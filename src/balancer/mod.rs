@@ -11,7 +11,7 @@ use crate::health::HealthState;
 
 pub use queue::RequestQueue;
 
-pub const MAX_BACKENDS: usize = 32;
+pub const MAX_BACKENDS: usize = 64;
 
 #[derive(Clone)]
 pub struct BackendPool {
