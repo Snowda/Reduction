@@ -1,30 +1,25 @@
-mod balancer;
-mod compression;
-mod config;
-mod error;
-mod health;
-mod metrics;
-mod proxy;
-mod ratelimit;
-mod tls;
-mod transport;
-
 use std::collections::HashMap;
 use std::env;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::routing::any;
+use dashmap::DashMap;
 use tokio::sync::watch;
 use tokio_rustls::TlsConnector;
-use tracing::info;
+use tokio::signal;
+use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
-use balancer::{BackendPool, RequestQueue};
-use config::{ReductionConfig, TransportKind};
-use error::{ReductionError, Result};
-use health::HealthState;
-use proxy::{ProxyState, ReloadableState, Router, init_request_queue, proxy_handler};
+use reduction::balancer::BackendPool;
+use reduction::config::{self, ReductionConfig, TransportKind};
+use reduction::error::{ReductionError, Result};
+use reduction::health::HealthState;
+use reduction::metrics::{self, ProxyMetrics};
+use reduction::proxy::{ConnPool, ProxyState, ReloadableState, Router, proxy_handler};
+use reduction::ratelimit::RateLimit;
+use reduction::tls;
+use reduction::transport;
 
 fn init_tracing() {
     let filter: EnvFilter = EnvFilter::try_from_default_env()
@@ -35,24 +30,27 @@ fn init_tracing() {
         .init();
 }
 
-fn build_backend_pools(config: &ReductionConfig) -> HashMap<String, BackendPool> {
+fn build_backend_pools(config: &ReductionConfig) -> Result<HashMap<String, BackendPool>> {
     let mut pools: HashMap<String, BackendPool> = HashMap::new();
 
     for route in &config.routes {
         let backends: Vec<config::BackendConfig> = config
             .backends
             .iter()
-            .filter(|b| b.id == route.backend_id)
+            .filter(|b| b.pool == route.backend_id)
             .cloned()
             .collect();
 
         if !backends.is_empty() && !pools.contains_key(&route.backend_id) {
-            let pool: BackendPool = BackendPool::new(backends, config.balancer.jitter_factor);
+            let pool: BackendPool = BackendPool::new(
+                backends,
+                config.balancer.jitter_factor,
+            )?;
             pools.insert(route.backend_id.clone(), pool);
         }
     }
 
-    return pools;
+    return Ok(pools);
 }
 
 fn spawn_config_reload_task(
@@ -61,10 +59,17 @@ fn spawn_config_reload_task(
 ) {
     tokio::spawn(async move {
         while config_rx.changed().await.is_ok() {
-            let config = config_rx.borrow_and_update().clone();
+            let config: ReductionConfig = config_rx.borrow_and_update().clone();
+            let backend_pools: HashMap<String, BackendPool> = match build_backend_pools(&config) {
+                Ok(pools) => pools,
+                Err(e) => {
+                    error!(error = %e, "failed to rebuild backend pools, keeping current config");
+                    continue;
+                }
+            };
             let new_state: ReloadableState = ReloadableState {
                 router: Router::new(&config.routes),
-                backend_pools: build_backend_pools(&config),
+                backend_pools,
             };
             if reloadable_tx.send(new_state).is_err() {
                 info!("all proxy state receivers dropped, stopping config reload");
@@ -79,7 +84,10 @@ async fn run(config_path: PathBuf) -> Result<()> {
     let config: ReductionConfig = config::load_config(&config_path)?;
 
     metrics::init_metrics(&config.metrics)?;
-    let (config_tx, config_rx) = watch::channel(config.clone());
+    let proxy_metrics: ProxyMetrics = ProxyMetrics::new();
+
+    let (config_tx, config_rx): (watch::Sender<ReductionConfig>, watch::Receiver<ReductionConfig>) =
+        watch::channel(config.clone());
 
     let _config_watcher: config::watcher::ConfigWatcher =
         config::watcher::ConfigWatcher::new(config_path, config_tx)?;
@@ -96,30 +104,42 @@ async fn run(config_path: PathBuf) -> Result<()> {
         &config.tls.client.ca_cert_path,
     )?);
 
-    let tls_connector: TlsConnector = TlsConnector::from(client_tls_config);
+    let tls_connector: TlsConnector = TlsConnector::from(client_tls_config.clone());
 
     let initial_reloadable: ReloadableState = ReloadableState {
         router: Router::new(&config.routes),
-        backend_pools: build_backend_pools(&config),
+        backend_pools: build_backend_pools(&config)?,
     };
 
-    let (reloadable_tx, reloadable_rx) = watch::channel(initial_reloadable);
+    let (reloadable_tx, reloadable_rx): (watch::Sender<ReloadableState>, watch::Receiver<ReloadableState>) =
+        watch::channel(initial_reloadable);
 
-    init_request_queue(RequestQueue::new(config.balancer.queue_depth))?;
-    let (_health_tx, health_rx) = watch::channel(HealthState::new());
+    let (_health_tx, health_rx): (watch::Sender<HealthState>, watch::Receiver<HealthState>) =
+        watch::channel(HealthState::new());
 
-    let proxy_state: ProxyState = ProxyState {
+    let rate_limiter: RateLimit = RateLimit::new(config.ratelimit.requests_per_second)
+        .expect("invalid rate limit config");
+    info!(rps = config.ratelimit.requests_per_second, "rate limiting enabled");
+
+    let proxy_state: Arc<ProxyState> = Arc::new(ProxyState {
         reloadable: reloadable_rx,
         tls_connector,
+        client_tls_config,
         health_rx,
-    };
+        conn_pool: ConnPool::new(),
+        rate_limiter,
+        queues: DashMap::new(),
+        default_queue_depth: config.balancer.queue_depth,
+        metrics: proxy_metrics,
+    });
 
     spawn_config_reload_task(config_rx, reloadable_tx);
 
-    let app: axum::Router = axum::Router::new()
+    let app = axum::Router::new()
         .fallback(any(proxy_handler))
         .layer(axum::extract::DefaultBodyLimit::max(10 * 1024 * 1024))
-        .with_state(proxy_state);
+        .with_state(proxy_state)
+        .into_make_service_with_connect_info::<transport::ConnectAddr>();
 
     info!("reduction proxy starting on {}", config.listen.address);
 
@@ -129,6 +149,7 @@ async fn run(config_path: PathBuf) -> Result<()> {
                 transport::tcp::TcpListener::bind(config.listen.address, server_tls_config)
                     .await?;
             return axum::serve(listener, app)
+                .with_graceful_shutdown(shutdown_signal())
                 .await
                 .map_err(ReductionError::from);
         }
@@ -138,9 +159,30 @@ async fn run(config_path: PathBuf) -> Result<()> {
             let listener: transport::quic::QuicListener =
                 transport::quic::QuicListener::bind(config.listen.address, quic_config)?;
             return axum::serve(listener, app)
+                .with_graceful_shutdown(shutdown_signal())
                 .await
                 .map_err(ReductionError::from);
         }
+    }
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = signal::ctrl_c();
+
+    #[cfg(unix)]
+    let terminate = async {
+        signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => info!("received ctrl-c, starting graceful shutdown"),
+        _ = terminate => info!("received SIGTERM, starting graceful shutdown"),
     }
 }
 

@@ -3,33 +3,36 @@ pub mod queue;
 pub mod rendezvous;
 
 use std::net::IpAddr;
+use std::sync::Arc;
 
 use arrayvec::ArrayVec;
 
 use crate::config::BackendConfig;
+use crate::error::{ReductionError, Result};
 use crate::health::HealthState;
 
 pub use queue::RequestQueue;
 
 pub const MAX_BACKENDS: usize = 64;
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct BackendPool {
-    pub backends: Vec<BackendConfig>,
+    pub backends: Arc<[BackendConfig]>,
     pub jitter_factor: f64,
 }
 
 impl BackendPool {
-    pub fn new(backends: Vec<BackendConfig>, jitter_factor: f64) -> Self {
-        assert!(
-            backends.len() <= MAX_BACKENDS,
-            "backend count {} exceeds maximum {MAX_BACKENDS}",
-            backends.len(),
-        );
-        return Self {
-            backends,
+    pub fn new(backends: Vec<BackendConfig>, jitter_factor: f64) -> Result<Self> {
+        if backends.len() > MAX_BACKENDS {
+            return Err(ReductionError::Config(format!(
+                "backend count {} exceeds maximum {MAX_BACKENDS}",
+                backends.len(),
+            )));
+        }
+        return Ok(Self {
+            backends: Arc::from(backends),
             jitter_factor,
-        };
+        });
     }
 
     pub fn select(
@@ -63,6 +66,7 @@ impl BackendPool {
 mod tests {
     use super::*;
     use crate::config::TransportKind;
+    use crate::health::state::{BackendHealth, HealthBroadcast};
 
     fn make_backends(count: usize) -> Vec<BackendConfig> {
         return (0..count)
@@ -77,7 +81,7 @@ mod tests {
 
     #[test]
     fn test_pool_select_deterministic() {
-        let pool: BackendPool = BackendPool::new(make_backends(3), 0.05);
+        let pool: BackendPool = BackendPool::new(make_backends(3), 0.05).unwrap();
         let health: HealthState = HealthState::new();
         let ip: IpAddr = "192.168.1.1".parse().unwrap();
 
@@ -89,7 +93,7 @@ mod tests {
 
     #[test]
     fn test_pool_empty_backends() {
-        let pool: BackendPool = BackendPool::new(vec![], 0.0);
+        let pool: BackendPool = BackendPool::new(vec![], 0.0).unwrap();
         let health: HealthState = HealthState::new();
         let ip: IpAddr = "10.0.0.1".parse().unwrap();
 
@@ -98,7 +102,7 @@ mod tests {
 
     #[test]
     fn test_pool_distributes_across_backends() {
-        let pool: BackendPool = BackendPool::new(make_backends(3), 0.05);
+        let pool: BackendPool = BackendPool::new(make_backends(3), 0.05).unwrap();
         let health: HealthState = HealthState::new();
         let mut counts: std::collections::HashMap<String, usize> =
             std::collections::HashMap::new();
@@ -117,8 +121,6 @@ mod tests {
 
     #[test]
     fn test_pool_respects_health_unavailable() {
-        use crate::health::state::{BackendHealth, HealthBroadcast};
-
         let mut health: HealthState = HealthState::new();
         health.update(HealthBroadcast {
             entries: vec![
@@ -137,7 +139,7 @@ mod tests {
             ],
         });
 
-        let pool: BackendPool = BackendPool::new(make_backends(2), 0.0);
+        let pool: BackendPool = BackendPool::new(make_backends(2), 0.0).unwrap();
 
         for i in 0..50u8 {
             let ip: IpAddr = format!("10.0.0.{i}").parse().unwrap();
@@ -148,9 +150,24 @@ mod tests {
 
     #[test]
     fn test_pool_is_clone() {
-        let pool: BackendPool = BackendPool::new(make_backends(2), 0.05);
+        let pool: BackendPool = BackendPool::new(make_backends(2), 0.05).unwrap();
         let cloned: BackendPool = pool.clone();
         assert_eq!(cloned.backends.len(), 2);
         assert_eq!(cloned.jitter_factor, 0.05);
+    }
+
+    #[test]
+    fn test_pool_rejects_too_many_backends() {
+        let result = BackendPool::new(make_backends(MAX_BACKENDS + 1), 0.05);
+        assert!(result.is_err());
+        let err: String = format!("{}", result.unwrap_err());
+        assert!(err.contains("exceeds maximum"), "expected exceeds maximum, got: {err}");
+    }
+
+    #[test]
+    fn test_pool_accepts_max_backends() {
+        let result = BackendPool::new(make_backends(MAX_BACKENDS), 0.05);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().backends.len(), MAX_BACKENDS);
     }
 }

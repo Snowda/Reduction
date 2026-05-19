@@ -30,7 +30,14 @@ impl Router {
     pub fn match_route(&self, path: &str) -> Option<&str> {
         for route in &self.routes {
             if path.starts_with(&route.path_prefix) {
-                return Some(&route.backend_id);
+                // Ensure the match ends at a path boundary to prevent
+                // "/api" from matching "/api-internal"
+                if path.len() == route.path_prefix.len()
+                    || route.path_prefix.ends_with('/')
+                    || path.as_bytes()[route.path_prefix.len()] == b'/'
+                {
+                    return Some(&route.backend_id);
+                }
             }
         }
         return None;
@@ -99,5 +106,25 @@ mod tests {
         let router: Router = Router::new(&routes);
 
         assert_eq!(router.match_route("/anything"), None);
+    }
+
+    #[test]
+    fn test_prefix_boundary_rejects_partial_segment() {
+        let routes: Vec<RouteConfig> = make_routes(&[("/api", "api-backend")]);
+        let router: Router = Router::new(&routes);
+
+        assert_eq!(router.match_route("/api-internal"), None);
+        assert_eq!(router.match_route("/api-v2/foo"), None);
+        assert_eq!(router.match_route("/api/v2/foo"), Some("api-backend"));
+        assert_eq!(router.match_route("/api"), Some("api-backend"));
+    }
+
+    #[test]
+    fn test_trailing_slash_prefix_matches_subpaths() {
+        let routes: Vec<RouteConfig> = make_routes(&[("/static/", "static-backend")]);
+        let router: Router = Router::new(&routes);
+
+        assert_eq!(router.match_route("/static/img.png"), Some("static-backend"));
+        assert_eq!(router.match_route("/static"), None);
     }
 }

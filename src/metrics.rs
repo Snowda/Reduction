@@ -5,7 +5,7 @@ use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
 use tracing::info;
 
 use crate::config::MetricsConfig;
-use crate::error::Result;
+use crate::error::{ReductionError, Result};
 
 pub struct ProxyMetrics {
     pub requests_total: Counter<u64>,
@@ -62,16 +62,17 @@ impl ProxyMetrics {
 }
 
 pub fn init_metrics(config: &MetricsConfig) -> Result<()> {
-    let mut builder = SdkMeterProvider::builder();
+    let mut builder: opentelemetry_sdk::metrics::MeterProviderBuilder = SdkMeterProvider::builder();
 
     if let Some(endpoint) = &config.otlp_endpoint {
-        let exporter = opentelemetry_otlp::MetricExporter::builder()
+        let exporter: opentelemetry_otlp::MetricExporter = opentelemetry_otlp::MetricExporter::builder()
             .with_http()
             .with_endpoint(endpoint)
             .build()
-            .map_err(|e| crate::error::ReductionError::Config(format!("OTLP exporter: {e}")))?;
+            .map_err(|e| ReductionError::Config(format!("OTLP exporter: {e}")))?;
 
-        let reader = PeriodicReader::builder(exporter).build();
+        let reader: PeriodicReader<opentelemetry_otlp::MetricExporter> =
+            PeriodicReader::builder(exporter).build();
         builder = builder.with_reader(reader);
 
         info!(%endpoint, "OTLP metrics exporter configured");

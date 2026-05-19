@@ -1,0 +1,30 @@
+[listen]
+address = "0.0.0.0:8443"
+transport = "quic"
+
+[tls]
+cert_path = "certs/server.crt"
+key_path = "certs/server.key"
+ca_cert_path = "certs/ca.crt"
+
+[[backends]]
+id = "api-primary"
+host = "api.internal"
+address = "10.0.0.1:8080"
+weight = 3.0
+transport = "quic"
+
+[[backends]]
+id = "api-secondary"
+host = "api.internal"
+address = "10.0.0.2:8080"
+weight = 1.0
+transport = "quic"
+
+[[routes]]
+path_prefix = "/api"
+backend_id = "api-primary"
+
+[[routes]]
+path_prefix = "/"
+backend_id = "api-secondary"

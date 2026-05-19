@@ -1,3 +1,5 @@
+use std::io::Read;
+
 use crate::error::{ReductionError, Result};
 
 const DEFAULT_COMPRESSION_LEVEL: i32 = 3;
@@ -15,6 +17,24 @@ pub fn compress_with_level(data: &[u8], level: i32) -> Result<Vec<u8>> {
 pub fn decompress(data: &[u8]) -> Result<Vec<u8>> {
     return zstd::decode_all(data)
         .map_err(|e| ReductionError::Transport(format!("zstd decompress: {e}")));
+}
+
+pub fn decompress_bounded(data: &[u8], max_bytes: usize) -> Result<Vec<u8>> {
+    let decoder: zstd::Decoder<'static, std::io::BufReader<&[u8]>> = zstd::Decoder::new(data)
+        .map_err(|e| ReductionError::Transport(format!("zstd init: {e}")))?;
+    let mut limited: std::io::Take<zstd::Decoder<'static, std::io::BufReader<&[u8]>>> =
+        decoder.take((max_bytes + 1) as u64);
+    let mut output: Vec<u8> = Vec::new();
+    limited
+        .read_to_end(&mut output)
+        .map_err(|e| ReductionError::Transport(format!("zstd decompress: {e}")))?;
+    if output.len() > max_bytes {
+        return Err(ReductionError::Transport(format!(
+            "decompressed body exceeds {} byte limit",
+            max_bytes
+        )));
+    }
+    return Ok(output);
 }
 
 #[cfg(test)]
@@ -56,6 +76,22 @@ mod tests {
     #[test]
     fn test_decompress_invalid_data() {
         let result: Result<Vec<u8>> = decompress(&[0xFF, 0xFE, 0xFD, 0xFC]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_decompress_bounded_within_limit() {
+        let original: &[u8] = b"bounded decompression test data";
+        let compressed: Vec<u8> = compress(original).unwrap();
+        let decompressed: Vec<u8> = decompress_bounded(&compressed, 1024).unwrap();
+        assert_eq!(decompressed, original);
+    }
+
+    #[test]
+    fn test_decompress_bounded_exceeds_limit() {
+        let original: Vec<u8> = vec![0u8; 10_000];
+        let compressed: Vec<u8> = compress(&original).unwrap();
+        let result: Result<Vec<u8>> = decompress_bounded(&compressed, 100);
         assert!(result.is_err());
     }
 

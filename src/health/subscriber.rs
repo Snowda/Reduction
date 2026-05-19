@@ -35,7 +35,8 @@ mod tests {
 
     #[test]
     fn test_subscriber_handle_valid_message() {
-        let (tx, rx) = watch::channel(HealthState::new());
+        let (tx, rx): (watch::Sender<HealthState>, watch::Receiver<HealthState>) =
+            watch::channel(HealthState::new());
         let subscriber: HealthSubscriber = HealthSubscriber::new(tx);
 
         let broadcast: HealthBroadcast = HealthBroadcast {
@@ -50,26 +51,28 @@ mod tests {
         let encoded: Vec<u8> = bitcode::encode(&broadcast);
         subscriber.handle_message(&encoded);
 
-        let health_ref = rx.borrow();
-        let health = health_ref.get("api").unwrap();
+        let health_ref: watch::Ref<'_, HealthState> = rx.borrow();
+        let health: &BackendHealth = health_ref.get("api").unwrap();
         assert!(health.available);
         assert_eq!(health.load, 0.5);
     }
 
     #[test]
     fn test_subscriber_handle_invalid_message() {
-        let (tx, rx) = watch::channel(HealthState::new());
+        let (tx, rx): (watch::Sender<HealthState>, watch::Receiver<HealthState>) =
+            watch::channel(HealthState::new());
         let subscriber: HealthSubscriber = HealthSubscriber::new(tx);
 
         subscriber.handle_message(&[0xFF, 0xFE, 0xFD]);
 
-        let health_ref = rx.borrow();
+        let health_ref: watch::Ref<'_, HealthState> = rx.borrow();
         assert!(health_ref.get("api").is_none());
     }
 
     #[test]
     fn test_subscriber_multiple_updates() {
-        let (tx, rx) = watch::channel(HealthState::new());
+        let (tx, rx): (watch::Sender<HealthState>, watch::Receiver<HealthState>) =
+            watch::channel(HealthState::new());
         let subscriber: HealthSubscriber = HealthSubscriber::new(tx);
 
         let broadcast1: HealthBroadcast = HealthBroadcast {
@@ -93,8 +96,8 @@ mod tests {
         subscriber.handle_message(&bitcode::encode(&broadcast1));
         subscriber.handle_message(&bitcode::encode(&broadcast2));
 
-        let health_ref = rx.borrow();
-        let health = health_ref.get("api").unwrap();
+        let health_ref: watch::Ref<'_, HealthState> = rx.borrow();
+        let health: &BackendHealth = health_ref.get("api").unwrap();
         assert_eq!(health.load, 0.9);
     }
 }

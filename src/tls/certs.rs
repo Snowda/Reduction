@@ -89,3 +89,172 @@ pub fn build_client_config(
 
     return Ok(config);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    fn generate_ca() -> rcgen::CertifiedKey {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::new(vec![]).unwrap();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        params.distinguished_name.push(
+            rcgen::DnType::CommonName,
+            rcgen::DnValue::Utf8String("Test CA".to_string()),
+        );
+        let cert = params.self_signed(&key).unwrap();
+        return rcgen::CertifiedKey { cert, key_pair: key };
+    }
+
+    fn generate_signed_cert(ca: &rcgen::CertifiedKey) -> rcgen::CertifiedKey {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut params =
+            rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+        params.distinguished_name.push(
+            rcgen::DnType::CommonName,
+            rcgen::DnValue::Utf8String("localhost".to_string()),
+        );
+        let cert = params.signed_by(&key, &ca.cert, &ca.key_pair).unwrap();
+        return rcgen::CertifiedKey { cert, key_pair: key };
+    }
+
+    fn write_pem(content: &str) -> NamedTempFile {
+        let mut f = NamedTempFile::new().unwrap();
+        f.write_all(content.as_bytes()).unwrap();
+        f.flush().unwrap();
+        return f;
+    }
+
+    fn setup_pki() -> (NamedTempFile, NamedTempFile, NamedTempFile) {
+        let ca = generate_ca();
+        let leaf = generate_signed_cert(&ca);
+
+        let ca_file = write_pem(&ca.cert.pem());
+        let cert_file = write_pem(&leaf.cert.pem());
+        let key_file = write_pem(&leaf.key_pair.serialize_pem());
+
+        return (cert_file, key_file, ca_file);
+    }
+
+    #[test]
+    fn test_load_certs_valid() {
+        let ca = generate_ca();
+        let f = write_pem(&ca.cert.pem());
+        let certs = load_certs(f.path()).unwrap();
+        assert_eq!(certs.len(), 1);
+    }
+
+    #[test]
+    fn test_load_certs_missing_file() {
+        let result = load_certs(Path::new("/nonexistent/cert.pem"));
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("failed to open cert file"));
+    }
+
+    #[test]
+    fn test_load_certs_empty_file() {
+        let f = write_pem("");
+        let result = load_certs(f.path());
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("no certificates found"));
+    }
+
+    #[test]
+    fn test_load_certs_invalid_pem() {
+        let f = write_pem("not a pem file at all");
+        let result = load_certs(f.path());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_load_private_key_valid() {
+        let ca = generate_ca();
+        let f = write_pem(&ca.key_pair.serialize_pem());
+        let _key = load_private_key(f.path()).unwrap();
+    }
+
+    #[test]
+    fn test_load_private_key_missing_file() {
+        let result = load_private_key(Path::new("/nonexistent/key.pem"));
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("failed to open key file"));
+    }
+
+    #[test]
+    fn test_load_private_key_invalid_pem() {
+        let f = write_pem("garbage data");
+        let result = load_private_key(f.path());
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("failed to parse private key"));
+    }
+
+    #[test]
+    fn test_load_ca_certs_valid() {
+        let ca = generate_ca();
+        let f = write_pem(&ca.cert.pem());
+        let store = load_ca_certs(f.path()).unwrap();
+        assert!(!store.is_empty());
+    }
+
+    #[test]
+    fn test_load_ca_certs_missing_file() {
+        let result = load_ca_certs(Path::new("/nonexistent/ca.pem"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_build_server_config_valid() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let (cert_file, key_file, ca_file) = setup_pki();
+        let config = build_server_config(cert_file.path(), key_file.path(), ca_file.path());
+        assert!(config.is_ok());
+    }
+
+    #[test]
+    fn test_build_server_config_bad_cert() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let ca = generate_ca();
+        let ca_file = write_pem(&ca.cert.pem());
+        let key_file = write_pem(&ca.key_pair.serialize_pem());
+        let bad_cert = write_pem("not a cert");
+
+        let result = build_server_config(bad_cert.path(), key_file.path(), ca_file.path());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_build_client_config_valid() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let (cert_file, key_file, ca_file) = setup_pki();
+        let config = build_client_config(cert_file.path(), key_file.path(), ca_file.path());
+        assert!(config.is_ok());
+    }
+
+    #[test]
+    fn test_build_client_config_bad_key() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let ca = generate_ca();
+        let cert_file = write_pem(&ca.cert.pem());
+        let ca_file = write_pem(&ca.cert.pem());
+        let bad_key = write_pem("not a key");
+
+        let result = build_client_config(cert_file.path(), bad_key.path(), ca_file.path());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_load_multiple_certs() {
+        let ca1 = generate_ca();
+        let ca2 = generate_ca();
+        let combined = format!("{}{}", ca1.cert.pem(), ca2.cert.pem());
+        let f = write_pem(&combined);
+        let certs = load_certs(f.path()).unwrap();
+        assert_eq!(certs.len(), 2);
+    }
+}

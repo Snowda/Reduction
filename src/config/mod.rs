@@ -22,6 +22,8 @@ pub fn load_config(path: &Path) -> Result<ReductionConfig> {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
+
     use super::*;
 
     fn minimal_toml() -> &'static str {
@@ -154,6 +156,7 @@ address = "127.0.0.1:8443"
                 },
             ],
             balancer: BalancerConfig::default(),
+            ratelimit: RateLimitConfig::default(),
             metrics: MetricsConfig::default(),
         };
 
@@ -164,6 +167,7 @@ address = "127.0.0.1:8443"
         assert_eq!(deserialized.listen.transport, original.listen.transport);
         assert_eq!(deserialized.backends.len(), 1);
         assert_eq!(deserialized.backends[0].id, "api");
+        assert_eq!(deserialized.backends[0].pool, "api");
         assert_eq!(deserialized.backends[0].weight, 2.5);
         assert_eq!(deserialized.routes.len(), 1);
         assert_eq!(deserialized.routes[0].path_prefix, "/api");
@@ -171,8 +175,6 @@ address = "127.0.0.1:8443"
 
     #[test]
     fn test_load_config_from_file() {
-        use std::io::Write;
-
         let dir: tempfile::TempDir = tempfile::tempdir().unwrap();
         let config_path: std::path::PathBuf = dir.path().join("test_config.toml");
 
@@ -392,6 +394,56 @@ backend_id = "api"
 "#;
         let config: ReductionConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.backends[0].weight, 0.0);
+    }
+
+    #[test]
+    fn test_pool_defaults_to_id() {
+        let config: ReductionConfig = toml::from_str(minimal_toml()).unwrap();
+        assert_eq!(config.backends[0].id, "api");
+        assert_eq!(config.backends[0].pool, "api");
+    }
+
+    #[test]
+    fn test_pool_explicit_grouping() {
+        let toml_str: &str = r#"
+[listen]
+address = "127.0.0.1:8443"
+transport = "tcp"
+
+[tls.server]
+cert_path = "certs/server.crt"
+key_path = "certs/server.key"
+ca_cert_path = "certs/ca.crt"
+
+[tls.client]
+cert_path = "certs/client.crt"
+key_path = "certs/client.key"
+ca_cert_path = "certs/ca.crt"
+
+[[backends]]
+id = "api-primary"
+pool = "api"
+address = "10.0.0.1:8080"
+weight = 3.0
+transport = "tcp"
+
+[[backends]]
+id = "api-secondary"
+pool = "api"
+address = "10.0.0.2:8080"
+weight = 1.0
+transport = "tcp"
+
+[[routes]]
+path_prefix = "/api"
+backend_id = "api"
+"#;
+        let config: ReductionConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.backends.len(), 2);
+        assert_eq!(config.backends[0].id, "api-primary");
+        assert_eq!(config.backends[0].pool, "api");
+        assert_eq!(config.backends[1].id, "api-secondary");
+        assert_eq!(config.backends[1].pool, "api");
     }
 
     #[test]

@@ -1,7 +1,10 @@
-use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::time::{Duration, Instant};
 
 use bitcode::{Decode, Encode};
+use lru::LruCache;
+
+use crate::balancer::MAX_BACKENDS;
 
 const DEFAULT_STALENESS_TTL: Duration = Duration::from_secs(300);
 
@@ -20,14 +23,16 @@ pub struct HealthBroadcast {
 
 #[derive(Debug)]
 pub struct HealthState {
-    entries: HashMap<String, (BackendHealth, Instant)>,
+    entries: LruCache<String, (BackendHealth, Instant)>,
     staleness_ttl: Duration,
 }
 
 impl HealthState {
     pub fn new() -> Self {
         return Self {
-            entries: HashMap::new(),
+            entries: LruCache::new(
+                NonZeroUsize::new(MAX_BACKENDS).expect("MAX_BACKENDS must be > 0"),
+            ),
             staleness_ttl: DEFAULT_STALENESS_TTL,
         };
     }
@@ -40,12 +45,12 @@ impl HealthState {
     pub fn update(&mut self, broadcast: HealthBroadcast) {
         let now: Instant = Instant::now();
         for entry in broadcast.entries {
-            self.entries.insert(entry.backend_id.clone(), (entry, now));
+            self.entries.push(entry.backend_id.clone(), (entry, now));
         }
     }
 
     pub fn is_valid(&self, backend_id: &str) -> bool {
-        match self.entries.get(backend_id) {
+        match self.entries.peek(backend_id) {
             None => return false,
             Some((_, received_at)) => {
                 return received_at.elapsed() < self.staleness_ttl;
@@ -58,17 +63,15 @@ impl HealthState {
             return 1.0;
         }
 
-        match self.entries.get(backend_id) {
+        match self.entries.peek(backend_id) {
             None => return 1.0,
             Some((health, _)) => {
                 if !health.available {
                     return 0.0;
                 }
 
-                // Reduce weight proportionally to load (0.0 = idle, 1.0 = full)
                 let load_factor: f64 = 1.0 - health.load.clamp(0.0, 1.0);
 
-                // Penalize high latency (>500ms starts reducing weight)
                 let latency_factor: f64 = if health.latency_ms > 500 {
                     500.0 / (health.latency_ms as f64)
                 } else {
@@ -81,7 +84,7 @@ impl HealthState {
     }
 
     pub fn get(&self, backend_id: &str) -> Option<&BackendHealth> {
-        return self.entries.get(backend_id).map(|(h, _)| h);
+        return self.entries.peek(backend_id).map(|(h, _)| h);
     }
 }
 
@@ -207,5 +210,37 @@ mod tests {
             .with_staleness_ttl(Duration::from_secs(60));
 
         assert!(!state.is_valid("api"));
+    }
+
+    #[test]
+    fn test_lru_evicts_oldest_at_capacity() {
+        let cap: usize = MAX_BACKENDS;
+        let mut state: HealthState = HealthState::new();
+
+        for i in 0..cap {
+            state.update(make_broadcast(vec![healthy_backend(&format!("b-{i}"))]));
+        }
+
+        assert!(state.get("b-0").is_some());
+
+        state.update(make_broadcast(vec![healthy_backend("overflow")]));
+
+        assert!(state.get("b-0").is_none(), "oldest entry should be evicted");
+        assert!(state.get("overflow").is_some());
+        assert!(state.get(&format!("b-{}", cap - 1)).is_some());
+    }
+
+    #[test]
+    fn test_lru_update_existing_does_not_evict() {
+        let mut state: HealthState = HealthState::new();
+
+        for i in 0..MAX_BACKENDS {
+            state.update(make_broadcast(vec![healthy_backend(&format!("b-{i}"))]));
+        }
+
+        state.update(make_broadcast(vec![healthy_backend("b-0")]));
+
+        assert!(state.get("b-0").is_some());
+        assert!(state.get(&format!("b-{}", MAX_BACKENDS - 1)).is_some());
     }
 }

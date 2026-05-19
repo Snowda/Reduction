@@ -5,7 +5,7 @@ use tokio::sync::watch;
 use tracing::{error, info, warn};
 
 use super::ReductionConfig;
-use crate::error::Result;
+use crate::error::{ReductionError, Result};
 
 pub struct ConfigWatcher {
     _watcher: RecommendedWatcher,
@@ -36,11 +36,11 @@ impl ConfigWatcher {
                 }
             },
         )
-        .map_err(|e| crate::error::ReductionError::Config(format!("watcher init: {e}")))?;
+        .map_err(|e| ReductionError::Config(format!("watcher init: {e}")))?;
 
         watcher
             .watch(config_path.as_ref(), RecursiveMode::NonRecursive)
-            .map_err(|e| crate::error::ReductionError::Config(format!("watch: {e}")))?;
+            .map_err(|e| ReductionError::Config(format!("watch: {e}")))?;
 
         info!(path = %config_path.display(), "watching config file for changes");
 
@@ -53,11 +53,11 @@ fn reload_config(
     config_tx: &watch::Sender<ReductionConfig>,
 ) -> Result<()> {
     let contents: String = std::fs::read_to_string(path)
-        .map_err(|e| crate::error::ReductionError::Config(format!("read: {e}")))?;
+        .map_err(|e| ReductionError::Config(format!("read: {e}")))?;
 
     let new_config: ReductionConfig = toml::from_str(&contents)?;
 
-    let old_config = config_tx.borrow();
+    let old_config: watch::Ref<'_, ReductionConfig> = config_tx.borrow();
     if old_config.listen.address != new_config.listen.address {
         warn!("listen address changed - requires restart to take effect");
     }
@@ -73,17 +73,19 @@ fn reload_config(
     drop(old_config);
 
     config_tx.send(new_config)
-        .map_err(|_| crate::error::ReductionError::Config("all config receivers dropped".to_string()))?;
+        .map_err(|_| ReductionError::Config("all config receivers dropped".to_string()))?;
 
     return Ok(());
 }
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
+
     use super::*;
     use crate::config::{
-        BackendConfig, BalancerConfig, ListenConfig, MetricsConfig, RouteConfig, TlsConfig,
-        TlsIdentity, TransportKind,
+        BackendConfig, BalancerConfig, ListenConfig, MetricsConfig, RateLimitConfig,
+        RouteConfig, TlsConfig, TlsIdentity, TransportKind,
     };
 
     fn test_config() -> ReductionConfig {
@@ -115,14 +117,13 @@ mod tests {
                 backend_id: "api".to_string(),
             }],
             balancer: BalancerConfig::default(),
+            ratelimit: RateLimitConfig::default(),
             metrics: MetricsConfig::default(),
         };
     }
 
     #[test]
     fn test_reload_config_updates_shared_state() {
-        use std::io::Write;
-
         let dir: tempfile::TempDir = tempfile::tempdir().unwrap();
         let config_path: PathBuf = dir.path().join("config.toml");
 
@@ -131,7 +132,8 @@ mod tests {
         let mut file: std::fs::File = std::fs::File::create(&config_path).unwrap();
         file.write_all(toml_str.as_bytes()).unwrap();
 
-        let (tx, rx) = watch::channel(config);
+        let (tx, rx): (watch::Sender<ReductionConfig>, watch::Receiver<ReductionConfig>) =
+            watch::channel(config);
 
         let mut updated: ReductionConfig = test_config();
         updated.backends[0].weight = 5.0;
