@@ -6,10 +6,18 @@ description = "Opinionated Rust Reverse Proxy"
 license = "MIT"
 
 [dependencies]
-arc-swap = "1.9.1"
+arrayvec = "0.7.6"
 axum = "0.8.9"
 bitcode = "0.6.9"
-http = "1.4.0"
+dashmap = "6.2.1"
+governor = "0.10.4"
+http-body-util = "0.1.3"
+hyper = { version = "1.9.0", features = ["client", "http1"] }
+hyper-util = { version = "0.1.20", features = ["tokio"] }
+notify = "8.2.0"
+opentelemetry = "0.32.0"
+opentelemetry-otlp = "0.32.0"
+opentelemetry_sdk = "0.32.0"
 quinn = "0.11.9"
 rustls = "0.23.40"
 serde = { version = "1.0.228", features = ["derive"] }
@@ -18,8 +26,8 @@ tokio = { version = "1.52.3", features = ["rt-multi-thread", "net", "io-util", "
 tokio-rustls = "0.26.4"
 toml = "1.1.2"
 tracing = "0.1.44"
+tracing-opentelemetry = "0.33.0"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
-url = "2.5.8"
 zstd = "0.13.3"
 
 [dev-dependencies]
