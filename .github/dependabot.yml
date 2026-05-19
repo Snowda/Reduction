@@ -1,0 +1,9 @@
+version: 2
+updates: # Enable version updates for cargo
+  - package-ecosystem: "cargo"
+    directory: "/" # Look for `cargo.toml` files in the `root` directory
+    schedule: # Check the cargo registry for updates every friday
+      interval: "weekly"
+      day: "friday"
+    target-branch: "main"
+    open-pull-requests-limit: 10 # Allow up to 10 open pull requests for dependencies
