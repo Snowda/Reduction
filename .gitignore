@@ -24,3 +24,5 @@ target
 *.txt
 CLAUDE.md
 Cranky.toml
+*.svg
+comparison/
