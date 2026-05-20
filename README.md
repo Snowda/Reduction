@@ -4,14 +4,18 @@ An opinionated reverse proxy built in Rust for machine-to-machine communication 
 
 Reduction is designed for environments where AI agents and devices communicate with cloud backends over unreliable connections. It prioritizes low overhead, mutual TLS authentication, and efficient binary serialization — with no browser or human-facing concerns.
 
-## Key design decisions
+## Features
 
-- **QUIC-first networking** — QUIC via `quinn` is the default transport. TCP is available as a fallback. A connection is either all-QUIC or all-TCP, configured per listener — no protocol translation.
+- **QUIC-first networking** — QUIC via `quinn` is the default transport. TCP is available as a fallback. Transport is configured independently on the listener and backend sides.
 - **mTLS only** — Mutual TLS is the sole authentication mechanism. Both client and server present certificates, validated against a shared CA. No token auth, no API keys.
-- **Zstd compression** — No gzip, no brotli. Zstd is the only supported compression algorithm.
-- **Bitcode serialization** — Control-plane communication between proxy nodes uses [Bitcode](https://crates.io/crates/bitcode) for compact binary encoding.
-- **TOML configuration** — All configuration lives in a single TOML file with hot-reload support.
-- **No SSH, no browser protocols** — This proxy serves machines, not people.
+- **Zstd compression** — Zstd is the only supported compression algorithm. Configurable level (1–22), minimum size threshold, and built-in zip-bomb protection.
+- **Circuit breaker** — Per-backend failure detection with configurable thresholds. Automatically stops sending traffic to failing backends and probes them during recovery.
+- **Retry with backoff** — Exponential backoff with jitter on failed requests. Configurable retry count, delay bounds, and jitter.
+- **Access control** — IP-based allow/deny lists with CIDR support.
+- **Rate limiting** — Per-IP token-bucket rate limiting via `governor`.
+- **Hot-reload** — Config file changes (routes, backends, weights) and TLS certificates are picked up automatically without restarting the proxy.
+- **TOML configuration** — All configuration lives in a single TOML file.
+- **Graceful shutdown** — In-flight connections drain before the proxy exits, with a configurable timeout.
 
 ## Architecture
 
@@ -44,23 +48,43 @@ Clients (Rust services / AI agents)
 
 Reduction uses **rendezvous hashing** (highest random weight) to assign clients to backends deterministically. This gives stable client affinity with minimal disruption when backends are added or removed.
 
-On top of base weights, **IP-seeded jitter** prevents thundering-herd scenarios when many clients arrive simultaneously. A per-backend **request queue with backpressure** buffers requests ahead of dispatch.
+On top of base weights, **IP-seeded jitter** prevents thundering-herd scenarios when many clients arrive simultaneously. A per-backend **request queue with backpressure** buffers requests ahead of dispatch and factors into backend selection so overloaded backends receive less traffic.
 
 Backend health data (received via a pub/sub control plane) factors into weight calculations. If the control plane is unreachable, the proxy falls back to local-only decisions using base weights and queue backpressure.
+
+### Observability
+
+Reduction exposes metrics via OpenTelemetry and supports OTLP trace export with configurable sampling.
+
+| Metric | Type | Description |
+|---|---|---|
+| `proxy.requests.total` | Counter | Total proxied requests |
+| `proxy.request.duration_ms` | Histogram | End-to-end request latency |
+| `proxy.connections.active` | Gauge | Currently open connections |
+| `proxy.queue.depth` | Gauge | Requests waiting in backend queues |
+| `proxy.rate_limit.rejections` | Counter | Requests rejected by rate limiter |
+| `proxy.backend.selections` | Counter | Backend selection events |
+| `proxy.backend.active_connections` | Gauge | Active connections per backend |
+| `proxy.backend.conn_limit_rejected` | Counter | Requests rejected due to connection limits |
+| `proxy.circuit.open_total` | Counter | Circuit breaker open transitions |
+| `proxy.circuit.half_open_probes` | Counter | Half-open probe attempts |
+| `proxy.retry.attempts` | Counter | Retry attempts |
 
 ### Modules
 
 | Module | Purpose |
 |---|---|
 | `balancer` | Rendezvous hashing, jitter, request queue with backpressure |
-| `compression` | Zstd compress/decompress |
+| `circuit` | Per-backend circuit breaker (closed → open → half-open → closed) |
+| `compression` | Zstd compress/decompress with zip-bomb protection |
 | `config` | TOML loading, validation, hot-reload file watcher |
 | `health` | Backend health state tracking and subscriber notifications |
-| `metrics` | OpenTelemetry integration (OTLP export) |
+| `metrics` | OpenTelemetry counters, gauges, and histograms (OTLP export) |
 | `proxy` | Request handler, path-based router, connection pooling |
 | `ratelimit` | Token-bucket rate limiting (via `governor`) |
-| `tls` | mTLS setup for both server and client sides |
-| `transport` | QUIC and TCP listener implementations for axum |
+| `tls` | mTLS setup and certificate hot-reload |
+| `transport` | QUIC and TCP listener implementations |
+| `acl` | IP allow/deny access control with CIDR matching |
 
 ## Getting started
 
@@ -73,6 +97,33 @@ Backend health data (received via a pub/sub control plane) factors into weight c
 
 ```sh
 cargo build --release
+```
+
+### Generate test certificates
+
+To try Reduction locally, generate a self-signed CA and certificates:
+
+```sh
+mkdir certs
+
+# Create a CA
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+  -keyout certs/ca.key -out certs/ca.crt -days 365 -nodes \
+  -subj "/CN=Reduction Test CA"
+
+# Server certificate
+openssl req -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+  -keyout certs/server.key -out certs/server.csr -nodes \
+  -subj "/CN=localhost"
+openssl x509 -req -in certs/server.csr -CA certs/ca.crt -CAkey certs/ca.key \
+  -CAcreateserial -out certs/server.crt -days 365
+
+# Client certificate
+openssl req -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+  -keyout certs/client.key -out certs/client.csr -nodes \
+  -subj "/CN=test-client"
+openssl x509 -req -in certs/client.csr -CA certs/ca.crt -CAkey certs/ca.key \
+  -CAcreateserial -out certs/client.crt -days 365
 ```
 
 ### Configure
@@ -111,19 +162,7 @@ path_prefix = "/api"
 backend_id = "api-primary"
 ```
 
-#### Optional sections
-
-```toml
-[balancer]
-queue_depth = 1000        # max queued requests per backend (default: 1000)
-jitter_factor = 0.05      # weight jitter 0.0–1.0 (default: 0.05)
-
-[ratelimit]
-requests_per_second = 10000
-
-[metrics]
-otlp_endpoint = "http://localhost:4317"
-```
+All other sections are optional and use sensible defaults. See `config.example.toml` for the full reference.
 
 ### Run
 
@@ -149,9 +188,9 @@ RUST_LOG=debug cargo run -- config.toml
 cargo test
 ```
 
-## Configuration hot-reload
+## Configuration reference
 
-Reduction watches the config file for changes and rebuilds routes and backend pools without restarting. TLS certificates are not reloaded — a restart is required for cert changes.
+See [docs/configuration.md](docs/configuration.md) for the full reference of every config section, field, and default.
 
 ## License
 
