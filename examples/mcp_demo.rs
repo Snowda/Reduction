@@ -18,12 +18,15 @@ use tokio::net::TcpStream;
 use tokio::sync::watch;
 use tokio_rustls::TlsConnector;
 use tokio_rustls::server::TlsStream;
+use tokio_util::sync::CancellationToken;
 
 use dashmap::DashMap;
 use reduction::balancer::BackendPool;
-use reduction::config::{self, BackendConfig, ReductionConfig};
+use reduction::circuit::CircuitBreakers;
+use reduction::config::{self, BackendConfig, CircuitBreakerConfig, ReductionConfig, TimeoutConfig};
 use reduction::health::{BackendHealth, HealthBroadcast, HealthState};
 use reduction::metrics::ProxyMetrics;
+use reduction::acl::AccessControl;
 use reduction::proxy::{ConnPool, ProxyState, ReloadableState, Router, proxy_handler};
 use reduction::ratelimit::RateLimit;
 use reduction::tls;
@@ -372,11 +375,12 @@ async fn mcp_backend_handler(
 }
 
 async fn start_mcp_backend(dir: &Path, port: u16, name: &str) {
-    let backend_tls: Arc<rustls::ServerConfig> = Arc::new(tls::build_server_config(
+    let (backend_tls_config, _) = tls::build_server_config(
         &dir.join("server.crt"),
         &dir.join("server.key"),
         &dir.join("ca.crt"),
-    ).unwrap());
+    ).unwrap();
+    let backend_tls: Arc<rustls::ServerConfig> = Arc::new(backend_tls_config);
 
     let addr: SocketAddr = ([127, 0, 0, 1], port).into();
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
@@ -429,17 +433,19 @@ async fn start_services(dir: &Path, config_path: &Path) -> DemoHandles {
     start_mcp_backend(dir, BACKEND_B_PORT, "mcp-backend-b").await;
 
     // -- Proxy --
-    let server_tls: Arc<rustls::ServerConfig> = Arc::new(tls::build_server_config(
+    let (server_tls_config, _) = tls::build_server_config(
         &config.tls.server.cert_path,
         &config.tls.server.key_path,
         &config.tls.server.ca_cert_path,
-    ).unwrap());
+    ).unwrap();
+    let server_tls: Arc<rustls::ServerConfig> = Arc::new(server_tls_config);
 
-    let client_tls: Arc<rustls::ClientConfig> = Arc::new(tls::build_client_config(
+    let (client_tls_config, _) = tls::build_client_config(
         &config.tls.client.cert_path,
         &config.tls.client.key_path,
         &config.tls.client.ca_cert_path,
-    ).unwrap());
+    ).unwrap();
+    let client_tls: Arc<rustls::ClientConfig> = Arc::new(client_tls_config);
 
     let tls_connector: TlsConnector = TlsConnector::from(client_tls.clone());
 
@@ -457,10 +463,17 @@ async fn start_services(dir: &Path, config_path: &Path) -> DemoHandles {
         client_tls_config: client_tls,
         health_rx,
         conn_pool: ConnPool::new(),
+        acl: AccessControl::new(vec![], vec![]),
         rate_limiter: RateLimit::new(u32::MAX).unwrap(),
         queues: DashMap::new(),
         default_queue_depth: config.balancer.queue_depth,
         metrics: ProxyMetrics::new(),
+        circuit_breakers: CircuitBreakers::new(&CircuitBreakerConfig::default()),
+        shutdown: CancellationToken::new(),
+        timeouts: TimeoutConfig::default(),
+        proxy_config: reduction::config::ProxyConfig::default(),
+        compression_config: reduction::config::CompressionConfig::default(),
+        retry_config: reduction::config::RetryConfig::default(),
     });
 
     let (config_tx, config_rx) = watch::channel(config.clone());
@@ -506,7 +519,7 @@ async fn start_services(dir: &Path, config_path: &Path) -> DemoHandles {
 // ---------------------------------------------------------------------------
 
 fn build_client_connector(dir: &Path) -> TlsConnector {
-    let client_config: rustls::ClientConfig = tls::build_client_config(
+    let (client_config, _): (rustls::ClientConfig, _) = tls::build_client_config(
         &dir.join("client.crt"),
         &dir.join("client.key"),
         &dir.join("ca.crt"),
