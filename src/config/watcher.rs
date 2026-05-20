@@ -65,10 +65,10 @@ fn reload_config(
         warn!("transport kind changed - requires restart to take effect");
     }
     if old_config.tls.server != new_config.tls.server {
-        warn!("server TLS config changed - requires restart to take effect");
+        warn!("server TLS identity paths changed in config - certificate files are hot-reloaded via file watcher, but changing paths requires restart");
     }
     if old_config.tls.client != new_config.tls.client {
-        warn!("client TLS config changed - requires restart to take effect");
+        warn!("client TLS identity paths changed in config - certificate files are hot-reloaded via file watcher, but changing paths requires restart");
     }
     drop(old_config);
 
@@ -84,8 +84,9 @@ mod tests {
 
     use super::*;
     use crate::config::{
-        BackendConfig, BalancerConfig, ListenConfig, MetricsConfig, RateLimitConfig,
-        RouteConfig, TlsConfig, TlsIdentity, TransportKind,
+        AccessControlConfig, BackendConfig, BalancerConfig, CircuitBreakerConfig,
+        CompressionConfig, HealthConfig, ListenConfig, MetricsConfig, ProxyConfig,
+        RateLimitConfig, RetryConfig, RouteConfig, TimeoutConfig, TlsConfig, TlsIdentity, TracingConfig, TransportKind,
     };
 
     fn test_config() -> ReductionConfig {
@@ -115,10 +116,19 @@ mod tests {
             routes: vec![RouteConfig {
                 path_prefix: "/api".to_string(),
                 backend_id: "api".to_string(),
+                timeout_secs: None,
             }],
             balancer: BalancerConfig::default(),
+            proxy: ProxyConfig::default(),
+            compression: CompressionConfig::default(),
+            health: HealthConfig::default(),
+            access: AccessControlConfig::default(),
             ratelimit: RateLimitConfig::default(),
             metrics: MetricsConfig::default(),
+            circuit_breaker: CircuitBreakerConfig::default(),
+            timeouts: TimeoutConfig::default(),
+            retry: RetryConfig::default(),
+            tracing: TracingConfig::default(),
         };
     }
 

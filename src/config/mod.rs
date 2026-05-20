@@ -153,11 +153,20 @@ address = "127.0.0.1:8443"
                 RouteConfig {
                     path_prefix: "/api".to_string(),
                     backend_id: "api".to_string(),
+                    timeout_secs: None,
                 },
             ],
             balancer: BalancerConfig::default(),
+            proxy: ProxyConfig::default(),
+            compression: CompressionConfig::default(),
+            health: HealthConfig::default(),
+            access: AccessControlConfig::default(),
             ratelimit: RateLimitConfig::default(),
             metrics: MetricsConfig::default(),
+            circuit_breaker: CircuitBreakerConfig::default(),
+            timeouts: TimeoutConfig::default(),
+            retry: RetryConfig::default(),
+            tracing: TracingConfig::default(),
         };
 
         let serialized: String = toml::to_string(&original).unwrap();
@@ -478,5 +487,121 @@ backend_id = "api"
 "#;
         let config: ReductionConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.balancer.jitter_factor, 0.99);
+    }
+
+    #[test]
+    fn test_drain_timeout_default() {
+        let config: BalancerConfig = BalancerConfig::default();
+        assert_eq!(config.drain_timeout_secs, 30);
+    }
+
+    #[test]
+    fn test_max_connections_defaults_to_256() {
+        let backend: BackendConfig = BackendConfig::new(
+            "test".into(),
+            "10.0.0.1:8080".parse().unwrap(),
+            1.0,
+            TransportKind::Tcp,
+        );
+        assert_eq!(backend.max_connections, 256);
+    }
+
+    #[test]
+    fn test_max_connections_with_builder() {
+        let backend: BackendConfig = BackendConfig::new(
+            "test".into(),
+            "10.0.0.1:8080".parse().unwrap(),
+            1.0,
+            TransportKind::Tcp,
+        ).with_max_connections(50);
+        assert_eq!(backend.max_connections, 50);
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid max_connections")]
+    fn test_max_connections_zero_panics() {
+        BackendConfig::new(
+            "test".into(),
+            "10.0.0.1:8080".parse().unwrap(),
+            1.0,
+            TransportKind::Tcp,
+        ).with_max_connections(0);
+    }
+
+    #[test]
+    fn test_max_connections_from_toml() {
+        let toml_str: &str = r#"
+[listen]
+address = "0.0.0.0:8443"
+transport = "tcp"
+
+[tls]
+server = { cert_path = "s.crt", key_path = "s.key", ca_cert_path = "ca.crt" }
+client = { cert_path = "c.crt", key_path = "c.key", ca_cert_path = "ca.crt" }
+
+[[backends]]
+id = "api"
+address = "10.0.0.1:8080"
+weight = 1.0
+transport = "tcp"
+max_connections = 100
+
+[[routes]]
+path_prefix = "/"
+backend_id = "api"
+"#;
+        let config: ReductionConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.backends[0].max_connections, 100);
+    }
+
+    #[test]
+    fn test_max_connections_omitted_defaults() {
+        let toml_str: &str = r#"
+[listen]
+address = "0.0.0.0:8443"
+transport = "tcp"
+
+[tls]
+server = { cert_path = "s.crt", key_path = "s.key", ca_cert_path = "ca.crt" }
+client = { cert_path = "c.crt", key_path = "c.key", ca_cert_path = "ca.crt" }
+
+[[backends]]
+id = "api"
+address = "10.0.0.1:8080"
+weight = 1.0
+transport = "tcp"
+
+[[routes]]
+path_prefix = "/"
+backend_id = "api"
+"#;
+        let config: ReductionConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.backends[0].max_connections, 256);
+    }
+
+    #[test]
+    fn test_reject_zero_max_connections_from_toml() {
+        let toml_str: &str = r#"
+[listen]
+address = "0.0.0.0:8443"
+transport = "tcp"
+
+[tls]
+server = { cert_path = "s.crt", key_path = "s.key", ca_cert_path = "ca.crt" }
+client = { cert_path = "c.crt", key_path = "c.key", ca_cert_path = "ca.crt" }
+
+[[backends]]
+id = "api"
+address = "10.0.0.1:8080"
+weight = 1.0
+transport = "tcp"
+max_connections = 0
+
+[[routes]]
+path_prefix = "/"
+backend_id = "api"
+"#;
+        let result: std::result::Result<ReductionConfig, _> = toml::from_str(toml_str);
+        assert!(result.is_err());
     }
 }

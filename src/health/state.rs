@@ -37,6 +37,16 @@ impl HealthState {
         };
     }
 
+    pub fn with_config(capacity: usize, staleness_ttl: Duration) -> Self {
+        let cap: usize = capacity.min(MAX_BACKENDS).max(1);
+        return Self {
+            entries: LruCache::new(
+                NonZeroUsize::new(cap).expect("capacity must be > 0"),
+            ),
+            staleness_ttl,
+        };
+    }
+
     pub fn with_staleness_ttl(mut self, ttl: Duration) -> Self {
         self.staleness_ttl = ttl;
         return self;
@@ -214,8 +224,8 @@ mod tests {
 
     #[test]
     fn test_lru_evicts_oldest_at_capacity() {
-        let cap: usize = MAX_BACKENDS;
-        let mut state: HealthState = HealthState::new();
+        let cap: usize = 16;
+        let mut state: HealthState = HealthState::with_config(cap, Duration::from_secs(300));
 
         for i in 0..cap {
             state.update(make_broadcast(vec![healthy_backend(&format!("b-{i}"))]));
@@ -232,15 +242,16 @@ mod tests {
 
     #[test]
     fn test_lru_update_existing_does_not_evict() {
-        let mut state: HealthState = HealthState::new();
+        let cap: usize = 16;
+        let mut state: HealthState = HealthState::with_config(cap, Duration::from_secs(300));
 
-        for i in 0..MAX_BACKENDS {
+        for i in 0..cap {
             state.update(make_broadcast(vec![healthy_backend(&format!("b-{i}"))]));
         }
 
         state.update(make_broadcast(vec![healthy_backend("b-0")]));
 
         assert!(state.get("b-0").is_some());
-        assert!(state.get(&format!("b-{}", MAX_BACKENDS - 1)).is_some());
+        assert!(state.get(&format!("b-{}", cap - 1)).is_some());
     }
 }

@@ -26,8 +26,14 @@ pub enum ReductionError {
     #[error("rate limited")]
     RateLimited,
 
+    #[error("access denied")]
+    AccessDenied,
+
     #[error("forward: {0}")]
     Forward(String),
+
+    #[error("circuit open for backend {0}")]
+    CircuitOpen(String),
 }
 
 pub type Result<T> = std::result::Result<T, ReductionError>;
@@ -64,6 +70,18 @@ mod tests {
     fn test_error_display_rate_limited() {
         let err: ReductionError = ReductionError::RateLimited;
         assert_eq!(format!("{err}"), "rate limited");
+    }
+
+    #[test]
+    fn test_error_display_access_denied() {
+        let err: ReductionError = ReductionError::AccessDenied;
+        assert_eq!(format!("{err}"), "access denied");
+    }
+
+    #[test]
+    fn test_error_display_circuit_open() {
+        let err: ReductionError = ReductionError::CircuitOpen("api-1".to_string());
+        assert_eq!(format!("{err}"), "circuit open for backend api-1");
     }
 
     #[test]

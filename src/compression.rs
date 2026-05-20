@@ -1,12 +1,30 @@
+use std::cell::RefCell;
 use std::io::Read;
 
 use crate::error::{ReductionError, Result};
 
-const DEFAULT_COMPRESSION_LEVEL: i32 = 3;
+pub const DEFAULT_COMPRESSION_LEVEL: i32 = 3;
+
+// Threshold below which compression is skipped entirely (bandwidth savings negligible).
+pub const MIN_COMPRESS_BYTES: usize = 256;
+
+// Bodies at or below this size are compressed inline on the async thread.
+// Above this, compression is offloaded to spawn_blocking.
+pub const INLINE_COMPRESS_THRESHOLD: usize = 8192;
+
+thread_local! {
+    static COMPRESSOR: RefCell<zstd::bulk::Compressor<'static>> =
+        RefCell::new(zstd::bulk::Compressor::new(DEFAULT_COMPRESSION_LEVEL).unwrap());
+
+    static DECOMPRESSOR: RefCell<zstd::bulk::Decompressor<'static>> =
+        RefCell::new(zstd::bulk::Decompressor::new().unwrap());
+}
 
 pub fn compress(data: &[u8]) -> Result<Vec<u8>> {
-    return zstd::encode_all(data, DEFAULT_COMPRESSION_LEVEL)
-        .map_err(|e| ReductionError::Transport(format!("zstd compress: {e}")));
+    return COMPRESSOR.with_borrow_mut(|c| {
+        c.compress(data)
+            .map_err(|e| ReductionError::Transport(format!("zstd compress: {e}")))
+    });
 }
 
 pub fn compress_with_level(data: &[u8], level: i32) -> Result<Vec<u8>> {
@@ -15,11 +33,25 @@ pub fn compress_with_level(data: &[u8], level: i32) -> Result<Vec<u8>> {
 }
 
 pub fn decompress(data: &[u8]) -> Result<Vec<u8>> {
+    let capacity: usize = zstd::bulk::Decompressor::upper_bound(data)
+        .filter(|&n| n > 0)
+        .unwrap_or(0);
+
+    if capacity > 0 {
+        return DECOMPRESSOR.with_borrow_mut(|d| {
+            d.decompress(data, capacity)
+                .map_err(|e| ReductionError::Transport(format!("zstd decompress: {e}")))
+        });
+    }
+
     return zstd::decode_all(data)
         .map_err(|e| ReductionError::Transport(format!("zstd decompress: {e}")));
 }
 
 pub fn decompress_bounded(data: &[u8], max_bytes: usize) -> Result<Vec<u8>> {
+    // Fresh decoder per call — safety-critical path that must enforce size limits
+    // against malicious payloads (zip bombs). Thread-local reuse is not worth the
+    // complexity here since the Decoder wraps the input reader.
     let decoder: zstd::Decoder<'static, std::io::BufReader<&[u8]>> = zstd::Decoder::new(data)
         .map_err(|e| ReductionError::Transport(format!("zstd init: {e}")))?;
     let mut limited: std::io::Take<zstd::Decoder<'static, std::io::BufReader<&[u8]>>> =
@@ -60,16 +92,13 @@ mod tests {
 
     #[test]
     fn test_compress_with_custom_level() {
-        // Use a large enough payload that compression level differences are visible
         let data: Vec<u8> = "repeated data ".repeat(10_000).into_bytes();
         let low: Vec<u8> = compress_with_level(&data, 1).unwrap();
         let high: Vec<u8> = compress_with_level(&data, 19).unwrap();
 
-        // Both should decompress to the same data
         assert_eq!(decompress(&low).unwrap(), data);
         assert_eq!(decompress(&high).unwrap(), data);
 
-        // Higher compression level should produce smaller output (or equal)
         assert!(high.len() <= low.len());
     }
 
@@ -102,7 +131,29 @@ mod tests {
         let decompressed: Vec<u8> = decompress(&compressed).unwrap();
 
         assert_eq!(decompressed, data);
-        // Repeated data should compress significantly
         assert!(compressed.len() < data.len() / 10);
+    }
+
+    #[test]
+    fn test_pooled_compress_multiple_calls() {
+        let data_a: &[u8] = b"first payload for pooled compressor test";
+        let data_b: &[u8] = b"second payload with different content to verify context reuse";
+
+        let compressed_a: Vec<u8> = compress(data_a).unwrap();
+        let compressed_b: Vec<u8> = compress(data_b).unwrap();
+
+        assert_eq!(decompress(&compressed_a).unwrap(), data_a);
+        assert_eq!(decompress(&compressed_b).unwrap(), data_b);
+    }
+
+    #[test]
+    fn test_min_compress_threshold() {
+        assert!(MIN_COMPRESS_BYTES > 0);
+        assert!(MIN_COMPRESS_BYTES <= INLINE_COMPRESS_THRESHOLD);
+    }
+
+    #[test]
+    fn test_inline_compress_threshold() {
+        assert!(INLINE_COMPRESS_THRESHOLD >= MIN_COMPRESS_BYTES);
     }
 }

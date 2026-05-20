@@ -121,7 +121,7 @@ mod tests {
         let cert_file = write_pem(&leaf.cert.pem());
         let key_file = write_pem(&leaf.key_pair.serialize_pem());
 
-        let config = build_server_config(
+        let (config, _resolver) = build_server_config(
             cert_file.path(),
             key_file.path(),
             ca_file.path(),

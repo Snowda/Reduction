@@ -8,6 +8,7 @@ use quinn::{Endpoint, Incoming, RecvStream, SendStream, ServerConfig};
 use quinn::crypto::rustls::QuicServerConfig;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info};
 
 use crate::error::{ReductionError, Result};
@@ -70,6 +71,14 @@ pub struct QuicListener {
 
 impl QuicListener {
     pub fn bind(addr: SocketAddr, server_config: ServerConfig) -> Result<Self> {
+        return Self::bind_with_token(addr, server_config, CancellationToken::new());
+    }
+
+    pub fn bind_with_token(
+        addr: SocketAddr,
+        server_config: ServerConfig,
+        shutdown: CancellationToken,
+    ) -> Result<Self> {
         let endpoint: Endpoint = Endpoint::server(server_config, addr)
             .map_err(|e| ReductionError::Transport(format!("QUIC bind: {e}")))?;
 
@@ -80,7 +89,7 @@ impl QuicListener {
         info!(%addr, "QUIC listener bound");
 
         let (stream_tx, stream_rx) = mpsc::channel(STREAM_CHANNEL_CAPACITY);
-        tokio::spawn(accept_connections(endpoint, stream_tx));
+        tokio::spawn(accept_connections(endpoint, stream_tx, shutdown));
 
         return Ok(Self { stream_rx, local_addr });
     }
@@ -93,14 +102,27 @@ impl QuicListener {
 async fn accept_connections(
     endpoint: Endpoint,
     stream_tx: mpsc::Sender<(QuicStream, SocketAddr)>,
+    shutdown: CancellationToken,
 ) {
-    while let Some(incoming) = endpoint.accept().await {
-        let remote_addr: SocketAddr = incoming.remote_address();
-        let tx: mpsc::Sender<(QuicStream, SocketAddr)> = stream_tx.clone();
+    loop {
+        tokio::select! {
+            incoming = endpoint.accept() => {
+                let Some(incoming) = incoming else {
+                    break;
+                };
+                let remote_addr: SocketAddr = incoming.remote_address();
+                let tx: mpsc::Sender<(QuicStream, SocketAddr)> = stream_tx.clone();
 
-        tokio::spawn(async move {
-            handle_connection(incoming, remote_addr, tx).await;
-        });
+                tokio::spawn(async move {
+                    handle_connection(incoming, remote_addr, tx).await;
+                });
+            }
+            _ = shutdown.cancelled() => {
+                info!("shutdown signal received, closing QUIC endpoint");
+                endpoint.close(0u32.into(), b"shutdown");
+                break;
+            }
+        }
     }
     debug!("QUIC endpoint closed, connection acceptor stopping");
 }
@@ -224,7 +246,7 @@ mod tests {
         let cert_file = write_pem(&leaf.cert.pem());
         let key_file = write_pem(&leaf.key_pair.serialize_pem());
 
-        let config = build_server_config(
+        let (config, _resolver) = build_server_config(
             cert_file.path(),
             key_file.path(),
             ca_file.path(),

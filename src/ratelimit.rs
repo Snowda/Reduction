@@ -33,6 +33,7 @@ impl RateLimit {
         });
     }
 
+    #[tracing::instrument(skip_all)]
     pub fn check(&self, key: IpAddr) -> Result<()> {
         if let Some(entry) = self.allow_cache.get(&key) {
             if entry.value().elapsed() < CACHE_WINDOW {

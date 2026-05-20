@@ -1,6 +1,7 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
+use ipnet::IpNet;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -12,15 +13,33 @@ pub struct ReductionConfig {
     #[serde(default)]
     pub balancer: BalancerConfig,
     #[serde(default)]
+    pub proxy: ProxyConfig,
+    #[serde(default)]
+    pub compression: CompressionConfig,
+    #[serde(default)]
+    pub health: HealthConfig,
+    #[serde(default)]
+    pub access: AccessControlConfig,
+    #[serde(default)]
     pub ratelimit: RateLimitConfig,
     #[serde(default)]
     pub metrics: MetricsConfig,
+    #[serde(default)]
+    pub circuit_breaker: CircuitBreakerConfig,
+    #[serde(default)]
+    pub timeouts: TimeoutConfig,
+    #[serde(default)]
+    pub retry: RetryConfig,
+    #[serde(default)]
+    pub tracing: TracingConfig,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct BalancerConfig {
     pub queue_depth: usize,
     pub jitter_factor: f64,
+    pub drain_timeout_secs: u64,
+    pub max_backends: usize,
 }
 
 impl<'de> Deserialize<'de> for BalancerConfig {
@@ -31,12 +50,19 @@ impl<'de> Deserialize<'de> for BalancerConfig {
             queue_depth: usize,
             #[serde(default = "default_jitter_factor")]
             jitter_factor: f64,
+            #[serde(default = "default_drain_timeout_secs")]
+            drain_timeout_secs: u64,
+            #[serde(default = "default_max_backends")]
+            max_backends: usize,
         }
         let wire: Wire = Wire::deserialize(deserializer)?;
         validate_jitter_factor(wire.jitter_factor).map_err(serde::de::Error::custom)?;
+        validate_max_backends(wire.max_backends).map_err(serde::de::Error::custom)?;
         return Ok(BalancerConfig {
             queue_depth: wire.queue_depth,
             jitter_factor: wire.jitter_factor,
+            drain_timeout_secs: wire.drain_timeout_secs,
+            max_backends: wire.max_backends,
         });
     }
 }
@@ -46,6 +72,8 @@ impl Default for BalancerConfig {
         return Self {
             queue_depth: default_queue_depth(),
             jitter_factor: default_jitter_factor(),
+            drain_timeout_secs: default_drain_timeout_secs(),
+            max_backends: default_max_backends(),
         };
     }
 }
@@ -58,10 +86,63 @@ fn default_jitter_factor() -> f64 {
     return 0.05;
 }
 
+fn default_drain_timeout_secs() -> u64 {
+    return 30;
+}
+
+fn default_max_backends() -> usize {
+    return 64;
+}
+
+fn validate_max_backends(max_backends: usize) -> std::result::Result<(), String> {
+    if max_backends == 0 {
+        return Err("max_backends must be at least 1".to_string());
+    }
+    if max_backends > HARD_MAX_BACKENDS {
+        return Err(format!("max_backends {max_backends} exceeds hard limit {HARD_MAX_BACKENDS}"));
+    }
+    return Ok(());
+}
+
+pub const HARD_MAX_BACKENDS: usize = 256;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouteConfig {
     pub path_prefix: String,
     pub backend_id: String,
+    pub timeout_secs: Option<u64>,
+}
+
+fn default_connect_timeout_secs() -> u64 {
+    return 5;
+}
+
+fn default_handshake_timeout_secs() -> u64 {
+    return 5;
+}
+
+fn default_request_timeout_secs() -> u64 {
+    return 30;
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TimeoutConfig {
+    #[serde(default = "default_connect_timeout_secs")]
+    pub connect_secs: u64,
+    #[serde(default = "default_handshake_timeout_secs")]
+    pub handshake_secs: u64,
+    #[serde(default = "default_request_timeout_secs")]
+    pub request_secs: u64,
+}
+
+impl Default for TimeoutConfig {
+    fn default() -> Self {
+        return Self {
+            connect_secs: default_connect_timeout_secs(),
+            handshake_secs: default_handshake_timeout_secs(),
+            request_secs: default_request_timeout_secs(),
+        };
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -98,6 +179,18 @@ pub struct BackendConfig {
     pub host: String,
     pub weight: f64,
     pub transport: TransportKind,
+    pub max_connections: u32,
+}
+
+fn default_max_connections() -> u32 {
+    return 256;
+}
+
+fn validate_max_connections(max_connections: u32) -> std::result::Result<(), String> {
+    if max_connections == 0 {
+        return Err("max_connections must be at least 1".to_string());
+    }
+    return Ok(());
 }
 
 fn validate_weight(weight: f64) -> std::result::Result<(), String> {
@@ -128,7 +221,8 @@ impl BackendConfig {
         validate_weight(weight).expect("invalid backend weight");
         let host: String = address.ip().to_string();
         let pool: String = id.clone();
-        return Self { id, pool, address, host, weight, transport };
+        let max_connections: u32 = default_max_connections();
+        return Self { id, pool, address, host, weight, transport, max_connections };
     }
 
     pub fn with_pool(mut self, pool: String) -> Self {
@@ -138,6 +232,12 @@ impl BackendConfig {
 
     pub fn with_host(mut self, host: String) -> Self {
         self.host = host;
+        return self;
+    }
+
+    pub fn with_max_connections(mut self, max_connections: u32) -> Self {
+        validate_max_connections(max_connections).expect("invalid max_connections");
+        self.max_connections = max_connections;
         return self;
     }
 }
@@ -152,6 +252,7 @@ impl Serialize for BackendConfig {
             address: String,
             weight: f64,
             transport: &'a TransportKind,
+            max_connections: u32,
         }
         let wire: Wire<'_> = Wire {
             id: &self.id,
@@ -160,6 +261,7 @@ impl Serialize for BackendConfig {
             address: self.address.to_string(),
             weight: self.weight,
             transport: &self.transport,
+            max_connections: self.max_connections,
         };
         return wire.serialize(serializer);
     }
@@ -175,11 +277,14 @@ impl<'de> Deserialize<'de> for BackendConfig {
             address: String,
             weight: f64,
             transport: TransportKind,
+            #[serde(default = "default_max_connections")]
+            max_connections: u32,
         }
         let wire: Wire = Wire::deserialize(deserializer)?;
         let address: SocketAddr = wire.address.parse()
             .map_err(|e| serde::de::Error::custom(format!("invalid backend address '{}': {e}", wire.address)))?;
         validate_weight(wire.weight).map_err(serde::de::Error::custom)?;
+        validate_max_connections(wire.max_connections).map_err(serde::de::Error::custom)?;
         let pool: String = wire.pool.unwrap_or_else(|| wire.id.clone());
         let host: String = wire.host.unwrap_or_else(|| address.ip().to_string());
         return Ok(BackendConfig {
@@ -189,6 +294,7 @@ impl<'de> Deserialize<'de> for BackendConfig {
             host,
             weight: wire.weight,
             transport: wire.transport,
+            max_connections: wire.max_connections,
         });
     }
 }
@@ -212,6 +318,180 @@ impl Default for RateLimitConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AccessControlConfig {
+    #[serde(default)]
+    pub allow: Vec<IpNet>,
+    #[serde(default)]
+    pub deny: Vec<IpNet>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct MetricsConfig {
     pub otlp_endpoint: Option<String>,
+}
+
+fn default_trace_sample_ratio() -> f64 {
+    return 1.0;
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TracingConfig {
+    pub otlp_endpoint: Option<String>,
+    #[serde(default = "default_trace_sample_ratio")]
+    pub sample_ratio: f64,
+}
+
+impl Default for TracingConfig {
+    fn default() -> Self {
+        return Self {
+            otlp_endpoint: None,
+            sample_ratio: default_trace_sample_ratio(),
+        };
+    }
+}
+
+fn default_max_response_body_bytes() -> usize {
+    return 10 * 1024 * 1024;
+}
+
+fn default_h2_connections_per_backend() -> usize {
+    return 4;
+}
+
+fn default_max_idle_quic_per_host() -> usize {
+    return 16;
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProxyConfig {
+    #[serde(default = "default_max_response_body_bytes")]
+    pub max_response_body_bytes: usize,
+    #[serde(default = "default_h2_connections_per_backend")]
+    pub h2_connections_per_backend: usize,
+    #[serde(default = "default_max_idle_quic_per_host")]
+    pub max_idle_quic_per_host: usize,
+}
+
+impl Default for ProxyConfig {
+    fn default() -> Self {
+        return Self {
+            max_response_body_bytes: default_max_response_body_bytes(),
+            h2_connections_per_backend: default_h2_connections_per_backend(),
+            max_idle_quic_per_host: default_max_idle_quic_per_host(),
+        };
+    }
+}
+
+fn default_compression_level() -> i32 {
+    return 3;
+}
+
+fn default_min_compress_bytes() -> usize {
+    return 256;
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompressionConfig {
+    #[serde(default = "default_compression_level")]
+    pub level: i32,
+    #[serde(default = "default_min_compress_bytes")]
+    pub min_bytes: usize,
+}
+
+impl Default for CompressionConfig {
+    fn default() -> Self {
+        return Self {
+            level: default_compression_level(),
+            min_bytes: default_min_compress_bytes(),
+        };
+    }
+}
+
+fn default_staleness_ttl_secs() -> u64 {
+    return 300;
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HealthConfig {
+    #[serde(default = "default_staleness_ttl_secs")]
+    pub staleness_ttl_secs: u64,
+}
+
+impl Default for HealthConfig {
+    fn default() -> Self {
+        return Self {
+            staleness_ttl_secs: default_staleness_ttl_secs(),
+        };
+    }
+}
+
+fn default_failure_threshold() -> u32 {
+    return 5;
+}
+
+fn default_recovery_timeout_secs() -> u64 {
+    return 60;
+}
+
+fn default_half_open_max_requests() -> u32 {
+    return 2;
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CircuitBreakerConfig {
+    #[serde(default = "default_failure_threshold")]
+    pub failure_threshold: u32,
+    #[serde(default = "default_recovery_timeout_secs")]
+    pub recovery_timeout_secs: u64,
+    #[serde(default = "default_half_open_max_requests")]
+    pub half_open_max_requests: u32,
+}
+
+impl Default for CircuitBreakerConfig {
+    fn default() -> Self {
+        return Self {
+            failure_threshold: default_failure_threshold(),
+            recovery_timeout_secs: default_recovery_timeout_secs(),
+            half_open_max_requests: default_half_open_max_requests(),
+        };
+    }
+}
+
+fn default_max_retries() -> u32 {
+    return 2;
+}
+
+fn default_retry_base_delay_ms() -> u64 {
+    return 200;
+}
+
+fn default_retry_max_delay_ms() -> u64 {
+    return 2000;
+}
+
+fn default_retry_jitter_ms() -> u64 {
+    return 100;
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetryConfig {
+    #[serde(default = "default_max_retries")]
+    pub max_retries: u32,
+    #[serde(default = "default_retry_base_delay_ms")]
+    pub base_delay_ms: u64,
+    #[serde(default = "default_retry_max_delay_ms")]
+    pub max_delay_ms: u64,
+    #[serde(default = "default_retry_jitter_ms")]
+    pub jitter_ms: u64,
+}
+
+impl Default for RetryConfig {
+    fn default() -> Self {
+        return Self {
+            max_retries: default_max_retries(),
+            base_delay_ms: default_retry_base_delay_ms(),
+            max_delay_ms: default_retry_max_delay_ms(),
+            jitter_ms: default_retry_jitter_ms(),
+        };
+    }
 }

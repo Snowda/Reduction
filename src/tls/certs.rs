@@ -8,6 +8,7 @@ use rustls::server::WebPkiClientVerifier;
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
 
 use crate::error::{ReductionError, Result};
+use crate::tls::reload::{ReloadingCertResolver, ReloadingClientCertResolver};
 
 // Load PEM-encoded certificates from a file.
 pub fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
@@ -51,14 +52,14 @@ pub fn load_ca_certs(path: &Path) -> Result<RootCertStore> {
     return Ok(root_store);
 }
 
-// Build a rustls ServerConfig with mTLS (mutual TLS) requiring client certificates.
+// Build a rustls ServerConfig with mTLS and a reloadable cert resolver.
 pub fn build_server_config(
     cert_path: &Path,
     key_path: &Path,
     ca_cert_path: &Path,
-) -> Result<ServerConfig> {
-    let certs: Vec<CertificateDer<'static>> = load_certs(cert_path)?;
-    let key: PrivateKeyDer<'static> = load_private_key(key_path)?;
+) -> Result<(ServerConfig, Arc<ReloadingCertResolver>)> {
+    let resolver: Arc<ReloadingCertResolver> =
+        Arc::new(ReloadingCertResolver::new(cert_path, key_path)?);
     let root_store: RootCertStore = load_ca_certs(ca_cert_path)?;
 
     let client_verifier: Arc<dyn rustls::server::danger::ClientCertVerifier> =
@@ -66,34 +67,39 @@ pub fn build_server_config(
             .build()
             .map_err(|e| ReductionError::Config(format!("failed to build client verifier: {e}")))?;
 
-    let config: ServerConfig = ServerConfig::builder()
+    let mut config: ServerConfig = ServerConfig::builder()
         .with_client_cert_verifier(client_verifier)
-        .with_single_cert(certs, key)?;
+        .with_cert_resolver(resolver.clone());
 
-    return Ok(config);
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+
+    return Ok((config, resolver));
 }
 
-// Build a rustls ClientConfig with mTLS for connecting to backends.
+// Build a rustls ClientConfig with mTLS and a reloadable cert resolver.
 pub fn build_client_config(
     cert_path: &Path,
     key_path: &Path,
     ca_cert_path: &Path,
-) -> Result<ClientConfig> {
-    let certs: Vec<CertificateDer<'static>> = load_certs(cert_path)?;
-    let key: PrivateKeyDer<'static> = load_private_key(key_path)?;
+) -> Result<(ClientConfig, Arc<ReloadingClientCertResolver>)> {
+    let resolver: Arc<ReloadingClientCertResolver> =
+        Arc::new(ReloadingClientCertResolver::new(cert_path, key_path)?);
     let root_store: RootCertStore = load_ca_certs(ca_cert_path)?;
 
-    let config: ClientConfig = ClientConfig::builder()
+    let mut config: ClientConfig = ClientConfig::builder()
         .with_root_certificates(root_store)
-        .with_client_auth_cert(certs, key)?;
+        .with_client_cert_resolver(resolver.clone());
 
-    return Ok(config);
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+
+    return Ok((config, resolver));
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write;
+    use rustls::client::ResolvesClientCert;
     use tempfile::NamedTempFile;
 
     fn generate_ca() -> rcgen::CertifiedKey {
@@ -212,8 +218,10 @@ mod tests {
     fn test_build_server_config_valid() {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let (cert_file, key_file, ca_file) = setup_pki();
-        let config = build_server_config(cert_file.path(), key_file.path(), ca_file.path());
-        assert!(config.is_ok());
+        let result = build_server_config(cert_file.path(), key_file.path(), ca_file.path());
+        assert!(result.is_ok());
+        let (_config, resolver) = result.unwrap();
+        assert!(!resolver.current().cert.is_empty());
     }
 
     #[test]
@@ -232,8 +240,10 @@ mod tests {
     fn test_build_client_config_valid() {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let (cert_file, key_file, ca_file) = setup_pki();
-        let config = build_client_config(cert_file.path(), key_file.path(), ca_file.path());
-        assert!(config.is_ok());
+        let result = build_client_config(cert_file.path(), key_file.path(), ca_file.path());
+        assert!(result.is_ok());
+        let (_config, resolver) = result.unwrap();
+        assert!(resolver.has_certs());
     }
 
     #[test]
