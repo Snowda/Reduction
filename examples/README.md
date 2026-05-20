@@ -1,5 +1,18 @@
 # Examples
 
+## acl_demo
+
+Demonstrates Reduction's CIDR-based IP access control (allow/deny listing). Starts a proxy with four different ACL configurations in sequence and shows how each mode handles incoming requests:
+
+1. **Allow-list only** — default-deny, only listed CIDRs pass (127.0.0.1/32 allowed)
+2. **Deny-list only** — default-allow, listed CIDRs blocked (10.0.0.0/8 denied)
+3. **Both lists** — deny checked first, then allow, default-deny (127.0.0.1 denied even though it falls within the allow range)
+4. **Disabled** — no rules configured, all traffic passes through
+
+```sh
+cargo run --example acl_demo
+```
+
 ## demo
 
 A self-contained demonstration of Reduction's core proxy features: mTLS certificate generation, request forwarding, health-weighted backend selection, and config hot-reload. Starts a simple JSON echo backend behind the proxy and exercises each feature in sequence.
@@ -100,6 +113,36 @@ Reduction - MCP Reverse Proxy Demo
 
 -- Demo Complete --
 ```
+
+## profile_loadtest
+
+Configurable load driver for profiling and flamechart analysis. Starts the same mTLS proxy + backend setup as the demos, then drives sustained traffic at configurable concurrency and reports latency percentiles.
+
+### Usage
+
+```sh
+# 10 concurrent workers, 1000 total requests (defaults)
+cargo run --release --example profile_loadtest
+
+# Custom: 20 workers, 5000 requests
+cargo run --release --example profile_loadtest -- 20 5000
+
+# With chrome trace output (opens in https://ui.perfetto.dev)
+cargo run --release --example profile_loadtest -- 10 500 --trace
+```
+
+The `--trace` flag writes a `trace.json` to the working directory. Open it in [Perfetto UI](https://ui.perfetto.dev) to see a per-request flamechart with spans for each proxy phase: rate limit check, route matching, backend selection, connection pool acquire, and request forwarding.
+
+### Sampling flamegraph
+
+For CPU-level profiling, install `cargo-flamegraph` and run with ETW (requires admin):
+
+```sh
+cargo install flamegraph
+cargo flamegraph --release --example profile_loadtest -- 20 5000
+```
+
+This produces an interactive SVG flamegraph showing where CPU time is spent.
 
 ### Notes
 
