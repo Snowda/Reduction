@@ -27,6 +27,8 @@ use reduction::config::{self, BackendConfig, CircuitBreakerConfig, ReductionConf
 use reduction::health::{BackendHealth, HealthBroadcast, HealthState};
 use reduction::metrics::ProxyMetrics;
 use reduction::acl::AccessControl;
+use reduction::cache::ResponseCache;
+use reduction::config::CacheConfig;
 use reduction::proxy::{ConnPool, ProxyState, ReloadableState, Router, proxy_handler};
 use reduction::ratelimit::RateLimit;
 use reduction::tls;
@@ -474,6 +476,8 @@ async fn start_services(dir: &Path, config_path: &Path) -> DemoHandles {
         proxy_config: reduction::config::ProxyConfig::default(),
         compression_config: reduction::config::CompressionConfig::default(),
         retry_config: reduction::config::RetryConfig::default(),
+        cache_config: CacheConfig::default(),
+        response_cache: ResponseCache::new(&CacheConfig::default()),
     });
 
     let (config_tx, config_rx) = watch::channel(config.clone());
