@@ -1,5 +1,6 @@
 pub mod acl;
 pub mod balancer;
+pub mod cache;
 pub mod cache_control;
 pub mod circuit;
 pub mod compression;
@@ -12,3 +13,4 @@ pub mod ratelimit;
 pub mod tls;
 pub mod tracing_init;
 pub mod transport;
+pub mod tunnel;
