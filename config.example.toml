@@ -62,6 +62,15 @@ base_delay_ms = 200                  # initial backoff delay
 max_delay_ms = 2000                  # backoff cap
 jitter_ms = 100                      # random jitter added to each delay
 
+# Response cache (all optional, shown with defaults)
+# Caches GET/HEAD responses keyed on method + path. Respects Cache-Control
+# directives: no-store and private skip caching, max-age sets TTL.
+[cache]
+# enabled = false                     # opt-in; no caching by default
+# max_entries = 1000                  # LRU capacity
+# max_entry_bytes = 1048576           # 1 MB — reject entries larger than this
+# default_ttl_secs = 60              # fallback TTL when response has no max-age
+
 # Health monitoring (all optional, shown with defaults)
 [health]
 staleness_ttl_secs = 300             # health data older than this is ignored
