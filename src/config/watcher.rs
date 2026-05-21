@@ -84,9 +84,9 @@ mod tests {
 
     use super::*;
     use crate::config::{
-        AccessControlConfig, BackendConfig, BalancerConfig, CircuitBreakerConfig,
+        AccessControlConfig, BackendConfig, BalancerConfig, CacheConfig, CircuitBreakerConfig,
         CompressionConfig, HealthConfig, ListenConfig, MetricsConfig, ProxyConfig,
-        RateLimitConfig, RetryConfig, RouteConfig, TimeoutConfig, TlsConfig, TlsIdentity, TracingConfig, TransportKind,
+        RateLimitConfig, RetryConfig, RouteConfig, TimeoutConfig, TlsConfig, TlsIdentity, TracingConfig, TransportKind, TunnelConfig,
     };
 
     fn test_config() -> ReductionConfig {
@@ -129,6 +129,8 @@ mod tests {
             timeouts: TimeoutConfig::default(),
             retry: RetryConfig::default(),
             tracing: TracingConfig::default(),
+            tunnel: TunnelConfig::default(),
+            cache: CacheConfig::default(),
         };
     }
 

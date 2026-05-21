@@ -21,6 +21,15 @@ pub struct ProxyMetrics {
     pub backend_active_connections: UpDownCounter<i64>,
     pub backend_conn_limit_rejected: Counter<u64>,
     pub retry_attempts: Counter<u64>,
+    pub tunnel_sessions_active: UpDownCounter<i64>,
+    pub tunnel_streams_opened: Counter<u64>,
+    pub tunnel_heartbeat_timeouts: Counter<u64>,
+    pub tunnel_registration_rejected: Counter<u64>,
+    pub raw_relay_active: UpDownCounter<i64>,
+    pub raw_relay_bytes_relayed: Counter<u64>,
+    pub raw_relay_errors: Counter<u64>,
+    pub cache_hits: Counter<u64>,
+    pub cache_misses: Counter<u64>,
     active_count: AtomicI64,
 }
 
@@ -83,6 +92,51 @@ impl ProxyMetrics {
             .with_description("Number of retry attempts by backend and outcome")
             .build();
 
+        let tunnel_sessions_active: UpDownCounter<i64> = meter
+            .i64_up_down_counter("proxy.tunnel.sessions_active")
+            .with_description("Active reverse tunnel sessions")
+            .build();
+
+        let tunnel_streams_opened: Counter<u64> = meter
+            .u64_counter("proxy.tunnel.streams_opened")
+            .with_description("Streams opened over reverse tunnels")
+            .build();
+
+        let tunnel_heartbeat_timeouts: Counter<u64> = meter
+            .u64_counter("proxy.tunnel.heartbeat_timeouts")
+            .with_description("Tunnel sessions lost to heartbeat timeout")
+            .build();
+
+        let tunnel_registration_rejected: Counter<u64> = meter
+            .u64_counter("proxy.tunnel.registration_rejected")
+            .with_description("Tunnel registration attempts rejected")
+            .build();
+
+        let raw_relay_active: UpDownCounter<i64> = meter
+            .i64_up_down_counter("proxy.raw_relay.active")
+            .with_description("Active raw QUIC stream relays")
+            .build();
+
+        let raw_relay_bytes_relayed: Counter<u64> = meter
+            .u64_counter("proxy.raw_relay.bytes_relayed")
+            .with_description("Bytes relayed through raw QUIC streams")
+            .build();
+
+        let raw_relay_errors: Counter<u64> = meter
+            .u64_counter("proxy.raw_relay.errors")
+            .with_description("Errors in raw QUIC stream relay")
+            .build();
+
+        let cache_hits: Counter<u64> = meter
+            .u64_counter("proxy.cache.hits")
+            .with_description("Response cache hits")
+            .build();
+
+        let cache_misses: Counter<u64> = meter
+            .u64_counter("proxy.cache.misses")
+            .with_description("Response cache misses")
+            .build();
+
         return Self {
             requests_total,
             request_duration_ms,
@@ -95,6 +149,15 @@ impl ProxyMetrics {
             backend_active_connections,
             backend_conn_limit_rejected,
             retry_attempts,
+            tunnel_sessions_active,
+            tunnel_streams_opened,
+            tunnel_heartbeat_timeouts,
+            tunnel_registration_rejected,
+            raw_relay_active,
+            raw_relay_bytes_relayed,
+            raw_relay_errors,
+            cache_hits,
+            cache_misses,
             active_count: AtomicI64::new(0),
         };
     }

@@ -32,6 +32,10 @@ pub struct ReductionConfig {
     pub retry: RetryConfig,
     #[serde(default)]
     pub tracing: TracingConfig,
+    #[serde(default)]
+    pub tunnel: TunnelConfig,
+    #[serde(default)]
+    pub cache: CacheConfig,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -362,6 +366,22 @@ fn default_max_idle_quic_per_host() -> usize {
     return 16;
 }
 
+fn default_h2_stream_window() -> u32 {
+    return 2 * 1024 * 1024;
+}
+
+fn default_h2_conn_window() -> u32 {
+    return 4 * 1024 * 1024;
+}
+
+fn default_inline_compress_threshold() -> usize {
+    return 8192;
+}
+
+fn default_quic_channel_capacity() -> usize {
+    return 256;
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProxyConfig {
     #[serde(default = "default_max_response_body_bytes")]
@@ -370,6 +390,14 @@ pub struct ProxyConfig {
     pub h2_connections_per_backend: usize,
     #[serde(default = "default_max_idle_quic_per_host")]
     pub max_idle_quic_per_host: usize,
+    #[serde(default = "default_h2_stream_window")]
+    pub h2_stream_window: u32,
+    #[serde(default = "default_h2_conn_window")]
+    pub h2_conn_window: u32,
+    #[serde(default = "default_inline_compress_threshold")]
+    pub inline_compress_threshold: usize,
+    #[serde(default = "default_quic_channel_capacity")]
+    pub quic_channel_capacity: usize,
 }
 
 impl Default for ProxyConfig {
@@ -378,6 +406,10 @@ impl Default for ProxyConfig {
             max_response_body_bytes: default_max_response_body_bytes(),
             h2_connections_per_backend: default_h2_connections_per_backend(),
             max_idle_quic_per_host: default_max_idle_quic_per_host(),
+            h2_stream_window: default_h2_stream_window(),
+            h2_conn_window: default_h2_conn_window(),
+            inline_compress_threshold: default_inline_compress_threshold(),
+            quic_channel_capacity: default_quic_channel_capacity(),
         };
     }
 }
@@ -492,6 +524,81 @@ impl Default for RetryConfig {
             base_delay_ms: default_retry_base_delay_ms(),
             max_delay_ms: default_retry_max_delay_ms(),
             jitter_ms: default_retry_jitter_ms(),
+        };
+    }
+}
+
+fn default_heartbeat_interval_secs() -> u64 {
+    return 15;
+}
+
+fn default_heartbeat_timeout_secs() -> u64 {
+    return 45;
+}
+
+fn default_max_sessions_per_backend() -> usize {
+    return 8;
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TunnelConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    pub listen_address: Option<SocketAddr>,
+    #[serde(default = "default_heartbeat_interval_secs")]
+    pub heartbeat_interval_secs: u64,
+    #[serde(default = "default_heartbeat_timeout_secs")]
+    pub heartbeat_timeout_secs: u64,
+    #[serde(default)]
+    pub allowed_backend_ids: Vec<String>,
+    #[serde(default = "default_max_sessions_per_backend")]
+    pub max_sessions_per_backend: usize,
+}
+
+impl Default for TunnelConfig {
+    fn default() -> Self {
+        return Self {
+            enabled: false,
+            listen_address: None,
+            heartbeat_interval_secs: default_heartbeat_interval_secs(),
+            heartbeat_timeout_secs: default_heartbeat_timeout_secs(),
+            allowed_backend_ids: Vec::new(),
+            max_sessions_per_backend: default_max_sessions_per_backend(),
+        };
+    }
+}
+
+fn default_cache_max_entries() -> usize {
+    return 1000;
+}
+
+fn default_cache_max_entry_bytes() -> usize {
+    return 1024 * 1024;
+}
+
+fn default_cache_default_ttl_secs() -> u64 {
+    return 60;
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CacheConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_cache_max_entries")]
+    pub max_entries: usize,
+    #[serde(default = "default_cache_max_entry_bytes")]
+    pub max_entry_bytes: usize,
+    #[serde(default = "default_cache_default_ttl_secs")]
+    pub default_ttl_secs: u64,
+}
+
+impl Default for CacheConfig {
+    fn default() -> Self {
+        return Self {
+            enabled: false,
+            max_entries: default_cache_max_entries(),
+            max_entry_bytes: default_cache_max_entry_bytes(),
+            default_ttl_secs: default_cache_default_ttl_secs(),
         };
     }
 }

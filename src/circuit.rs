@@ -1,4 +1,5 @@
 use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
@@ -46,8 +47,29 @@ impl BackendBreaker {
     }
 }
 
+/// RAII guard that decrements `half_open_inflight` when dropped,
+/// unless the circuit has already transitioned out of HalfOpen.
+pub struct HalfOpenGuard {
+    breaker: Arc<BackendBreaker>,
+}
+
+impl std::fmt::Debug for HalfOpenGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        return f.debug_struct("HalfOpenGuard").finish();
+    }
+}
+
+impl Drop for HalfOpenGuard {
+    fn drop(&mut self) {
+        let current: CircuitState = CircuitState::from(self.breaker.state.load(Ordering::Acquire));
+        if current == CircuitState::HalfOpen {
+            self.breaker.half_open_inflight.fetch_sub(1, Ordering::Release);
+        }
+    }
+}
+
 pub struct CircuitBreakers {
-    breakers: DashMap<String, BackendBreaker>,
+    breakers: DashMap<String, Arc<BackendBreaker>>,
     failure_threshold: u32,
     recovery_timeout: Duration,
     half_open_max_requests: u32,
@@ -63,14 +85,15 @@ impl CircuitBreakers {
         };
     }
 
-    pub fn check(&self, backend_id: &str) -> CircuitState {
-        let breaker = self.breakers.entry(backend_id.to_string())
-            .or_insert_with(BackendBreaker::new);
+    pub fn check(&self, backend_id: &str) -> (CircuitState, Option<HalfOpenGuard>) {
+        let breaker: Arc<BackendBreaker> = self.breakers.entry(backend_id.to_string())
+            .or_insert_with(|| Arc::new(BackendBreaker::new()))
+            .clone();
 
         let current: CircuitState = CircuitState::from(breaker.state.load(Ordering::Acquire));
 
         return match current {
-            CircuitState::Closed => CircuitState::Closed,
+            CircuitState::Closed => (CircuitState::Closed, None),
             CircuitState::Open => {
                 let should_transition: bool = {
                     let opened_at = breaker.opened_at.lock();
@@ -82,18 +105,20 @@ impl CircuitBreakers {
                     breaker.half_open_inflight.store(1, Ordering::Release);
                     breaker.state.store(STATE_HALF_OPEN, Ordering::Release);
                     info!(backend = %backend_id, "circuit breaker transitioning to half-open");
-                    CircuitState::HalfOpen
+                    let guard: HalfOpenGuard = HalfOpenGuard { breaker };
+                    (CircuitState::HalfOpen, Some(guard))
                 } else {
-                    CircuitState::Open
+                    (CircuitState::Open, None)
                 }
             }
             CircuitState::HalfOpen => {
                 let inflight: u32 = breaker.half_open_inflight.fetch_add(1, Ordering::AcqRel);
                 if inflight >= self.half_open_max_requests {
                     breaker.half_open_inflight.fetch_sub(1, Ordering::Release);
-                    CircuitState::Open
+                    (CircuitState::Open, None)
                 } else {
-                    CircuitState::HalfOpen
+                    let guard: HalfOpenGuard = HalfOpenGuard { breaker };
+                    (CircuitState::HalfOpen, Some(guard))
                 }
             }
         };
@@ -109,6 +134,7 @@ impl CircuitBreakers {
         match current {
             CircuitState::HalfOpen => {
                 breaker.consecutive_failures.store(0, Ordering::Release);
+                breaker.half_open_inflight.store(0, Ordering::Release);
                 breaker.state.store(STATE_CLOSED, Ordering::Release);
                 *breaker.opened_at.lock() = None;
                 info!(backend = %backend_id, "circuit breaker closed after successful probe");
@@ -121,8 +147,9 @@ impl CircuitBreakers {
     }
 
     pub fn record_failure(&self, backend_id: &str) {
-        let breaker = self.breakers.entry(backend_id.to_string())
-            .or_insert_with(BackendBreaker::new);
+        let breaker: Arc<BackendBreaker> = self.breakers.entry(backend_id.to_string())
+            .or_insert_with(|| Arc::new(BackendBreaker::new()))
+            .clone();
 
         let current: CircuitState = CircuitState::from(breaker.state.load(Ordering::Acquire));
 
@@ -140,6 +167,7 @@ impl CircuitBreakers {
                 }
             }
             CircuitState::HalfOpen => {
+                breaker.half_open_inflight.store(0, Ordering::Release);
                 breaker.state.store(STATE_OPEN, Ordering::Release);
                 *breaker.opened_at.lock() = Some(Instant::now());
                 warn!(backend = %backend_id, "circuit breaker re-opened after half-open failure");
@@ -152,6 +180,10 @@ impl CircuitBreakers {
         return self.breakers.get(backend_id)
             .map(|b| CircuitState::from(b.state.load(Ordering::Acquire)))
             .unwrap_or(CircuitState::Closed);
+    }
+
+    pub fn remove_backend(&self, backend_id: &str) {
+        self.breakers.remove(backend_id);
     }
 }
 
@@ -167,11 +199,16 @@ mod tests {
         };
     }
 
+    fn check_state(cb: &CircuitBreakers, id: &str) -> CircuitState {
+        let (state, _guard) = cb.check(id);
+        return state;
+    }
+
     #[test]
     fn test_starts_closed() {
         let cb: CircuitBreakers = CircuitBreakers::new(&test_config());
         assert_eq!(cb.state("backend-1"), CircuitState::Closed);
-        assert_eq!(cb.check("backend-1"), CircuitState::Closed);
+        assert_eq!(check_state(&cb, "backend-1"), CircuitState::Closed);
     }
 
     #[test]
@@ -203,7 +240,7 @@ mod tests {
         for _ in 0..3 {
             cb.record_failure("b1");
         }
-        assert_eq!(cb.check("b1"), CircuitState::Open);
+        assert_eq!(check_state(&cb, "b1"), CircuitState::Open);
     }
 
     #[test]
@@ -218,8 +255,9 @@ mod tests {
         assert_eq!(cb.state("b1"), CircuitState::Open);
 
         // recovery_timeout is 0s so it should immediately transition
-        let state: CircuitState = cb.check("b1");
+        let (state, guard) = cb.check("b1");
         assert_eq!(state, CircuitState::HalfOpen);
+        assert!(guard.is_some());
     }
 
     #[test]
@@ -232,10 +270,12 @@ mod tests {
         let cb: CircuitBreakers = CircuitBreakers::new(&config);
         cb.record_failure("b1");
 
-        assert_eq!(cb.check("b1"), CircuitState::HalfOpen);
-        assert_eq!(cb.check("b1"), CircuitState::HalfOpen);
+        let (_s1, _g1) = cb.check("b1");
+        assert_eq!(_s1, CircuitState::HalfOpen);
+        let (_s2, _g2) = cb.check("b1");
+        assert_eq!(_s2, CircuitState::HalfOpen);
         // Third probe should be rejected (returns Open)
-        assert_eq!(cb.check("b1"), CircuitState::Open);
+        assert_eq!(check_state(&cb, "b1"), CircuitState::Open);
     }
 
     #[test]
@@ -267,6 +307,60 @@ mod tests {
     }
 
     #[test]
+    fn test_half_open_guard_decrements_on_drop() {
+        let config: CircuitBreakerConfig = CircuitBreakerConfig {
+            failure_threshold: 1,
+            recovery_timeout_secs: 0,
+            half_open_max_requests: 3,
+        };
+        let cb: CircuitBreakers = CircuitBreakers::new(&config);
+        cb.record_failure("b1");
+
+        let (_s1, guard1) = cb.check("b1"); // inflight=1
+        assert_eq!(_s1, CircuitState::HalfOpen);
+        let (_s2, _g2) = cb.check("b1"); // inflight=2
+        assert_eq!(_s2, CircuitState::HalfOpen);
+
+        // Drop guard1 — should decrement inflight back to 1
+        drop(guard1);
+
+        // Now a third check should succeed (inflight was 2, dropped to 1, now goes to 2 again)
+        let (_s3, _g3) = cb.check("b1");
+        assert_eq!(_s3, CircuitState::HalfOpen);
+    }
+
+    #[test]
+    fn test_guard_no_decrement_after_state_transition() {
+        let config: CircuitBreakerConfig = CircuitBreakerConfig {
+            failure_threshold: 1,
+            recovery_timeout_secs: 0,
+            half_open_max_requests: 2,
+        };
+        let cb: CircuitBreakers = CircuitBreakers::new(&config);
+        cb.record_failure("b1");
+
+        let (_state, guard) = cb.check("b1"); // half-open, inflight=1
+        cb.record_success("b1"); // transitions to Closed, resets inflight to 0
+
+        // Dropping guard after transition to Closed should NOT decrement
+        drop(guard);
+
+        // State should remain Closed (not corrupted by guard drop)
+        assert_eq!(cb.state("b1"), CircuitState::Closed);
+    }
+
+    #[test]
+    fn test_remove_backend() {
+        let cb: CircuitBreakers = CircuitBreakers::new(&test_config());
+        cb.check("b1");
+        cb.record_failure("b1");
+        assert_eq!(cb.state("b1"), CircuitState::Closed);
+        cb.remove_backend("b1");
+        // After removal, state resets to default (Closed, no entry)
+        assert_eq!(cb.state("b1"), CircuitState::Closed);
+    }
+
+    #[test]
     fn test_independent_backends() {
         let cb: CircuitBreakers = CircuitBreakers::new(&test_config());
         for _ in 0..3 {
@@ -274,7 +368,7 @@ mod tests {
         }
         assert_eq!(cb.state("b1"), CircuitState::Open);
         assert_eq!(cb.state("b2"), CircuitState::Closed);
-        assert_eq!(cb.check("b2"), CircuitState::Closed);
+        assert_eq!(check_state(&cb, "b2"), CircuitState::Closed);
     }
 
     #[test]

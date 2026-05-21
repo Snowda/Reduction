@@ -34,6 +34,12 @@ pub enum ReductionError {
 
     #[error("circuit open for backend {0}")]
     CircuitOpen(String),
+
+    #[error("connect tunnel: {0}")]
+    ConnectTunnel(String),
+
+    #[error("tunnel: {0}")]
+    Tunnel(String),
 }
 
 pub type Result<T> = std::result::Result<T, ReductionError>;

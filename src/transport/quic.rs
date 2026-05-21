@@ -13,6 +13,9 @@ use tracing::{debug, error, info};
 
 use crate::error::{ReductionError, Result};
 
+pub const STREAM_TYPE_HTTP: u8 = 0x01;
+pub const STREAM_TYPE_RAW: u8 = 0x02;
+
 pub struct QuicStream {
     send: SendStream,
     recv: RecvStream,
@@ -62,22 +65,24 @@ impl AsyncWrite for QuicStream {
 
 impl Unpin for QuicStream {}
 
-const STREAM_CHANNEL_CAPACITY: usize = 256;
+const DEFAULT_CHANNEL_CAPACITY: usize = 256;
 
 pub struct QuicListener {
     stream_rx: mpsc::Receiver<(QuicStream, SocketAddr)>,
+    raw_stream_rx: Option<mpsc::Receiver<(QuicStream, SocketAddr)>>,
     local_addr: SocketAddr,
 }
 
 impl QuicListener {
     pub fn bind(addr: SocketAddr, server_config: ServerConfig) -> Result<Self> {
-        return Self::bind_with_token(addr, server_config, CancellationToken::new());
+        return Self::bind_with_token(addr, server_config, CancellationToken::new(), DEFAULT_CHANNEL_CAPACITY);
     }
 
     pub fn bind_with_token(
         addr: SocketAddr,
         server_config: ServerConfig,
         shutdown: CancellationToken,
+        channel_capacity: usize,
     ) -> Result<Self> {
         let endpoint: Endpoint = Endpoint::server(server_config, addr)
             .map_err(|e| ReductionError::Transport(format!("QUIC bind: {e}")))?;
@@ -88,10 +93,15 @@ impl QuicListener {
 
         info!(%addr, "QUIC listener bound");
 
-        let (stream_tx, stream_rx) = mpsc::channel(STREAM_CHANNEL_CAPACITY);
-        tokio::spawn(accept_connections(endpoint, stream_tx, shutdown));
+        let (stream_tx, stream_rx) = mpsc::channel(channel_capacity);
+        let (raw_tx, raw_rx) = mpsc::channel(channel_capacity);
+        tokio::spawn(accept_connections(endpoint, stream_tx, raw_tx, shutdown));
 
-        return Ok(Self { stream_rx, local_addr });
+        return Ok(Self { stream_rx, raw_stream_rx: Some(raw_rx), local_addr });
+    }
+
+    pub fn take_raw_stream_receiver(&mut self) -> Option<mpsc::Receiver<(QuicStream, SocketAddr)>> {
+        return self.raw_stream_rx.take();
     }
 
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
@@ -102,6 +112,7 @@ impl QuicListener {
 async fn accept_connections(
     endpoint: Endpoint,
     stream_tx: mpsc::Sender<(QuicStream, SocketAddr)>,
+    raw_stream_tx: mpsc::Sender<(QuicStream, SocketAddr)>,
     shutdown: CancellationToken,
 ) {
     loop {
@@ -112,9 +123,10 @@ async fn accept_connections(
                 };
                 let remote_addr: SocketAddr = incoming.remote_address();
                 let tx: mpsc::Sender<(QuicStream, SocketAddr)> = stream_tx.clone();
+                let raw_tx: mpsc::Sender<(QuicStream, SocketAddr)> = raw_stream_tx.clone();
 
                 tokio::spawn(async move {
-                    handle_connection(incoming, remote_addr, tx).await;
+                    handle_connection(incoming, remote_addr, tx, raw_tx).await;
                 });
             }
             _ = shutdown.cancelled() => {
@@ -131,6 +143,7 @@ async fn handle_connection(
     incoming: Incoming,
     remote_addr: SocketAddr,
     stream_tx: mpsc::Sender<(QuicStream, SocketAddr)>,
+    raw_stream_tx: mpsc::Sender<(QuicStream, SocketAddr)>,
 ) {
     let connection: quinn::Connection = match incoming.await {
         Ok(conn) => conn,
@@ -144,11 +157,41 @@ async fn handle_connection(
 
     loop {
         match connection.accept_bi().await {
-            Ok((send, recv)) => {
-                let stream: QuicStream = QuicStream::new(send, recv);
-                if stream_tx.send((stream, remote_addr)).await.is_err() {
-                    return;
-                }
+            Ok((send, mut recv)) => {
+                let tx: mpsc::Sender<(QuicStream, SocketAddr)> = stream_tx.clone();
+                let raw_tx: mpsc::Sender<(QuicStream, SocketAddr)> = raw_stream_tx.clone();
+                let addr: SocketAddr = remote_addr;
+
+                tokio::spawn(async move {
+                    let mut type_buf: [u8; 1] = [0u8; 1];
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        tokio::io::AsyncReadExt::read_exact(&mut recv, &mut type_buf),
+                    ).await {
+                        Ok(Ok(_)) => {}
+                        Ok(Err(e)) => {
+                            debug!(error = %e, %addr, "failed to read stream type byte");
+                            return;
+                        }
+                        Err(_) => {
+                            debug!(%addr, "stream type byte read timed out");
+                            return;
+                        }
+                    }
+
+                    let stream: QuicStream = QuicStream::new(send, recv);
+                    match type_buf[0] {
+                        STREAM_TYPE_HTTP => {
+                            let _ = tx.send((stream, addr)).await;
+                        }
+                        STREAM_TYPE_RAW => {
+                            let _ = raw_tx.send((stream, addr)).await;
+                        }
+                        unknown => {
+                            debug!(%addr, unknown, "unknown stream type byte, dropping stream");
+                        }
+                    }
+                });
             }
             Err(quinn::ConnectionError::ApplicationClosed(_)) => {
                 debug!(%remote_addr, "QUIC connection closed by peer");
@@ -175,11 +218,14 @@ impl axum::serve::Listener for QuicListener {
     type Addr = SocketAddr;
 
     async fn accept(&mut self) -> (Self::Io, Self::Addr) {
-        return self
-            .stream_rx
-            .recv()
-            .await
-            .expect("QUIC acceptor task stopped unexpectedly");
+        match self.stream_rx.recv().await {
+            Some(stream) => return stream,
+            None => {
+                error!("QUIC acceptor task stopped, waiting for graceful shutdown");
+                std::future::pending::<(Self::Io, Self::Addr)>().await;
+                unreachable!()
+            }
+        }
     }
 
     fn local_addr(&self) -> io::Result<Self::Addr> {
@@ -290,6 +336,6 @@ mod tests {
 
     #[test]
     fn test_stream_channel_capacity_constant() {
-        assert_eq!(STREAM_CHANNEL_CAPACITY, 256);
+        assert_eq!(DEFAULT_CHANNEL_CAPACITY, 256);
     }
 }

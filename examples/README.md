@@ -114,6 +114,81 @@ Reduction - MCP Reverse Proxy Demo
 -- Demo Complete --
 ```
 
+## tunnel_demo
+
+Demonstrates NAT traversal using Reduction's reverse tunnel feature. A backend behind a simulated NAT connects *outbound* to the proxy's tunnel listener via QUIC, registers itself, and then serves HTTP requests forwarded through the tunnel — no inbound ports required on the backend side.
+
+### What it does
+
+```
+┌──────────┐      mTLS/TCP      ┌───────────┐    Tunnel QUIC     ┌──────────────┐
+│  Client   │ ───────────────►  │ Reduction │ ◄─────────────────  │  Backend     │
+│           │  POST /api        │   Proxy   │   (reverse tunnel)  │  (behind NAT)│
+│           │                   │  :18443   │   :18444             │              │
+└──────────┘                    └───────────┘                     └──────────────┘
+```
+
+The demo runs five phases:
+
+**Phase 1 — TLS certificates.** Generates an ephemeral CA, server certificate (SAN: 127.0.0.1), and client certificate using `rcgen`.
+
+**Phase 2 — Proxy with tunnel listener.** Starts the Reduction proxy on `:18443` (TCP, for client requests) and a QUIC tunnel listener on `:18444` (for backend registration). The proxy's connection pool is configured with a `TunnelRegistry` so requests to tunnel backends are routed over reverse-tunnel streams.
+
+**Phase 3 — Backend registration.** A simulated "backend behind NAT" connects outbound to the tunnel listener via QUIC, sends a `TunnelFrame::Register` on the control channel, receives a `RegisterAck`, and starts a heartbeat loop. It also spawns an acceptor that serves HTTP/1.1 on any bidi streams opened by the proxy.
+
+**Phase 4 — Client requests.** An mTLS client sends HTTP requests to the proxy. The proxy resolves the route to the tunnel backend, opens a new QUIC stream on the backend's reverse-tunnel connection, performs an HTTP/1.1 handshake, and forwards the request. The response includes `"transport":"reverse-tunnel"` to confirm the tunnel path.
+
+**Phase 5 — Topology diagram.** Prints the architecture to highlight that the backend initiated the connection — no inbound ports needed.
+
+### Run it
+
+```sh
+cargo run --example tunnel_demo
+```
+
+### Expected output
+
+```
+Reduction - NAT Traversal Tunnel Demo
+======================================
+
+-- Phase 1: TLS Certificate Generation --
+
+  [ok] CA certificate
+  [ok] Server certificate (SAN: 127.0.0.1)
+  [ok] Client certificate (mTLS)
+
+-- Phase 2: Start Proxy with Tunnel Listener --
+
+  Proxy (:18443) and tunnel listener (:18444) started
+
+-- Phase 3: Backend Registers via Reverse Tunnel --
+
+  Backend behind NAT dials the proxy's tunnel listener.
+  ...
+  [ok] QUIC connection established to proxy tunnel listener
+  [ok] Sent Register frame (backend_id: tunnel-backend)
+  [ok] Received RegisterAck (session: sess-...)
+  Session ID: sess-...
+  Active tunnel sessions for 'tunnel-backend': 1
+  Backend is now reachable through the proxy!
+
+-- Phase 4: Client Requests Routed Through Tunnel --
+
+  POST /api/echo -> 200 OK {"path":"/api/echo",...,"transport":"reverse-tunnel","received":"hello through tunnel"}
+  GET  /api/status -> 200 OK {"path":"/api/status",...,"transport":"reverse-tunnel"}
+  POST /api/data -> 200 OK {"path":"/api/data",...,"transport":"reverse-tunnel","received":"..."}
+
+-- Phase 5: Tunnel Topology --
+
+  ...
+  The backend INITIATED the QUIC connection to the proxy.
+  The proxy opens new streams on that connection to forward requests.
+  No inbound ports needed on the backend side.
+
+-- Demo Complete --
+```
+
 ## profile_loadtest
 
 Configurable load driver for profiling and flamechart analysis. Starts the same mTLS proxy + backend setup as the demos, then drives sustained traffic at configurable concurrency and reports latency percentiles.

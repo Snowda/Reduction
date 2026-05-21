@@ -24,11 +24,12 @@ use tracing::{error, info, warn};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::acl::AccessControl;
+use crate::cache::ResponseCache;
 use crate::cache_control::CacheDirectives;
 use crate::balancer::{BackendPool, RequestQueue};
-use crate::circuit::{CircuitBreakers, CircuitState};
+use crate::circuit::{CircuitBreakers, CircuitState, HalfOpenGuard};
 use crate::compression;
-use crate::config::{BackendConfig, CompressionConfig, ProxyConfig, RetryConfig, TimeoutConfig};
+use crate::config::{BackendConfig, CacheConfig, CompressionConfig, ProxyConfig, RetryConfig, TimeoutConfig};
 use crate::proxy::compress_body::CompressedBody;
 use crate::error::{ReductionError, Result};
 use crate::health::HealthState;
@@ -61,6 +62,8 @@ pub struct ProxyState {
     pub proxy_config: ProxyConfig,
     pub compression_config: CompressionConfig,
     pub retry_config: RetryConfig,
+    pub cache_config: CacheConfig,
+    pub response_cache: ResponseCache,
 }
 
 // Synchronous so the watch::Ref never crosses an await point.
@@ -204,6 +207,18 @@ pub async fn proxy_handler(
         return error_response(StatusCode::TOO_MANY_REQUESTS, "rate limited");
     }
 
+    let is_cacheable_method: bool =
+        req.method() == hyper::Method::GET || req.method() == hyper::Method::HEAD;
+
+    if state.cache_config.enabled && is_cacheable_method {
+        if let Some(cached) = state.response_cache.get(req.method().as_str(), req.uri().path()) {
+            state.metrics.cache_hits.add(1, &[]);
+            state.metrics.track_connection(-1);
+            return cached;
+        }
+        state.metrics.cache_misses.add(1, &[]);
+    }
+
     // Capture compression negotiation headers before consuming the request
     let accepts_zstd: bool = req
         .headers()
@@ -283,23 +298,27 @@ pub async fn proxy_handler(
         }
     };
 
+    let _half_open_guard: Option<HalfOpenGuard>;
     match state.circuit_breakers.check(&backend.id) {
-        CircuitState::Open => {
+        (CircuitState::Open, _) => {
             state.metrics.circuit_open_total.add(1, &[KeyValue::new("backend", backend.id.clone())]);
             state.metrics.queue_depth.add(-1, &backend_attr);
             warn!(backend = %backend.id, "circuit breaker open, rejecting request");
             record_completion(&state, start, StatusCode::SERVICE_UNAVAILABLE, &backend_id);
             return error_response(StatusCode::SERVICE_UNAVAILABLE, "circuit open");
         }
-        CircuitState::HalfOpen => {
+        (CircuitState::HalfOpen, guard) => {
+            _half_open_guard = guard;
             state.metrics.circuit_half_open_probes.add(1, &[KeyValue::new("backend", backend.id.clone())]);
         }
-        CircuitState::Closed => {}
+        (CircuitState::Closed, _) => {
+            _half_open_guard = None;
+        }
     }
 
     // Decompress zstd-encoded request body before forwarding to backend
     let req: Request<Body> = if request_is_zstd {
-        match decompress_request(req, state.proxy_config.max_response_body_bytes).await {
+        match decompress_request(req, state.proxy_config.max_response_body_bytes, state.proxy_config.inline_compress_threshold).await {
             Ok(r) => r,
             Err(response) => {
                 state.metrics.queue_depth.add(-1, &backend_attr);
@@ -312,6 +331,9 @@ pub async fn proxy_handler(
     };
 
     info!(backend = %backend.id, path = %req.uri().path(), "forwarding request");
+
+    let req_method: String = req.method().to_string();
+    let req_path: String = req.uri().path().to_string();
 
     // Buffer the request body so we can replay it on retries.
     let (parts, body) = req.into_parts();
@@ -345,7 +367,7 @@ pub async fn proxy_handler(
 
         // Circuit breaker may have tripped during a previous attempt
         if attempt > 0
-            && let CircuitState::Open = state.circuit_breakers.check(&backend.id)
+            && let (CircuitState::Open, _) = state.circuit_breakers.check(&backend.id)
         {
             warn!(backend = %backend.id, attempt, "circuit opened during retry");
             break;
@@ -381,6 +403,45 @@ pub async fn proxy_handler(
                 state.metrics.queue_depth.add(-1, &backend_attr);
 
                 let cache_directives: CacheDirectives = CacheDirectives::from_response(&response);
+
+                let should_cache: bool = state.cache_config.enabled
+                    && is_cacheable_method
+                    && status.is_success();
+
+                if should_cache {
+                    let (parts, body) = response.into_parts();
+                    let body_bytes: Bytes = match body.collect().await {
+                        Ok(collected) => collected.to_bytes(),
+                        Err(e) => {
+                            warn!(error = %e, "failed to buffer response for caching");
+                            record_completion(&state, start, status, &backend_id);
+                            return error_response(StatusCode::BAD_GATEWAY, "failed to read response");
+                        }
+                    };
+
+                    state.response_cache.put(
+                        req_method.as_str(),
+                        &req_path,
+                        status,
+                        &parts.headers,
+                        body_bytes.to_vec(),
+                        &cache_directives,
+                    );
+
+                    let response: Response<Body> = Response::from_parts(parts, Body::from(body_bytes));
+
+                    if accepts_zstd
+                        && !response_is_encoded(&response)
+                        && status != StatusCode::PARTIAL_CONTENT
+                        && !cache_directives.no_transform
+                    {
+                        record_completion(&state, start, status, &backend_id);
+                        return compress_response(response, state.compression_config.min_bytes, state.compression_config.level);
+                    }
+
+                    record_completion(&state, start, status, &backend_id);
+                    return response;
+                }
 
                 if accepts_zstd
                     && !response_is_encoded(&response)
@@ -492,7 +553,7 @@ fn backoff_delay(attempt: u32, config: &RetryConfig) -> Duration {
 }
 
 #[tracing::instrument(skip_all)]
-async fn decompress_request(req: Request<Body>, max_body: usize) -> std::result::Result<Request<Body>, Response<Body>> {
+async fn decompress_request(req: Request<Body>, max_body: usize, inline_threshold: usize) -> std::result::Result<Request<Body>, Response<Body>> {
     let (mut parts, body) = req.into_parts();
 
     let body_bytes: Bytes = body
@@ -504,7 +565,7 @@ async fn decompress_request(req: Request<Body>, max_body: usize) -> std::result:
             error_response(StatusCode::BAD_REQUEST, "failed to read request body")
         })?;
 
-    let decompressed: Vec<u8> = if body_bytes.len() <= compression::INLINE_COMPRESS_THRESHOLD {
+    let decompressed: Vec<u8> = if body_bytes.len() <= inline_threshold {
         compression::decompress_bounded(&body_bytes, max_body)
             .map_err(|e| {
                 warn!(error = %e, "request decompression failed");
@@ -769,7 +830,7 @@ mod tests {
             .body(Body::from(compressed))
             .unwrap();
 
-        let result = decompress_request(req, 10 * 1024 * 1024).await;
+        let result = decompress_request(req, 10 * 1024 * 1024, 8192).await;
         assert!(result.is_ok());
         let decompressed_req = result.unwrap();
         assert!(!decompressed_req.headers().contains_key(CONTENT_ENCODING));
@@ -790,7 +851,7 @@ mod tests {
             .body(Body::from(vec![0xFF, 0xFE, 0xFD]))
             .unwrap();
 
-        let result = decompress_request(req, 10 * 1024 * 1024).await;
+        let result = decompress_request(req, 10 * 1024 * 1024, 8192).await;
         assert!(result.is_err());
         let resp = result.unwrap_err();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
@@ -851,6 +912,10 @@ mod tests {
         assert_eq!(cfg.max_response_body_bytes, 10 * 1024 * 1024);
         assert_eq!(cfg.h2_connections_per_backend, 4);
         assert_eq!(cfg.max_idle_quic_per_host, 16);
+        assert_eq!(cfg.h2_stream_window, 2 * 1024 * 1024);
+        assert_eq!(cfg.h2_conn_window, 4 * 1024 * 1024);
+        assert_eq!(cfg.inline_compress_threshold, 8192);
+        assert_eq!(cfg.quic_channel_capacity, 256);
     }
 
     #[test]

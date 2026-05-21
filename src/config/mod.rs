@@ -167,6 +167,8 @@ address = "127.0.0.1:8443"
             timeouts: TimeoutConfig::default(),
             retry: RetryConfig::default(),
             tracing: TracingConfig::default(),
+            tunnel: TunnelConfig::default(),
+            cache: CacheConfig::default(),
         };
 
         let serialized: String = toml::to_string(&original).unwrap();

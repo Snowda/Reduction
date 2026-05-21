@@ -1,5 +1,5 @@
 use std::collections::VecDeque;
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -28,13 +28,13 @@ use tracing::{debug, error, warn};
 
 use crate::config::{BackendConfig, TransportKind};
 use crate::error::{ReductionError, Result};
-use crate::transport::quic::QuicStream;
+use crate::transport::quic::{self, QuicStream};
+use crate::tunnel::registry::TunnelRegistry;
 
 const MAX_IDLE_PER_HOST: usize = 16;
 const READY_TIMEOUT: Duration = Duration::from_millis(50);
-const H2_STREAM_WINDOW: u32 = 2 * 1024 * 1024;
-const H2_CONN_WINDOW: u32 = 4 * 1024 * 1024;
 const H2_CONNS_PER_BACKEND: usize = 4;
+const QUIC_BIND_ADDR: SocketAddr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0));
 
 pub enum HttpSender {
     H1(http1::SendRequest<Body>),
@@ -61,6 +61,9 @@ pub struct ConnPool {
     conn_limits: DashMap<String, Arc<Semaphore>>,
     h2_conns_per_backend: usize,
     max_idle_quic_per_host: usize,
+    h2_stream_window: u32,
+    h2_conn_window: u32,
+    tunnel_registry: Option<Arc<TunnelRegistry>>,
 }
 
 impl ConnPool {
@@ -73,12 +76,28 @@ impl ConnPool {
             conn_limits: DashMap::new(),
             h2_conns_per_backend: H2_CONNS_PER_BACKEND,
             max_idle_quic_per_host: MAX_IDLE_PER_HOST,
+            h2_stream_window: 2 * 1024 * 1024,
+            h2_conn_window: 4 * 1024 * 1024,
+            tunnel_registry: None,
         };
     }
 
-    pub fn with_pool_config(mut self, h2_conns: usize, max_idle_quic: usize) -> Self {
+    pub fn with_tunnel_registry(mut self, registry: Arc<TunnelRegistry>) -> Self {
+        self.tunnel_registry = Some(registry);
+        return self;
+    }
+
+    pub fn with_pool_config(
+        mut self,
+        h2_conns: usize,
+        max_idle_quic: usize,
+        h2_stream_window: u32,
+        h2_conn_window: u32,
+    ) -> Self {
         self.h2_conns_per_backend = h2_conns;
         self.max_idle_quic_per_host = max_idle_quic;
+        self.h2_stream_window = h2_stream_window;
+        self.h2_conn_window = h2_conn_window;
         return self;
     }
 
@@ -146,10 +165,39 @@ impl ConnPool {
         connect_timeout: Duration,
         handshake_timeout: Duration,
     ) -> Result<HttpSender> {
+        if let Some(registry) = &self.tunnel_registry {
+            if registry.is_tunnel_backend(&backend.id) {
+                return self.acquire_tunnel(registry, backend, handshake_timeout).await;
+            }
+        }
         return match backend.transport {
             TransportKind::Tcp => self.acquire_tcp(backend, tls_connector, connect_timeout, handshake_timeout).await,
             TransportKind::Quic => self.acquire_quic(backend, client_tls_config, connect_timeout, handshake_timeout).await,
         };
+    }
+
+    async fn acquire_tunnel(
+        &self,
+        registry: &Arc<TunnelRegistry>,
+        backend: &BackendConfig,
+        handshake_timeout: Duration,
+    ) -> Result<HttpSender> {
+        let stream: QuicStream = registry.acquire_stream(&backend.id).await?;
+        let io: TokioIo<QuicStream> = TokioIo::new(stream);
+
+        let (sender, conn_driver): (http1::SendRequest<Body>, _) =
+            timeout(handshake_timeout, http1::handshake(io))
+                .await
+                .map_err(|_| ReductionError::Forward("tunnel http handshake: timed out".to_string()))?
+                .map_err(|e| ReductionError::Forward(format!("tunnel http handshake: {e}")))?;
+
+        tokio::spawn(async move {
+            if let Err(e) = conn_driver.await {
+                debug!(error = %e, "tunnel stream HTTP driver ended");
+            }
+        });
+
+        return Ok(HttpSender::H1(sender));
     }
 
     async fn acquire_tcp(
@@ -195,10 +243,14 @@ impl ConnPool {
             self.connect_quic(backend, client_tls_config, connect_timeout).await?
         };
 
-        let (send, recv) = timeout(handshake_timeout, conn.open_bi())
+        let (mut send, recv) = timeout(handshake_timeout, conn.open_bi())
             .await
             .map_err(|_| ReductionError::Forward("QUIC stream open: timed out".to_string()))?
             .map_err(|e| ReductionError::Forward(format!("QUIC stream open: {e}")))?;
+
+        tokio::io::AsyncWriteExt::write_all(&mut send, &[quic::STREAM_TYPE_HTTP])
+            .await
+            .map_err(|e| ReductionError::Forward(format!("write stream type: {e}")))?;
 
         // Return the connection to the pool immediately — QUIC multiplexes streams
         self.put_quic(backend.address, conn);
@@ -253,8 +305,8 @@ impl ConnPool {
             timeout(
                 handshake_timeout,
                 http2::Builder::new(TokioExecutor::new())
-                    .initial_stream_window_size(H2_STREAM_WINDOW)
-                    .initial_connection_window_size(H2_CONN_WINDOW)
+                    .initial_stream_window_size(self.h2_stream_window)
+                    .initial_connection_window_size(self.h2_conn_window)
                     .handshake(io),
             )
                 .await
@@ -292,7 +344,7 @@ impl ConnPool {
                 client_config.transport_config(Arc::new(quinn::TransportConfig::default()));
 
                 let mut endpoint: Endpoint =
-                    Endpoint::client("0.0.0.0:0".parse().unwrap())
+                    Endpoint::client(QUIC_BIND_ADDR)
                         .map_err(|e| ReductionError::Forward(format!("QUIC endpoint: {e}")))?;
                 endpoint.set_default_client_config(client_config);
 
@@ -321,6 +373,37 @@ impl ConnPool {
 
         debug!(backend = %backend.id, "QUIC connection established");
         return Ok(connection);
+    }
+
+    pub async fn acquire_raw_stream(
+        &self,
+        backend: &BackendConfig,
+        client_tls_config: &Arc<rustls::ClientConfig>,
+        connect_timeout: Duration,
+    ) -> Result<QuicStream> {
+        if let Some(registry) = &self.tunnel_registry {
+            if registry.is_tunnel_backend(&backend.id) {
+                let stream: QuicStream = registry.acquire_stream(&backend.id).await?;
+                return Ok(stream);
+            }
+        }
+
+        let conn: Connection = if let Some(conn) = self.take_quic(&backend.address) {
+            conn
+        } else {
+            self.connect_quic(backend, client_tls_config, connect_timeout).await?
+        };
+
+        let (mut send, recv) = conn.open_bi().await
+            .map_err(|e| ReductionError::Forward(format!("raw stream open: {e}")))?;
+
+        tokio::io::AsyncWriteExt::write_all(&mut send, &[quic::STREAM_TYPE_RAW])
+            .await
+            .map_err(|e| ReductionError::Forward(format!("write raw stream type: {e}")))?;
+
+        self.put_quic(backend.address, conn);
+
+        return Ok(QuicStream::new(send, recv));
     }
 
     pub fn drain_backends(&self, addrs: &[SocketAddr]) {
@@ -471,7 +554,8 @@ mod tests {
     use tokio::sync::watch;
 
     use crate::circuit::CircuitBreakers;
-    use crate::config::{CircuitBreakerConfig, CompressionConfig, ProxyConfig, RetryConfig, TimeoutConfig};
+    use crate::cache::ResponseCache;
+    use crate::config::{CacheConfig, CircuitBreakerConfig, CompressionConfig, ProxyConfig, RetryConfig, TimeoutConfig};
     use crate::health::HealthState;
     use crate::metrics::ProxyMetrics;
     use crate::acl::AccessControl;
@@ -515,6 +599,8 @@ mod tests {
             proxy_config: ProxyConfig::default(),
             compression_config: CompressionConfig::default(),
             retry_config: RetryConfig::default(),
+            cache_config: CacheConfig::default(),
+            response_cache: ResponseCache::new(&CacheConfig::default()),
         });
     }
 
@@ -596,9 +682,11 @@ mod tests {
 
     #[test]
     fn test_pool_with_custom_config() {
-        let pool = ConnPool::new().with_pool_config(8, 32);
+        let pool = ConnPool::new().with_pool_config(8, 32, 1024 * 1024, 2 * 1024 * 1024);
         assert_eq!(pool.h2_conns_per_backend, 8);
         assert_eq!(pool.max_idle_quic_per_host, 32);
+        assert_eq!(pool.h2_stream_window, 1024 * 1024);
+        assert_eq!(pool.h2_conn_window, 2 * 1024 * 1024);
     }
 
     #[test]

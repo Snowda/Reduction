@@ -16,6 +16,7 @@ use tracing::{error, info, warn};
 
 use reduction::acl::AccessControl;
 use reduction::balancer::BackendPool;
+use reduction::cache::ResponseCache;
 use reduction::circuit::CircuitBreakers;
 use reduction::config::{self, ReductionConfig, TransportKind};
 use reduction::error::{ReductionError, Result};
@@ -25,6 +26,7 @@ use reduction::proxy::{ConnPool, ProxyState, ReloadableState, Router, proxy_hand
 use reduction::ratelimit::RateLimit;
 use reduction::tls;
 use reduction::transport;
+use reduction::tunnel::registry::TunnelRegistry;
 
 fn build_backend_pools(config: &ReductionConfig) -> Result<HashMap<String, BackendPool>> {
     let mut pools: HashMap<String, BackendPool> = HashMap::new();
@@ -73,11 +75,16 @@ fn spawn_config_reload_task(
             let new_addrs: HashSet<SocketAddr> = new_state.backend_pools.values()
                 .flat_map(|p| p.backends.iter().map(|b| b.address))
                 .collect();
+            let new_backend_ids: HashSet<String> = new_state.backend_pools.keys().cloned().collect();
 
             let old_state: ReloadableState = reloadable_tx.borrow().clone();
             let removed_addrs: Vec<SocketAddr> = old_state.backend_pools.values()
                 .flat_map(|p| p.backends.iter().map(|b| b.address))
                 .filter(|addr| !new_addrs.contains(addr))
+                .collect();
+            let removed_backend_ids: Vec<String> = old_state.backend_pools.keys()
+                .filter(|id| !new_backend_ids.contains(*id))
+                .cloned()
                 .collect();
 
             if reloadable_tx.send(new_state).is_err() {
@@ -85,6 +92,14 @@ fn spawn_config_reload_task(
                 return;
             }
             info!("proxy state rebuilt from updated config");
+
+            for id in &removed_backend_ids {
+                proxy_state.queues.remove(id);
+                proxy_state.circuit_breakers.remove_backend(id);
+            }
+            if !removed_backend_ids.is_empty() {
+                info!(backends = ?removed_backend_ids, "cleaned up state for removed backends");
+            }
 
             if !removed_addrs.is_empty() {
                 let drain_timeout: u64 = config.balancer.drain_timeout_secs;
@@ -190,10 +205,19 @@ async fn run(config_path: PathBuf, config: ReductionConfig) -> Result<()> {
         "circuit breaker configured"
     );
 
-    let conn_pool: ConnPool = ConnPool::new().with_pool_config(
+    let tunnel_registry: Arc<TunnelRegistry> = Arc::new(
+        TunnelRegistry::new(config.tunnel.max_sessions_per_backend),
+    );
+
+    let mut conn_pool: ConnPool = ConnPool::new().with_pool_config(
         config.proxy.h2_connections_per_backend,
         config.proxy.max_idle_quic_per_host,
+        config.proxy.h2_stream_window,
+        config.proxy.h2_conn_window,
     );
+    if config.tunnel.enabled {
+        conn_pool = conn_pool.with_tunnel_registry(Arc::clone(&tunnel_registry));
+    }
 
     let proxy_state: Arc<ProxyState> = Arc::new(ProxyState {
         reloadable: reloadable_rx,
@@ -212,9 +236,45 @@ async fn run(config_path: PathBuf, config: ReductionConfig) -> Result<()> {
         proxy_config: config.proxy.clone(),
         compression_config: config.compression.clone(),
         retry_config: config.retry.clone(),
+        cache_config: config.cache.clone(),
+        response_cache: ResponseCache::new(&config.cache),
     });
 
+    if config.cache.enabled {
+        info!(
+            max_entries = config.cache.max_entries,
+            max_entry_bytes = config.cache.max_entry_bytes,
+            default_ttl_secs = config.cache.default_ttl_secs,
+            "response cache enabled"
+        );
+    }
+
     spawn_config_reload_task(config_rx, reloadable_tx, Arc::clone(&proxy_state));
+
+    if config.tunnel.enabled {
+        if let Some(tunnel_addr) = config.tunnel.listen_address {
+            let tunnel_reg: Arc<TunnelRegistry> = Arc::clone(&tunnel_registry);
+            let tunnel_shutdown: CancellationToken = shutdown_token.clone();
+            let tunnel_tls: Arc<rustls::ServerConfig> = Arc::clone(&server_tls_config);
+            let tunnel_config = config.tunnel.clone();
+            let tunnel_metrics: ProxyMetrics = ProxyMetrics::new();
+            tokio::spawn(async move {
+                if let Err(e) = reduction::tunnel::listener::run_tunnel_listener(
+                    tunnel_addr,
+                    tunnel_tls,
+                    tunnel_reg,
+                    tunnel_shutdown,
+                    tunnel_config,
+                    tunnel_metrics,
+                ).await {
+                    error!(error = %e, "tunnel listener failed");
+                }
+            });
+            info!(%tunnel_addr, "tunnel listener spawned");
+        } else {
+            warn!("tunnel enabled but no listen_address configured");
+        }
+    }
 
     proxy_state.conn_pool.warm_up(
         &config.backends,
@@ -225,7 +285,9 @@ async fn run(config_path: PathBuf, config: ReductionConfig) -> Result<()> {
     ).await;
     info!(count = config.backends.len(), "connection pool pre-warmed on startup");
 
+    let drain_registry: Arc<TunnelRegistry> = Arc::clone(&tunnel_registry);
     let drain_state: Arc<ProxyState> = Arc::clone(&proxy_state);
+    let raw_relay_state: Arc<ProxyState> = Arc::clone(&proxy_state);
     let drain_timeout: Duration = Duration::from_secs(config.balancer.drain_timeout_secs);
 
     let app = axum::Router::new()
@@ -249,12 +311,27 @@ async fn run(config_path: PathBuf, config: ReductionConfig) -> Result<()> {
         TransportKind::Quic => {
             let quic_config: quinn::ServerConfig =
                 transport::quic::build_quic_server_config(server_tls_config)?;
-            let listener: transport::quic::QuicListener =
+            let mut listener: transport::quic::QuicListener =
                 transport::quic::QuicListener::bind_with_token(
                     config.listen.address,
                     quic_config,
                     shutdown_token.clone(),
+                    config.proxy.quic_channel_capacity,
                 )?;
+
+            if let Some(raw_rx) = listener.take_raw_stream_receiver() {
+                let raw_state: Arc<ProxyState> = raw_relay_state;
+                let raw_shutdown: CancellationToken = shutdown_token.clone();
+                tokio::spawn(async move {
+                    reduction::proxy::raw_relay::run_raw_relay_handler(
+                        raw_rx,
+                        raw_state,
+                        raw_shutdown,
+                    ).await;
+                });
+                info!("raw QUIC stream relay handler spawned");
+            }
+
             axum::serve(listener, app)
                 .with_graceful_shutdown(shutdown_signal(shutdown_token))
                 .await
@@ -262,6 +339,7 @@ async fn run(config_path: PathBuf, config: ReductionConfig) -> Result<()> {
         }
     }
 
+    drain_registry.shutdown_all().await;
     drain_connections(drain_state, drain_timeout).await;
     return Ok(());
 }
