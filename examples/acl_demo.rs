@@ -28,6 +28,8 @@ use reduction::circuit::CircuitBreakers;
 use reduction::config::{self, BackendConfig, ReductionConfig, TimeoutConfig};
 use reduction::health::HealthState;
 use reduction::metrics::ProxyMetrics;
+use reduction::cache::ResponseCache;
+use reduction::config::CacheConfig;
 use reduction::proxy::{ConnPool, ProxyState, ReloadableState, Router, proxy_handler};
 use reduction::ratelimit::RateLimit;
 use reduction::tls;
@@ -367,6 +369,8 @@ async fn start_proxy(dir: &Path, config_path: &Path, acl: AccessControl) {
         proxy_config: reduction::config::ProxyConfig::default(),
         compression_config: reduction::config::CompressionConfig::default(),
         retry_config: reduction::config::RetryConfig::default(),
+        cache_config: CacheConfig::default(),
+        response_cache: ResponseCache::new(&CacheConfig::default()),
     });
 
     let app = axum::Router::new()
