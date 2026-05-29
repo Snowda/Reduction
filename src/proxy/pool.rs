@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+use arrayvec::ArrayString;
 use axum::body::Body;
 use axum::http::{Request, Response};
 use bytes::Bytes;
@@ -31,9 +32,9 @@ use crate::error::{ReductionError, Result};
 use crate::transport::quic::{self, QuicStream};
 use crate::tunnel::registry::TunnelRegistry;
 
-const MAX_IDLE_PER_HOST: usize = 16;
+const MAX_IDLE_PER_HOST: u32 = 16;
 const READY_TIMEOUT: Duration = Duration::from_millis(50);
-const H2_CONNS_PER_BACKEND: usize = 4;
+const H2_CONNS_PER_BACKEND: u32 = 4;
 const QUIC_BIND_ADDR: SocketAddr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0));
 
 pub enum HttpSender {
@@ -58,9 +59,9 @@ pub struct ConnPool {
     tcp_h2_rr: AtomicUsize,
     quic_idle: DashMap<SocketAddr, Mutex<VecDeque<Connection>>>,
     quic_endpoint: OnceCell<Endpoint>,
-    conn_limits: DashMap<String, Arc<Semaphore>>,
-    h2_conns_per_backend: usize,
-    max_idle_quic_per_host: usize,
+    conn_limits: DashMap<ArrayString<256>, Arc<Semaphore>>,
+    h2_conns_per_backend: u32,
+    max_idle_quic_per_host: u32,
     h2_stream_window: u32,
     h2_conn_window: u32,
     tunnel_registry: Option<Arc<TunnelRegistry>>,
@@ -89,8 +90,8 @@ impl ConnPool {
 
     pub fn with_pool_config(
         mut self,
-        h2_conns: usize,
-        max_idle_quic: usize,
+        h2_conns: u32,
+        max_idle_quic: u32,
         h2_stream_window: u32,
         h2_conn_window: u32,
     ) -> Self {
@@ -107,7 +108,7 @@ impl ConnPool {
     ) -> std::result::Result<OwnedSemaphorePermit, ReductionError> {
         let sem: Arc<Semaphore> = self
             .conn_limits
-            .entry(backend.id.clone())
+            .entry(backend.id)
             .or_insert_with(|| Arc::new(Semaphore::new(backend.max_connections as usize)))
             .clone();
         return sem.try_acquire_owned().map_err(|_| {
@@ -151,7 +152,7 @@ impl ConnPool {
         let Ok(mut queue) = entry.try_lock() else {
             return;
         };
-        if queue.len() < self.max_idle_quic_per_host {
+        if queue.len() < self.max_idle_quic_per_host as usize {
             queue.push_back(conn);
         }
     }
@@ -450,7 +451,7 @@ impl ConnPool {
                     let existing: usize = self.tcp_h2.get(&backend.address)
                         .map(|e| e.value().len())
                         .unwrap_or(0);
-                    for i in existing..self.h2_conns_per_backend {
+                    for i in existing..self.h2_conns_per_backend as usize {
                         match self.connect_tcp_h2(backend, tls_connector, connect_timeout, handshake_timeout).await {
                             Ok(_sender) => {
                                 debug!(backend = %backend.id, conn = i, "pre-warmed H2 connection");
@@ -613,8 +614,8 @@ mod tests {
             1.0,
             TransportKind::Tcp,
         );
-        let connect_timeout: Duration = Duration::from_secs(state.timeouts.connect_secs);
-        let handshake_timeout: Duration = Duration::from_secs(state.timeouts.handshake_secs);
+        let connect_timeout: Duration = Duration::from_secs(state.timeouts.connect_secs.get());
+        let handshake_timeout: Duration = Duration::from_secs(state.timeouts.handshake_secs.get());
         let result: Result<HttpSender> =
             state.conn_pool.acquire(&backend, &state.tls_connector, &state.client_tls_config, connect_timeout, handshake_timeout).await;
         assert!(result.is_err());
@@ -844,8 +845,8 @@ mod tests {
             1.0,
             TransportKind::Quic,
         );
-        let connect_timeout: Duration = Duration::from_secs(state.timeouts.connect_secs);
-        let handshake_timeout: Duration = Duration::from_secs(state.timeouts.handshake_secs);
+        let connect_timeout: Duration = Duration::from_secs(state.timeouts.connect_secs.get());
+        let handshake_timeout: Duration = Duration::from_secs(state.timeouts.handshake_secs.get());
         let result: Result<HttpSender> = state.conn_pool.acquire(&backend, &state.tls_connector, &state.client_tls_config, connect_timeout, handshake_timeout).await;
         assert!(result.is_err());
     }

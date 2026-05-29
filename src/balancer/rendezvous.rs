@@ -3,6 +3,7 @@ use std::net::IpAddr;
 
 // Compute a rendezvous hash score for a (client_ip, backend_id) pair.
 // Higher score = preferred backend for this client.
+#[inline]
 pub fn rendezvous_score(client_ip: IpAddr, backend_id: &str, weight: f64) -> f64 {
     let mut hasher: DefaultHasher = DefaultHasher::new();
     client_ip.hash(&mut hasher);
@@ -15,6 +16,7 @@ pub fn rendezvous_score(client_ip: IpAddr, backend_id: &str, weight: f64) -> f64
 }
 
 // Select the best backend index for a given client IP using rendezvous hashing.
+#[must_use]
 pub fn select_backend(
     client_ip: IpAddr,
     backend_ids: &[&str],

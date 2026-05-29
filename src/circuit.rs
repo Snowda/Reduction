@@ -1,7 +1,10 @@
+use std::fmt::{self, Debug, Formatter};
+use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use arrayvec::ArrayString;
 use dashmap::DashMap;
 use parking_lot::Mutex;
 use tracing::{info, warn};
@@ -20,6 +23,7 @@ pub enum CircuitState {
 }
 
 impl From<u8> for CircuitState {
+    #[inline]
     fn from(v: u8) -> Self {
         return match v {
             STATE_OPEN => CircuitState::Open,
@@ -53,8 +57,8 @@ pub struct HalfOpenGuard {
     breaker: Arc<BackendBreaker>,
 }
 
-impl std::fmt::Debug for HalfOpenGuard {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Debug for HalfOpenGuard {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         return f.debug_struct("HalfOpenGuard").finish();
     }
 }
@@ -69,10 +73,10 @@ impl Drop for HalfOpenGuard {
 }
 
 pub struct CircuitBreakers {
-    breakers: DashMap<String, Arc<BackendBreaker>>,
-    failure_threshold: u32,
+    breakers: DashMap<ArrayString<256>, Arc<BackendBreaker>>,
+    failure_threshold: NonZeroU32,
     recovery_timeout: Duration,
-    half_open_max_requests: u32,
+    half_open_max_requests: NonZeroU32,
 }
 
 impl CircuitBreakers {
@@ -86,7 +90,11 @@ impl CircuitBreakers {
     }
 
     pub fn check(&self, backend_id: &str) -> (CircuitState, Option<HalfOpenGuard>) {
-        let breaker: Arc<BackendBreaker> = self.breakers.entry(backend_id.to_string())
+        let key: ArrayString<256> = match ArrayString::from(backend_id) {
+            Ok(k) => k,
+            Err(_) => return (CircuitState::Open, None),
+        };
+        let breaker: Arc<BackendBreaker> = self.breakers.entry(key)
             .or_insert_with(|| Arc::new(BackendBreaker::new()))
             .clone();
 
@@ -113,7 +121,7 @@ impl CircuitBreakers {
             }
             CircuitState::HalfOpen => {
                 let inflight: u32 = breaker.half_open_inflight.fetch_add(1, Ordering::AcqRel);
-                if inflight >= self.half_open_max_requests {
+                if inflight >= self.half_open_max_requests.get() {
                     breaker.half_open_inflight.fetch_sub(1, Ordering::Release);
                     (CircuitState::Open, None)
                 } else {
@@ -147,7 +155,11 @@ impl CircuitBreakers {
     }
 
     pub fn record_failure(&self, backend_id: &str) {
-        let breaker: Arc<BackendBreaker> = self.breakers.entry(backend_id.to_string())
+        let key: ArrayString<256> = match ArrayString::from(backend_id) {
+            Ok(k) => k,
+            Err(_) => return,
+        };
+        let breaker: Arc<BackendBreaker> = self.breakers.entry(key)
             .or_insert_with(|| Arc::new(BackendBreaker::new()))
             .clone();
 
@@ -156,7 +168,7 @@ impl CircuitBreakers {
         match current {
             CircuitState::Closed => {
                 let failures: u32 = breaker.consecutive_failures.fetch_add(1, Ordering::AcqRel) + 1;
-                if failures >= self.failure_threshold {
+                if failures >= self.failure_threshold.get() {
                     breaker.state.store(STATE_OPEN, Ordering::Release);
                     *breaker.opened_at.lock() = Some(Instant::now());
                     warn!(
@@ -193,9 +205,9 @@ mod tests {
 
     fn test_config() -> CircuitBreakerConfig {
         return CircuitBreakerConfig {
-            failure_threshold: 3,
+            failure_threshold: NonZeroU32::new(3).unwrap(),
             recovery_timeout_secs: 60,
-            half_open_max_requests: 2,
+            half_open_max_requests: NonZeroU32::new(2).unwrap(),
         };
     }
 
@@ -246,9 +258,9 @@ mod tests {
     #[test]
     fn test_half_open_after_recovery_timeout() {
         let config: CircuitBreakerConfig = CircuitBreakerConfig {
-            failure_threshold: 1,
+            failure_threshold: NonZeroU32::new(1).unwrap(),
             recovery_timeout_secs: 0,
-            half_open_max_requests: 2,
+            half_open_max_requests: NonZeroU32::new(2).unwrap(),
         };
         let cb: CircuitBreakers = CircuitBreakers::new(&config);
         cb.record_failure("b1");
@@ -263,9 +275,9 @@ mod tests {
     #[test]
     fn test_half_open_limits_probes() {
         let config: CircuitBreakerConfig = CircuitBreakerConfig {
-            failure_threshold: 1,
+            failure_threshold: NonZeroU32::new(1).unwrap(),
             recovery_timeout_secs: 0,
-            half_open_max_requests: 2,
+            half_open_max_requests: NonZeroU32::new(2).unwrap(),
         };
         let cb: CircuitBreakers = CircuitBreakers::new(&config);
         cb.record_failure("b1");
@@ -281,9 +293,9 @@ mod tests {
     #[test]
     fn test_half_open_success_closes() {
         let config: CircuitBreakerConfig = CircuitBreakerConfig {
-            failure_threshold: 1,
+            failure_threshold: NonZeroU32::new(1).unwrap(),
             recovery_timeout_secs: 0,
-            half_open_max_requests: 2,
+            half_open_max_requests: NonZeroU32::new(2).unwrap(),
         };
         let cb: CircuitBreakers = CircuitBreakers::new(&config);
         cb.record_failure("b1");
@@ -295,9 +307,9 @@ mod tests {
     #[test]
     fn test_half_open_failure_reopens() {
         let config: CircuitBreakerConfig = CircuitBreakerConfig {
-            failure_threshold: 1,
+            failure_threshold: NonZeroU32::new(1).unwrap(),
             recovery_timeout_secs: 0,
-            half_open_max_requests: 2,
+            half_open_max_requests: NonZeroU32::new(2).unwrap(),
         };
         let cb: CircuitBreakers = CircuitBreakers::new(&config);
         cb.record_failure("b1");
@@ -309,9 +321,9 @@ mod tests {
     #[test]
     fn test_half_open_guard_decrements_on_drop() {
         let config: CircuitBreakerConfig = CircuitBreakerConfig {
-            failure_threshold: 1,
+            failure_threshold: NonZeroU32::new(1).unwrap(),
             recovery_timeout_secs: 0,
-            half_open_max_requests: 3,
+            half_open_max_requests: NonZeroU32::new(3).unwrap(),
         };
         let cb: CircuitBreakers = CircuitBreakers::new(&config);
         cb.record_failure("b1");
@@ -332,9 +344,9 @@ mod tests {
     #[test]
     fn test_guard_no_decrement_after_state_transition() {
         let config: CircuitBreakerConfig = CircuitBreakerConfig {
-            failure_threshold: 1,
+            failure_threshold: NonZeroU32::new(1).unwrap(),
             recovery_timeout_secs: 0,
-            half_open_max_requests: 2,
+            half_open_max_requests: NonZeroU32::new(2).unwrap(),
         };
         let cb: CircuitBreakers = CircuitBreakers::new(&config);
         cb.record_failure("b1");

@@ -1,4 +1,3 @@
-use std::hash::{DefaultHasher, Hash, Hasher};
 use std::time::{Duration, Instant};
 
 use axum::body::Body;
@@ -26,16 +25,16 @@ impl CachedResponse {
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 struct CacheKey {
-    hash: u64,
+    method: String,
+    path: String,
 }
 
 impl CacheKey {
     fn new(method: &str, path: &str) -> Self {
-        let mut hasher: DefaultHasher = DefaultHasher::new();
-        method.hash(&mut hasher);
-        path.hash(&mut hasher);
-        let hash: u64 = hasher.finish();
-        return Self { hash };
+        return Self {
+            method: method.into(),
+            path: path.into(),
+        };
     }
 }
 
@@ -46,10 +45,8 @@ pub struct ResponseCache {
 
 impl ResponseCache {
     pub fn new(config: &CacheConfig) -> Self {
-        let cap: std::num::NonZeroUsize = std::num::NonZeroUsize::new(config.max_entries)
-            .unwrap_or(std::num::NonZeroUsize::new(1).unwrap());
         return Self {
-            store: Mutex::new(LruCache::new(cap)),
+            store: Mutex::new(LruCache::new(config.max_entries)),
             config: config.clone(),
         };
     }
@@ -93,11 +90,11 @@ impl ResponseCache {
             return false;
         }
 
-        if body.len() > self.config.max_entry_bytes {
+        if body.len() > self.config.max_entry_bytes.get() {
             return false;
         }
 
-        let ttl_secs: u64 = directives.max_age.unwrap_or(self.config.default_ttl_secs);
+        let ttl_secs: u64 = directives.max_age.unwrap_or(self.config.default_ttl_secs.get());
         if ttl_secs == 0 {
             return false;
         }
@@ -123,6 +120,8 @@ impl ResponseCache {
 
 #[cfg(test)]
 mod tests {
+    use std::num::{NonZeroU64, NonZeroUsize};
+
     use axum::http::HeaderValue;
 
     use super::*;
@@ -130,9 +129,9 @@ mod tests {
     fn test_config() -> CacheConfig {
         return CacheConfig {
             enabled: true,
-            max_entries: 100,
-            max_entry_bytes: 1024 * 1024,
-            default_ttl_secs: 60,
+            max_entries: NonZeroUsize::new(100).unwrap(),
+            max_entry_bytes: NonZeroUsize::new(1024 * 1024).unwrap(),
+            default_ttl_secs: NonZeroU64::new(60).unwrap(),
         };
     }
 
@@ -230,7 +229,7 @@ mod tests {
     #[test]
     fn test_cache_oversized_entry_rejected() {
         let mut config: CacheConfig = test_config();
-        config.max_entry_bytes = 10;
+        config.max_entry_bytes = NonZeroUsize::new(10).unwrap();
         let cache: ResponseCache = ResponseCache::new(&config);
 
         let directives: CacheDirectives = CacheDirectives {
@@ -252,7 +251,7 @@ mod tests {
     #[test]
     fn test_cache_expired_entry_evicted() {
         let mut config: CacheConfig = test_config();
-        config.default_ttl_secs = 0;
+        config.default_ttl_secs = NonZeroU64::new(1).unwrap();
         let cache: ResponseCache = ResponseCache::new(&config);
 
         let directives: CacheDirectives = CacheDirectives {
@@ -324,7 +323,7 @@ mod tests {
     #[test]
     fn test_cache_lru_eviction() {
         let mut config: CacheConfig = test_config();
-        config.max_entries = 2;
+        config.max_entries = NonZeroUsize::new(2).unwrap();
         let cache: ResponseCache = ResponseCache::new(&config);
 
         let directives: CacheDirectives = CacheDirectives {

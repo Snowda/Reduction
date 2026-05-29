@@ -5,15 +5,13 @@ use std::path::Path;
 
 use tracing::info;
 
-use crate::error::{ReductionError, Result};
+use crate::error::Result;
+use crate::fs_util::load_or_recover;
 
 pub use types::*;
 
 pub fn load_config(path: &Path) -> Result<ReductionConfig> {
-    let contents: String = std::fs::read_to_string(path)
-        .map_err(|e| ReductionError::Config(format!("failed to read config file: {e}")))?;
-
-    let config: ReductionConfig = toml::from_str(&contents)?;
+    let config: ReductionConfig = load_or_recover(path, |s| toml::from_str(s))?;
 
     info!(path = %path.display(), "loaded configuration");
 
@@ -23,6 +21,8 @@ pub fn load_config(path: &Path) -> Result<ReductionConfig> {
 #[cfg(test)]
 mod tests {
     use std::io::Write;
+
+    use arrayvec::ArrayString;
 
     use super::*;
 
@@ -59,10 +59,10 @@ backend_id = "api"
         let config: ReductionConfig = toml::from_str(minimal_toml()).unwrap();
         assert_eq!(config.listen.transport, TransportKind::Tcp);
         assert_eq!(config.backends.len(), 1);
-        assert_eq!(config.backends[0].id, "api");
+        assert_eq!(config.backends[0].id.as_str(), "api");
         assert_eq!(config.backends[0].weight, 1.0);
         assert_eq!(config.routes.len(), 1);
-        assert_eq!(config.routes[0].path_prefix, "/api");
+        assert_eq!(config.routes[0].path_prefix.as_str(), "/api");
     }
 
     #[test]
@@ -130,11 +130,11 @@ address = "127.0.0.1:8443"
                 transport: TransportKind::Quic,
             },
             tls: TlsConfig {
-                server: TlsIdentity {
+                server: ServerTlsConfig::Manual(TlsIdentity {
                     cert_path: "certs/server.crt".into(),
                     key_path: "certs/server.key".into(),
                     ca_cert_path: "certs/ca.crt".into(),
-                },
+                }),
                 client: TlsIdentity {
                     cert_path: "certs/client.crt".into(),
                     key_path: "certs/client.key".into(),
@@ -143,7 +143,7 @@ address = "127.0.0.1:8443"
             },
             backends: vec![
                 BackendConfig::new(
-                    "api".to_string(),
+                    "api",
                     "10.0.0.1:8080".parse().unwrap(),
                     2.5,
                     TransportKind::Quic,
@@ -151,8 +151,8 @@ address = "127.0.0.1:8443"
             ],
             routes: vec![
                 RouteConfig {
-                    path_prefix: "/api".to_string(),
-                    backend_id: "api".to_string(),
+                    path_prefix: ArrayString::from("/api").unwrap(),
+                    backend_id: ArrayString::from("api").unwrap(),
                     timeout_secs: None,
                 },
             ],
@@ -177,11 +177,11 @@ address = "127.0.0.1:8443"
         assert_eq!(deserialized.listen.address, original.listen.address);
         assert_eq!(deserialized.listen.transport, original.listen.transport);
         assert_eq!(deserialized.backends.len(), 1);
-        assert_eq!(deserialized.backends[0].id, "api");
-        assert_eq!(deserialized.backends[0].pool, "api");
+        assert_eq!(deserialized.backends[0].id.as_str(), "api");
+        assert_eq!(deserialized.backends[0].pool.as_str(), "api");
         assert_eq!(deserialized.backends[0].weight, 2.5);
         assert_eq!(deserialized.routes.len(), 1);
-        assert_eq!(deserialized.routes[0].path_prefix, "/api");
+        assert_eq!(deserialized.routes[0].path_prefix.as_str(), "/api");
     }
 
     #[test]
@@ -193,7 +193,7 @@ address = "127.0.0.1:8443"
         file.write_all(minimal_toml().as_bytes()).unwrap();
 
         let config: ReductionConfig = load_config(&config_path).unwrap();
-        assert_eq!(config.backends[0].id, "api");
+        assert_eq!(config.backends[0].id.as_str(), "api");
     }
 
     #[test]
@@ -410,8 +410,8 @@ backend_id = "api"
     #[test]
     fn test_pool_defaults_to_id() {
         let config: ReductionConfig = toml::from_str(minimal_toml()).unwrap();
-        assert_eq!(config.backends[0].id, "api");
-        assert_eq!(config.backends[0].pool, "api");
+        assert_eq!(config.backends[0].id.as_str(), "api");
+        assert_eq!(config.backends[0].pool.as_str(), "api");
     }
 
     #[test]
@@ -451,10 +451,10 @@ backend_id = "api"
 "#;
         let config: ReductionConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.backends.len(), 2);
-        assert_eq!(config.backends[0].id, "api-primary");
-        assert_eq!(config.backends[0].pool, "api");
-        assert_eq!(config.backends[1].id, "api-secondary");
-        assert_eq!(config.backends[1].pool, "api");
+        assert_eq!(config.backends[0].id.as_str(), "api-primary");
+        assert_eq!(config.backends[0].pool.as_str(), "api");
+        assert_eq!(config.backends[1].id.as_str(), "api-secondary");
+        assert_eq!(config.backends[1].pool.as_str(), "api");
     }
 
     #[test]

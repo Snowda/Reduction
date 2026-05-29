@@ -5,6 +5,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use arrayvec::ArrayString;
 use axum::body::Body;
 use axum::extract::DefaultBodyLimit;
 use axum::http::{Request, Response, StatusCode};
@@ -24,7 +25,7 @@ use dashmap::DashMap;
 use reduction::balancer::BackendPool;
 use reduction::circuit::CircuitBreakers;
 use reduction::config::{self, BackendConfig, CircuitBreakerConfig, ReductionConfig, TimeoutConfig, TransportKind};
-use reduction::health::{BackendHealth, HealthBroadcast, HealthState};
+use reduction::health::{Availability, BackendHealth, HealthBroadcast, HealthState};
 use reduction::metrics::ProxyMetrics;
 use reduction::acl::AccessControl;
 use reduction::cache::ResponseCache;
@@ -243,19 +244,19 @@ struct DemoHandles {
     _watcher: config::watcher::ConfigWatcher,
 }
 
-fn build_backend_pools(config: &ReductionConfig) -> HashMap<String, BackendPool> {
-    let mut pools: HashMap<String, BackendPool> = HashMap::new();
+fn build_backend_pools(config: &ReductionConfig) -> HashMap<ArrayString<256>, BackendPool> {
+    let mut pools: HashMap<ArrayString<256>, BackendPool> = HashMap::new();
     for route in &config.routes {
         let backends: Vec<BackendConfig> = config.backends.iter()
-            .filter(|b| b.pool == route.backend_id)
+            .filter(|b| b.pool.as_str() == route.backend_id.as_str())
             .cloned()
             .collect();
-        if !backends.is_empty() && !pools.contains_key(&route.backend_id) {
+        if !backends.is_empty() && !pools.contains_key(route.backend_id.as_str()) {
             let pool: BackendPool = BackendPool::new(
                 backends,
                 config.balancer.jitter_factor,
             ).expect("too many backends");
-            pools.insert(route.backend_id.clone(), pool);
+            pools.insert(route.backend_id, pool);
         }
     }
     return pools;
@@ -286,9 +287,9 @@ async fn start_services(dir: &Path, config_path: &Path) -> DemoHandles {
 
     // -- Proxy --
     let (server_tls_config, _) = tls::build_server_config(
-        &config.tls.server.cert_path,
-        &config.tls.server.key_path,
-        &config.tls.server.ca_cert_path,
+        &config.tls.server.as_manual().unwrap().cert_path,
+        &config.tls.server.as_manual().unwrap().key_path,
+        &config.tls.server.as_manual().unwrap().ca_cert_path,
     ).unwrap();
     let server_tls: Arc<rustls::ServerConfig> = Arc::new(server_tls_config);
 
@@ -421,8 +422,8 @@ fn demonstrate_health(health_tx: &watch::Sender<HealthState>) {
     // Show bitcode wire format used for M2M health broadcasts
     let broadcast: HealthBroadcast = HealthBroadcast {
         entries: vec![
-            BackendHealth { backend_id: "node-1".into(), load: 0.2, latency_ms: 30, available: true },
-            BackendHealth { backend_id: "node-2".into(), load: 0.8, latency_ms: 200, available: true },
+            BackendHealth { backend_id: ArrayString::from("node-1").unwrap(), load: 0.2, latency_ms: 30, availability: Availability::Online },
+            BackendHealth { backend_id: ArrayString::from("node-2").unwrap(), load: 0.8, latency_ms: 200, availability: Availability::Online },
         ],
     };
     let wire: Vec<u8> = bitcode::encode(&broadcast);
@@ -434,8 +435,8 @@ fn demonstrate_health(health_tx: &watch::Sender<HealthState>) {
 
     // Demonstrate health-weighted backend selection
     let backends: Vec<BackendConfig> = vec![
-        BackendConfig::new("node-1".into(), "10.0.0.1:8080".parse().unwrap(), 1.0, TransportKind::Tcp),
-        BackendConfig::new("node-2".into(), "10.0.0.2:8080".parse().unwrap(), 1.0, TransportKind::Tcp),
+        BackendConfig::new("node-1", "10.0.0.1:8080".parse().unwrap(), 1.0, TransportKind::Tcp),
+        BackendConfig::new("node-2", "10.0.0.2:8080".parse().unwrap(), 1.0, TransportKind::Tcp),
     ];
     let pool: BackendPool = BackendPool::new(backends, 0.0).unwrap();
     let client_ip: IpAddr = "192.168.1.1".parse().unwrap();
@@ -449,8 +450,8 @@ fn demonstrate_health(health_tx: &watch::Sender<HealthState>) {
     let mut health: HealthState = HealthState::new();
     health.update(HealthBroadcast {
         entries: vec![
-            BackendHealth { backend_id: "node-1".into(), load: 0.95, latency_ms: 800, available: true },
-            BackendHealth { backend_id: "node-2".into(), load: 0.1, latency_ms: 20, available: true },
+            BackendHealth { backend_id: ArrayString::from("node-1").unwrap(), load: 0.95, latency_ms: 800, availability: Availability::Online },
+            BackendHealth { backend_id: ArrayString::from("node-2").unwrap(), load: 0.1, latency_ms: 20, availability: Availability::Online },
         ],
     });
     let selected = pool.select(client_ip, &health).unwrap();
@@ -460,8 +461,8 @@ fn demonstrate_health(health_tx: &watch::Sender<HealthState>) {
     let mut health: HealthState = HealthState::new();
     health.update(HealthBroadcast {
         entries: vec![
-            BackendHealth { backend_id: "node-1".into(), load: 0.0, latency_ms: 0, available: false },
-            BackendHealth { backend_id: "node-2".into(), load: 0.3, latency_ms: 50, available: true },
+            BackendHealth { backend_id: ArrayString::from("node-1").unwrap(), load: 0.0, latency_ms: 0, availability: Availability::Offline },
+            BackendHealth { backend_id: ArrayString::from("node-2").unwrap(), load: 0.3, latency_ms: 50, availability: Availability::Online },
         ],
     });
     let selected = pool.select(client_ip, &health).unwrap();
@@ -471,10 +472,10 @@ fn demonstrate_health(health_tx: &watch::Sender<HealthState>) {
     health_tx.send_modify(|state| {
         state.update(HealthBroadcast {
             entries: vec![BackendHealth {
-                backend_id: "backend-a".into(),
+                backend_id: ArrayString::from("backend-a").unwrap(),
                 load: 0.2,
                 latency_ms: 30,
-                available: true,
+                availability: Availability::Online,
             }],
         });
     });

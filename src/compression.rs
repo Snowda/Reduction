@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::io::Read;
+use std::io::{BufReader, Read, Take};
 
 use crate::error::{ReductionError, Result};
 
@@ -52,9 +52,9 @@ pub fn decompress_bounded(data: &[u8], max_bytes: usize) -> Result<Vec<u8>> {
     // Fresh decoder per call — safety-critical path that must enforce size limits
     // against malicious payloads (zip bombs). Thread-local reuse is not worth the
     // complexity here since the Decoder wraps the input reader.
-    let decoder: zstd::Decoder<'static, std::io::BufReader<&[u8]>> = zstd::Decoder::new(data)
+    let decoder: zstd::Decoder<'static, BufReader<&[u8]>> = zstd::Decoder::new(data)
         .map_err(|e| ReductionError::Transport(format!("zstd init: {e}")))?;
-    let mut limited: std::io::Take<zstd::Decoder<'static, std::io::BufReader<&[u8]>>> =
+    let mut limited: Take<zstd::Decoder<'static, BufReader<&[u8]>>> =
         decoder.take((max_bytes + 1) as u64);
     let mut output: Vec<u8> = Vec::new();
     limited

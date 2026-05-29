@@ -95,6 +95,31 @@ pub fn build_client_config(
     return Ok((config, resolver));
 }
 
+#[cfg(feature = "acme")]
+pub fn build_acme_server_config(
+    ca_cert_path: &Path,
+    resolver: Arc<crate::tls::acme::AcmeCertResolver>,
+) -> Result<ServerConfig> {
+    let root_store: RootCertStore = load_ca_certs(ca_cert_path)?;
+
+    let client_verifier: Arc<dyn rustls::server::danger::ClientCertVerifier> =
+        WebPkiClientVerifier::builder(Arc::new(root_store))
+            .build()
+            .map_err(|e| ReductionError::Config(format!("failed to build client verifier: {e}")))?;
+
+    let mut config: ServerConfig = ServerConfig::builder()
+        .with_client_cert_verifier(client_verifier)
+        .with_cert_resolver(resolver);
+
+    config.alpn_protocols = vec![
+        b"h2".to_vec(),
+        b"http/1.1".to_vec(),
+        b"acme-tls/1".to_vec(),
+    ];
+
+    return Ok(config);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

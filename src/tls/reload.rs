@@ -125,6 +125,8 @@ fn build_certified_key(cert_path: &Path, key_path: &Path) -> Result<CertifiedKey
     return Ok(certified_key);
 }
 
+const CERT_RELOAD_DEBOUNCE_MS: u64 = 300;
+
 pub struct CertWatcher {
     _watcher: RecommendedWatcher,
 }
@@ -134,7 +136,7 @@ impl CertWatcher {
         server_resolver: Arc<ReloadingCertResolver>,
         client_resolver: Arc<ReloadingClientCertResolver>,
     ) -> Result<Self> {
-        let debounce_duration: Duration = Duration::from_millis(300);
+        let debounce_duration: Duration = Duration::from_millis(CERT_RELOAD_DEBOUNCE_MS);
         let last_reload: Arc<RwLock<Instant>> =
             Arc::new(RwLock::new(Instant::now() - debounce_duration));
 

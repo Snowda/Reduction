@@ -5,13 +5,13 @@ use crate::error::{ReductionError, Result};
 #[derive(Debug)]
 pub struct RequestQueue {
     semaphore: Semaphore,
-    max_depth: usize,
+    max_depth: u32,
 }
 
 impl RequestQueue {
-    pub fn new(max_depth: usize) -> Self {
+    pub fn new(max_depth: u32) -> Self {
         return Self {
-            semaphore: Semaphore::new(max_depth),
+            semaphore: Semaphore::new(max_depth as usize),
             max_depth,
         };
     }
@@ -23,11 +23,12 @@ impl RequestQueue {
         }
     }
 
-    pub fn depth(&self) -> usize {
-        return self.max_depth - self.semaphore.available_permits();
+    pub fn depth(&self) -> u32 {
+        // Safe: available_permits <= max_depth (u32), so subtraction fits in u32
+        return self.max_depth - self.semaphore.available_permits() as u32;
     }
 
-    pub fn max_depth(&self) -> usize {
+    pub fn max_depth(&self) -> u32 {
         return self.max_depth;
     }
 

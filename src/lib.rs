@@ -6,6 +6,7 @@ pub mod circuit;
 pub mod compression;
 pub mod config;
 pub mod error;
+pub mod fs_util;
 pub mod health;
 pub mod metrics;
 pub mod proxy;

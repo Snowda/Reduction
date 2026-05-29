@@ -1,5 +1,4 @@
 use std::fs;
-use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -20,6 +19,7 @@ use x509_parser::prelude::*;
 
 use crate::config::AcmeTlsConfig;
 use crate::error::{ReductionError, Result};
+use crate::fs_util::atomic_write;
 
 const ACME_TLS_ALPN_PROTO: &[u8] = b"acme-tls/1";
 const ACME_IDENTIFIER_OID: &[u64] = &[1, 3, 6, 1, 5, 5, 7, 1, 31];
@@ -286,9 +286,9 @@ impl AcmeRenewalTask {
         let cert_path: PathBuf = self.config.cache_dir.join(CERT_FILENAME);
         let key_path: PathBuf = self.config.cache_dir.join(KEY_FILENAME);
 
-        fs::write(&cert_path, cert_chain_pem.as_bytes())
+        atomic_write(&cert_path, cert_chain_pem.as_bytes())
             .map_err(|e| ReductionError::Acme(format!("failed to write cert: {e}")))?;
-        fs::write(&key_path, key_pem.as_bytes())
+        atomic_write(&key_path, key_pem.as_bytes())
             .map_err(|e| ReductionError::Acme(format!("failed to write key: {e}")))?;
 
         info!(cert_path = %cert_path.display(), "ACME certificate provisioned and cached");
@@ -330,9 +330,7 @@ impl AcmeRenewalTask {
         let serialized: String = serde_json::to_string(&credentials)
             .map_err(|e| ReductionError::Acme(format!("failed to serialize credentials: {e}")))?;
 
-        let mut file = fs::File::create(&account_key_path)
-            .map_err(|e| ReductionError::Acme(format!("failed to create account key file: {e}")))?;
-        file.write_all(serialized.as_bytes())
+        atomic_write(&account_key_path, serialized.as_bytes())
             .map_err(|e| ReductionError::Acme(format!("failed to write account credentials: {e}")))?;
 
         info!(path = %account_key_path.display(), "created new ACME account");

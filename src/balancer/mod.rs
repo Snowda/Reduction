@@ -13,7 +13,7 @@ use crate::health::HealthState;
 
 pub use queue::RequestQueue;
 
-pub const MAX_BACKENDS: usize = HARD_MAX_BACKENDS;
+pub const MAX_BACKENDS: usize = HARD_MAX_BACKENDS as usize;
 
 #[derive(Debug, Clone)]
 pub struct BackendPool {
@@ -26,8 +26,8 @@ impl BackendPool {
         return Self::with_max(backends, jitter_factor, 64);
     }
 
-    pub fn with_max(backends: Vec<BackendConfig>, jitter_factor: f64, max_backends: usize) -> Result<Self> {
-        if backends.len() > max_backends {
+    pub fn with_max(backends: Vec<BackendConfig>, jitter_factor: f64, max_backends: u32) -> Result<Self> {
+        if backends.len() > max_backends as usize {
             return Err(ReductionError::Config(format!(
                 "backend count {} exceeds maximum {max_backends}",
                 backends.len(),
@@ -45,6 +45,7 @@ impl BackendPool {
         });
     }
 
+    #[must_use]
     #[tracing::instrument(skip_all)]
     pub fn select(
         &self,
@@ -54,13 +55,17 @@ impl BackendPool {
         return self.select_with_pressure(client_ip, health, &|_| 0.0);
     }
 
+    #[must_use]
     #[tracing::instrument(skip_all)]
-    pub fn select_with_pressure(
+    pub fn select_with_pressure<F>(
         &self,
         client_ip: IpAddr,
         health: &HealthState,
-        pressure_fn: &dyn Fn(&str) -> f64,
-    ) -> Option<&BackendConfig> {
+        pressure_fn: &F,
+    ) -> Option<&BackendConfig>
+    where
+        F: Fn(&str) -> f64,
+    {
         if self.backends.is_empty() {
             return None;
         }
@@ -94,9 +99,11 @@ impl BackendPool {
 
 #[cfg(test)]
 mod tests {
+    use arrayvec::ArrayString;
+
     use super::*;
-    use crate::config::TransportKind;
-    use crate::health::state::{BackendHealth, HealthBroadcast};
+    use crate::config::{HARD_MAX_BACKENDS, TransportKind};
+    use crate::health::state::{Availability, BackendHealth, HealthBroadcast};
 
     fn make_backends(count: usize) -> Vec<BackendConfig> {
         return (0..count)
@@ -104,7 +111,7 @@ mod tests {
                 let a: usize = (i / 256) % 256;
                 let b: usize = i % 256;
                 BackendConfig::new(
-                    format!("backend-{i}"),
+                    &format!("backend-{i}"),
                     format!("10.0.{a}.{b}:8080").parse().unwrap(),
                     1.0,
                     TransportKind::Tcp,
@@ -138,13 +145,13 @@ mod tests {
     fn test_pool_distributes_across_backends() {
         let pool: BackendPool = BackendPool::new(make_backends(3), 0.05).unwrap();
         let health: HealthState = HealthState::new();
-        let mut counts: std::collections::HashMap<String, usize> =
+        let mut counts: std::collections::HashMap<ArrayString<256>, usize> =
             std::collections::HashMap::new();
 
         for i in 0..200u8 {
             let ip: IpAddr = format!("10.0.{}.{}", i / 50, i % 50).parse().unwrap();
             if let Some(b) = pool.select(ip, &health) {
-                *counts.entry(b.id.clone()).or_insert(0) += 1;
+                *counts.entry(b.id).or_insert(0) += 1;
             }
         }
 
@@ -159,16 +166,16 @@ mod tests {
         health.update(HealthBroadcast {
             entries: vec![
                 BackendHealth {
-                    backend_id: "backend-0".to_string(),
+                    backend_id: ArrayString::from("backend-0").unwrap(),
                     load: 0.0,
                     latency_ms: 10,
-                    available: false,
+                    availability: Availability::Offline,
                 },
                 BackendHealth {
-                    backend_id: "backend-1".to_string(),
+                    backend_id: ArrayString::from("backend-1").unwrap(),
                     load: 0.1,
                     latency_ms: 10,
-                    available: true,
+                    availability: Availability::Online,
                 },
             ],
         });
@@ -178,7 +185,7 @@ mod tests {
         for i in 0..50u8 {
             let ip: IpAddr = format!("10.0.0.{i}").parse().unwrap();
             let selected: &BackendConfig = pool.select(ip, &health).unwrap();
-            assert_eq!(selected.id, "backend-1");
+            assert_eq!(selected.id.as_str(), "backend-1");
         }
     }
 
@@ -220,7 +227,7 @@ mod tests {
 
     #[test]
     fn test_pool_rejects_over_hard_limit() {
-        let result = BackendPool::with_max(make_backends(MAX_BACKENDS + 1), 0.05, MAX_BACKENDS + 1);
+        let result = BackendPool::with_max(make_backends(MAX_BACKENDS + 1), 0.05, HARD_MAX_BACKENDS + 1);
         assert!(result.is_err());
         let err: String = format!("{}", result.unwrap_err());
         assert!(err.contains("hard limit"), "expected hard limit error, got: {err}");
@@ -239,7 +246,7 @@ mod tests {
         for i in 0..100u8 {
             let ip: IpAddr = format!("10.0.0.{i}").parse().unwrap();
             if let Some(b) = pool.select_with_pressure(ip, &health, &pressure_fn) {
-                if b.id == "backend-1" {
+                if b.id.as_str() == "backend-1" {
                     backend_1_count += 1;
                 }
             }

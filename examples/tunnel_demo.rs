@@ -4,6 +4,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use arrayvec::ArrayString;
 use axum::body::Body;
 use axum::extract::DefaultBodyLimit;
 use axum::http::{Request, Response, StatusCode};
@@ -37,7 +38,7 @@ use reduction::proxy::{ConnPool, ProxyState, ReloadableState, Router, proxy_hand
 use reduction::ratelimit::RateLimit;
 use reduction::tls;
 use reduction::transport::quic::QuicStream;
-use reduction::tunnel::protocol::{self, TunnelFrame};
+use reduction::tunnel::protocol::{self, SessionId, TunnelFrame};
 use reduction::tunnel::registry::TunnelRegistry;
 
 const PROXY_PORT: u16 = 18443;
@@ -185,16 +186,16 @@ fn generate_signed_cert(
 // Proxy setup with tunnel support
 // ---------------------------------------------------------------------------
 
-fn build_backend_pools(backends: &[BackendConfig], routes: &[(&str, &str)]) -> HashMap<String, BackendPool> {
-    let mut pools: HashMap<String, BackendPool> = HashMap::new();
+fn build_backend_pools(backends: &[BackendConfig], routes: &[(&str, &str)]) -> HashMap<ArrayString<256>, BackendPool> {
+    let mut pools: HashMap<ArrayString<256>, BackendPool> = HashMap::new();
     for (_, backend_id) in routes {
         let bs: Vec<BackendConfig> = backends.iter()
-            .filter(|b| b.pool == *backend_id)
+            .filter(|b| b.pool.as_str() == *backend_id)
             .cloned()
             .collect();
         if !bs.is_empty() && !pools.contains_key(*backend_id) {
             let pool: BackendPool = BackendPool::new(bs, 0.0).expect("too many backends");
-            pools.insert(backend_id.to_string(), pool);
+            pools.insert(ArrayString::from(backend_id).unwrap(), pool);
         }
     }
     return pools;
@@ -224,7 +225,7 @@ async fn start_proxy(
     // We still need a BackendConfig for route matching; address is a placeholder.
     let backends: Vec<BackendConfig> = vec![
         BackendConfig::new(
-            BACKEND_ID.to_string(),
+            BACKEND_ID,
             "0.0.0.0:0".parse().unwrap(),
             1.0,
             TransportKind::Tcp,
@@ -234,8 +235,8 @@ async fn start_proxy(
 
     let route_configs: Vec<reduction::config::RouteConfig> = routes.iter()
         .map(|(prefix, id)| reduction::config::RouteConfig {
-            path_prefix: prefix.to_string(),
-            backend_id: id.to_string(),
+            path_prefix: ArrayString::from(prefix).unwrap(),
+            backend_id: ArrayString::from(id).unwrap(),
             timeout_secs: None,
         })
         .collect();
@@ -293,10 +294,7 @@ async fn start_proxy(
     let tunnel_config: TunnelConfig = TunnelConfig {
         enabled: true,
         listen_address: Some(([127, 0, 0, 1], TUNNEL_PORT).into()),
-        heartbeat_interval_secs: 15,
-        heartbeat_timeout_secs: 45,
-        allowed_backend_ids: vec![],
-        max_sessions_per_backend: 8,
+        ..TunnelConfig::default()
     };
     let tunnel_metrics: ProxyMetrics = ProxyMetrics::new();
     let tunnel_shutdown: CancellationToken = shutdown.clone();
@@ -322,7 +320,7 @@ async fn start_proxy(
 async fn start_tunnel_backend(
     dir: &Path,
     shutdown: CancellationToken,
-) -> String {
+) -> SessionId {
     let (client_tls_config, _) = tls::build_client_config(
         &dir.join("client.crt"),
         &dir.join("client.key"),
@@ -358,9 +356,9 @@ async fn start_tunnel_backend(
 
     // Send Register frame
     let register: TunnelFrame = TunnelFrame::Register {
-        backend_id: BACKEND_ID.to_string(),
-        pool: BACKEND_ID.to_string(),
-        capabilities: vec!["http".to_string()],
+        backend_id: ArrayString::from(BACKEND_ID).unwrap(),
+        pool: ArrayString::from(BACKEND_ID).unwrap(),
+        capabilities: ["http"].iter().map(|s| ArrayString::from(s).unwrap()).collect(),
     };
     protocol::write_frame(&mut control_stream, &register).await
         .expect("failed to send Register");
@@ -369,9 +367,9 @@ async fn start_tunnel_backend(
     // Read RegisterAck
     let ack: TunnelFrame = protocol::read_frame(&mut control_stream).await
         .expect("failed to read RegisterAck");
-    let session_id: String = match ack {
+    let session_id: SessionId = match ack {
         TunnelFrame::RegisterAck { session_id } => {
-            println!("  [ok] Received RegisterAck (session: {})", &session_id[..20]);
+            println!("  [ok] Received RegisterAck (session: {})", session_id);
             session_id
         }
         other => panic!("expected RegisterAck, got {:?}", other),
@@ -397,7 +395,7 @@ async fn start_tunnel_backend(
                 }
                 _ = heartbeat_shutdown.cancelled() => {
                     let _ = protocol::write_frame(&mut control_stream, &TunnelFrame::Shutdown {
-                        reason: "demo ending".to_string(),
+                        reason: ArrayString::from("demo ending").unwrap(),
                     }).await;
                     break;
                 }

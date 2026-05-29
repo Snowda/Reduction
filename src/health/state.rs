@@ -1,19 +1,36 @@
 use std::num::NonZeroUsize;
 use std::time::{Duration, Instant};
 
+use arrayvec::ArrayString;
 use bitcode::{Decode, Encode};
 use lru::LruCache;
 
 use crate::balancer::MAX_BACKENDS;
 
-const DEFAULT_STALENESS_TTL: Duration = Duration::from_secs(300);
+use crate::config::types::{DEFAULT_LATENCY_THRESHOLD_MS, DEFAULT_STALENESS_TTL_SECS};
+
+const DEFAULT_STALENESS_TTL: Duration = Duration::from_secs(DEFAULT_STALENESS_TTL_SECS);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
+#[repr(u8)]
+pub enum Availability {
+    Online = 0,
+    Offline = 1,
+}
+
+impl Availability {
+    #[inline]
+    pub fn is_online(self) -> bool {
+        return self == Availability::Online;
+    }
+}
 
 #[derive(Debug, Clone, Encode, Decode)]
 pub struct BackendHealth {
-    pub backend_id: String,
+    pub backend_id: ArrayString<256>,
     pub load: f64,
     pub latency_ms: u32,
-    pub available: bool,
+    pub availability: Availability,
 }
 
 #[derive(Debug, Clone, Encode, Decode)]
@@ -23,8 +40,9 @@ pub struct HealthBroadcast {
 
 #[derive(Debug)]
 pub struct HealthState {
-    entries: LruCache<String, (BackendHealth, Instant)>,
+    entries: LruCache<ArrayString<256>, (BackendHealth, Instant)>,
     staleness_ttl: Duration,
+    latency_threshold_ms: u32,
 }
 
 impl HealthState {
@@ -34,16 +52,18 @@ impl HealthState {
                 NonZeroUsize::new(MAX_BACKENDS).expect("MAX_BACKENDS must be > 0"),
             ),
             staleness_ttl: DEFAULT_STALENESS_TTL,
+            latency_threshold_ms: DEFAULT_LATENCY_THRESHOLD_MS,
         };
     }
 
-    pub fn with_config(capacity: usize, staleness_ttl: Duration) -> Self {
-        let cap: usize = capacity.min(MAX_BACKENDS).max(1);
+    pub fn with_config(capacity: u32, staleness_ttl: Duration, latency_threshold_ms: u32) -> Self {
+        let cap: usize = (capacity as usize).min(MAX_BACKENDS).max(1);
         return Self {
             entries: LruCache::new(
                 NonZeroUsize::new(cap).expect("capacity must be > 0"),
             ),
             staleness_ttl,
+            latency_threshold_ms,
         };
     }
 
@@ -55,10 +75,11 @@ impl HealthState {
     pub fn update(&mut self, broadcast: HealthBroadcast) {
         let now: Instant = Instant::now();
         for entry in broadcast.entries {
-            self.entries.push(entry.backend_id.clone(), (entry, now));
+            self.entries.push(entry.backend_id, (entry, now));
         }
     }
 
+    #[inline]
     pub fn is_valid(&self, backend_id: &str) -> bool {
         match self.entries.peek(backend_id) {
             None => return false,
@@ -76,14 +97,14 @@ impl HealthState {
         match self.entries.peek(backend_id) {
             None => return 1.0,
             Some((health, _)) => {
-                if !health.available {
+                if !health.availability.is_online() {
                     return 0.0;
                 }
 
                 let load_factor: f64 = 1.0 - health.load.clamp(0.0, 1.0);
 
-                let latency_factor: f64 = if health.latency_ms > 500 {
-                    500.0 / (health.latency_ms as f64)
+                let latency_factor: f64 = if health.latency_ms > self.latency_threshold_ms {
+                    (self.latency_threshold_ms as f64) / (health.latency_ms as f64)
                 } else {
                     1.0
                 };
@@ -93,6 +114,7 @@ impl HealthState {
         }
     }
 
+    #[must_use]
     pub fn get(&self, backend_id: &str) -> Option<&BackendHealth> {
         return self.entries.peek(backend_id).map(|(h, _)| h);
     }
@@ -108,10 +130,10 @@ mod tests {
 
     fn healthy_backend(id: &str) -> BackendHealth {
         return BackendHealth {
-            backend_id: id.to_string(),
+            backend_id: ArrayString::from(id).unwrap(),
             load: 0.3,
             latency_ms: 50,
-            available: true,
+            availability: Availability::Online,
         };
     }
 
@@ -121,8 +143,8 @@ mod tests {
         state.update(make_broadcast(vec![healthy_backend("api")]));
 
         let health: &BackendHealth = state.get("api").unwrap();
-        assert_eq!(health.backend_id, "api");
-        assert!(health.available);
+        assert_eq!(health.backend_id.as_str(), "api");
+        assert!(health.availability.is_online());
     }
 
     #[test]
@@ -153,10 +175,10 @@ mod tests {
     fn test_weight_factor_unavailable() {
         let mut state: HealthState = HealthState::new();
         state.update(make_broadcast(vec![BackendHealth {
-            backend_id: "api".to_string(),
+            backend_id: ArrayString::from("api").unwrap(),
             load: 0.0,
             latency_ms: 10,
-            available: false,
+            availability: Availability::Offline,
         }]));
 
         let factor: f64 = state.weight_factor("api");
@@ -167,10 +189,10 @@ mod tests {
     fn test_weight_factor_high_load() {
         let mut state: HealthState = HealthState::new();
         state.update(make_broadcast(vec![BackendHealth {
-            backend_id: "api".to_string(),
+            backend_id: ArrayString::from("api").unwrap(),
             load: 0.9,
             latency_ms: 50,
-            available: true,
+            availability: Availability::Online,
         }]));
 
         let factor: f64 = state.weight_factor("api");
@@ -181,10 +203,10 @@ mod tests {
     fn test_weight_factor_high_latency() {
         let mut state: HealthState = HealthState::new();
         state.update(make_broadcast(vec![BackendHealth {
-            backend_id: "api".to_string(),
+            backend_id: ArrayString::from("api").unwrap(),
             load: 0.0,
             latency_ms: 1000,
-            available: true,
+            availability: Availability::Online,
         }]));
 
         let factor: f64 = state.weight_factor("api");
@@ -210,8 +232,8 @@ mod tests {
         let decoded: HealthBroadcast = bitcode::decode(&encoded).unwrap();
 
         assert_eq!(decoded.entries.len(), 2);
-        assert_eq!(decoded.entries[0].backend_id, "api-1");
-        assert_eq!(decoded.entries[1].backend_id, "api-2");
+        assert_eq!(decoded.entries[0].backend_id.as_str(), "api-1");
+        assert_eq!(decoded.entries[1].backend_id.as_str(), "api-2");
     }
 
     #[test]
@@ -224,8 +246,8 @@ mod tests {
 
     #[test]
     fn test_lru_evicts_oldest_at_capacity() {
-        let cap: usize = 16;
-        let mut state: HealthState = HealthState::with_config(cap, Duration::from_secs(300));
+        let cap: u32 = 16;
+        let mut state: HealthState = HealthState::with_config(cap, Duration::from_secs(300), DEFAULT_LATENCY_THRESHOLD_MS);
 
         for i in 0..cap {
             state.update(make_broadcast(vec![healthy_backend(&format!("b-{i}"))]));
@@ -242,8 +264,8 @@ mod tests {
 
     #[test]
     fn test_lru_update_existing_does_not_evict() {
-        let cap: usize = 16;
-        let mut state: HealthState = HealthState::with_config(cap, Duration::from_secs(300));
+        let cap: u32 = 16;
+        let mut state: HealthState = HealthState::with_config(cap, Duration::from_secs(300), DEFAULT_LATENCY_THRESHOLD_MS);
 
         for i in 0..cap {
             state.update(make_broadcast(vec![healthy_backend(&format!("b-{i}"))]));

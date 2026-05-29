@@ -1,11 +1,14 @@
 pub mod quic;
 pub mod tcp;
 
-#[derive(Debug, Clone, Copy)]
-pub struct ConnectAddr(pub std::net::SocketAddr);
+use std::net::SocketAddr;
+use std::ops::Deref;
 
-impl std::ops::Deref for ConnectAddr {
-    type Target = std::net::SocketAddr;
+#[derive(Debug, Clone, Copy)]
+pub struct ConnectAddr(pub SocketAddr);
+
+impl Deref for ConnectAddr {
+    type Target = SocketAddr;
     fn deref(&self) -> &Self::Target {
         return &self.0;
     }

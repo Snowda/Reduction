@@ -30,8 +30,10 @@ impl HealthSubscriber {
 
 #[cfg(test)]
 mod tests {
+    use arrayvec::ArrayString;
+
     use super::*;
-    use crate::health::state::{BackendHealth, HealthBroadcast};
+    use crate::health::state::{Availability, BackendHealth, HealthBroadcast};
 
     #[test]
     fn test_subscriber_handle_valid_message() {
@@ -41,10 +43,10 @@ mod tests {
 
         let broadcast: HealthBroadcast = HealthBroadcast {
             entries: vec![BackendHealth {
-                backend_id: "api".to_string(),
+                backend_id: ArrayString::from("api").unwrap(),
                 load: 0.5,
                 latency_ms: 100,
-                available: true,
+                availability: Availability::Online,
             }],
         };
 
@@ -53,7 +55,7 @@ mod tests {
 
         let health_ref: watch::Ref<'_, HealthState> = rx.borrow();
         let health: &BackendHealth = health_ref.get("api").unwrap();
-        assert!(health.available);
+        assert!(health.availability.is_online());
         assert_eq!(health.load, 0.5);
     }
 
@@ -77,19 +79,19 @@ mod tests {
 
         let broadcast1: HealthBroadcast = HealthBroadcast {
             entries: vec![BackendHealth {
-                backend_id: "api".to_string(),
+                backend_id: ArrayString::from("api").unwrap(),
                 load: 0.3,
                 latency_ms: 50,
-                available: true,
+                availability: Availability::Online,
             }],
         };
 
         let broadcast2: HealthBroadcast = HealthBroadcast {
             entries: vec![BackendHealth {
-                backend_id: "api".to_string(),
+                backend_id: ArrayString::from("api").unwrap(),
                 load: 0.9,
                 latency_ms: 500,
-                available: true,
+                availability: Availability::Online,
             }],
         };
 

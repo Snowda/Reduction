@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use arrayvec::ArrayString;
 use axum::routing::any;
 use dashmap::DashMap;
 use tokio::sync::watch;
@@ -18,7 +19,7 @@ use reduction::acl::AccessControl;
 use reduction::balancer::BackendPool;
 use reduction::cache::ResponseCache;
 use reduction::circuit::CircuitBreakers;
-use reduction::config::{self, ReductionConfig, TransportKind};
+use reduction::config::{self, ReductionConfig, ServerTlsConfig, TransportKind};
 use reduction::error::{ReductionError, Result};
 use reduction::health::HealthState;
 use reduction::metrics::{self, ProxyMetrics};
@@ -28,14 +29,14 @@ use reduction::tls;
 use reduction::transport;
 use reduction::tunnel::registry::TunnelRegistry;
 
-fn build_backend_pools(config: &ReductionConfig) -> Result<HashMap<String, BackendPool>> {
-    let mut pools: HashMap<String, BackendPool> = HashMap::new();
+fn build_backend_pools(config: &ReductionConfig) -> Result<HashMap<ArrayString<256>, BackendPool>> {
+    let mut pools: HashMap<ArrayString<256>, BackendPool> = HashMap::new();
 
     for route in &config.routes {
         let backends: Vec<config::BackendConfig> = config
             .backends
             .iter()
-            .filter(|b| b.pool == route.backend_id)
+            .filter(|b| b.pool.as_str() == route.backend_id.as_str())
             .cloned()
             .collect();
 
@@ -45,7 +46,7 @@ fn build_backend_pools(config: &ReductionConfig) -> Result<HashMap<String, Backe
                 config.balancer.jitter_factor,
                 config.balancer.max_backends,
             )?;
-            pools.insert(route.backend_id.clone(), pool);
+            pools.insert(route.backend_id, pool);
         }
     }
 
@@ -60,7 +61,7 @@ fn spawn_config_reload_task(
     tokio::spawn(async move {
         while config_rx.changed().await.is_ok() {
             let config: ReductionConfig = config_rx.borrow_and_update().clone();
-            let backend_pools: HashMap<String, BackendPool> = match build_backend_pools(&config) {
+            let backend_pools: HashMap<ArrayString<256>, BackendPool> = match build_backend_pools(&config) {
                 Ok(pools) => pools,
                 Err(e) => {
                     error!(error = %e, "failed to rebuild backend pools, keeping current config");
@@ -72,19 +73,22 @@ fn spawn_config_reload_task(
                 backend_pools,
             };
 
-            let new_addrs: HashSet<SocketAddr> = new_state.backend_pools.values()
-                .flat_map(|p| p.backends.iter().map(|b| b.address))
-                .collect();
-            let new_backend_ids: HashSet<String> = new_state.backend_pools.keys().cloned().collect();
+            let mut new_addrs: HashSet<SocketAddr> = HashSet::new();
+            new_state.backend_pools.values()
+                .for_each(|p| p.backends.iter().for_each(|b| { new_addrs.insert(b.address); }));
+            let new_backend_ids: HashSet<ArrayString<256>> = new_state.backend_pools.keys().copied().collect();
 
             let old_state: ReloadableState = reloadable_tx.borrow().clone();
-            let removed_addrs: Vec<SocketAddr> = old_state.backend_pools.values()
-                .flat_map(|p| p.backends.iter().map(|b| b.address))
-                .filter(|addr| !new_addrs.contains(addr))
-                .collect();
-            let removed_backend_ids: Vec<String> = old_state.backend_pools.keys()
+            let mut removed_addrs: Vec<SocketAddr> = Vec::new();
+            old_state.backend_pools.values()
+                .for_each(|p| p.backends.iter().for_each(|b| {
+                    if !new_addrs.contains(&b.address) {
+                        removed_addrs.push(b.address);
+                    }
+                }));
+            let removed_backend_ids: Vec<ArrayString<256>> = old_state.backend_pools.keys()
                 .filter(|id| !new_backend_ids.contains(*id))
-                .cloned()
+                .copied()
                 .collect();
 
             if reloadable_tx.send(new_state).is_err() {
@@ -113,9 +117,9 @@ fn spawn_config_reload_task(
                 tokio::spawn(async move {
                     sleep(Duration::from_secs(drain_timeout)).await;
                     let current: ReloadableState = reloadable_rx.borrow().clone();
-                    let still_active: HashSet<SocketAddr> = current.backend_pools.values()
-                        .flat_map(|p| p.backends.iter().map(|b| b.address))
-                        .collect();
+                    let mut still_active: HashSet<SocketAddr> = HashSet::new();
+                    current.backend_pools.values()
+                        .for_each(|p| p.backends.iter().for_each(|b| { still_active.insert(b.address); }));
                     let to_evict: Vec<SocketAddr> = removed_addrs.into_iter()
                         .filter(|addr| !still_active.contains(addr))
                         .collect();
@@ -130,8 +134,8 @@ fn spawn_config_reload_task(
                 &config.backends,
                 &proxy_state.tls_connector,
                 &proxy_state.client_tls_config,
-                Duration::from_secs(config.timeouts.connect_secs),
-                Duration::from_secs(config.timeouts.handshake_secs),
+                Duration::from_secs(config.timeouts.connect_secs.get()),
+                Duration::from_secs(config.timeouts.handshake_secs.get()),
             ).await;
             info!(count = config.backends.len(), "connection pool pre-warmed after config reload");
         }
@@ -148,13 +152,6 @@ async fn run(config_path: PathBuf, config: ReductionConfig) -> Result<()> {
     let _config_watcher: config::watcher::ConfigWatcher =
         config::watcher::ConfigWatcher::new(config_path, config_tx)?;
 
-    let (server_tls_config, server_cert_resolver) = tls::build_server_config(
-        &config.tls.server.cert_path,
-        &config.tls.server.key_path,
-        &config.tls.server.ca_cert_path,
-    )?;
-    let server_tls_config: Arc<rustls::ServerConfig> = Arc::new(server_tls_config);
-
     let (client_tls_config, client_cert_resolver) = tls::build_client_config(
         &config.tls.client.cert_path,
         &config.tls.client.key_path,
@@ -162,8 +159,35 @@ async fn run(config_path: PathBuf, config: ReductionConfig) -> Result<()> {
     )?;
     let client_tls_config: Arc<rustls::ClientConfig> = Arc::new(client_tls_config);
 
-    let _cert_watcher: tls::CertWatcher =
-        tls::CertWatcher::new(server_cert_resolver, client_cert_resolver)?;
+    let server_tls_config: Arc<rustls::ServerConfig>;
+    let _cert_watcher: Option<tls::CertWatcher>;
+
+    match &config.tls.server {
+        ServerTlsConfig::Manual(identity) => {
+            let (cfg, server_cert_resolver) = tls::build_server_config(
+                &identity.cert_path,
+                &identity.key_path,
+                &identity.ca_cert_path,
+            )?;
+            server_tls_config = Arc::new(cfg);
+            _cert_watcher = Some(tls::CertWatcher::new(server_cert_resolver, client_cert_resolver)?);
+        }
+        #[cfg(feature = "acme")]
+        ServerTlsConfig::Acme(acme_config) => {
+            let resolver = Arc::new(tls::AcmeCertResolver::new());
+            let cfg = tls::build_acme_server_config(&acme_config.ca_cert_path, resolver.clone())?;
+            server_tls_config = Arc::new(cfg);
+            _cert_watcher = None;
+
+            let (shutdown_tx, shutdown_rx) = watch::channel(());
+            let task = tls::AcmeRenewalTask::new(acme_config.clone(), resolver, shutdown_rx);
+            task.provision_initial_cert().await?;
+            tokio::spawn(async move {
+                task.run().await;
+                drop(shutdown_tx);
+            });
+        }
+    }
 
     let tls_connector: TlsConnector = TlsConnector::from(client_tls_config.clone());
 
@@ -179,6 +203,7 @@ async fn run(config_path: PathBuf, config: ReductionConfig) -> Result<()> {
         watch::channel(HealthState::with_config(
             config.balancer.max_backends,
             Duration::from_secs(config.health.staleness_ttl_secs),
+            config.health.latency_threshold_ms,
         ));
 
     let acl: AccessControl = AccessControl::new(
@@ -199,18 +224,18 @@ async fn run(config_path: PathBuf, config: ReductionConfig) -> Result<()> {
 
     let circuit_breakers: CircuitBreakers = CircuitBreakers::new(&config.circuit_breaker);
     info!(
-        failure_threshold = config.circuit_breaker.failure_threshold,
+        failure_threshold = config.circuit_breaker.failure_threshold.get(),
         recovery_timeout_secs = config.circuit_breaker.recovery_timeout_secs,
-        half_open_max = config.circuit_breaker.half_open_max_requests,
+        half_open_max = config.circuit_breaker.half_open_max_requests.get(),
         "circuit breaker configured"
     );
 
     let tunnel_registry: Arc<TunnelRegistry> = Arc::new(
-        TunnelRegistry::new(config.tunnel.max_sessions_per_backend),
+        TunnelRegistry::new(config.tunnel.max_sessions_per_backend.get()),
     );
 
     let mut conn_pool: ConnPool = ConnPool::new().with_pool_config(
-        config.proxy.h2_connections_per_backend,
+        config.proxy.h2_connections_per_backend.get(),
         config.proxy.max_idle_quic_per_host,
         config.proxy.h2_stream_window,
         config.proxy.h2_conn_window,
@@ -242,9 +267,9 @@ async fn run(config_path: PathBuf, config: ReductionConfig) -> Result<()> {
 
     if config.cache.enabled {
         info!(
-            max_entries = config.cache.max_entries,
-            max_entry_bytes = config.cache.max_entry_bytes,
-            default_ttl_secs = config.cache.default_ttl_secs,
+            max_entries = config.cache.max_entries.get(),
+            max_entry_bytes = config.cache.max_entry_bytes.get(),
+            default_ttl_secs = config.cache.default_ttl_secs.get(),
             "response cache enabled"
         );
     }
@@ -280,8 +305,8 @@ async fn run(config_path: PathBuf, config: ReductionConfig) -> Result<()> {
         &config.backends,
         &proxy_state.tls_connector,
         &proxy_state.client_tls_config,
-        Duration::from_secs(config.timeouts.connect_secs),
-        Duration::from_secs(config.timeouts.handshake_secs),
+        Duration::from_secs(config.timeouts.connect_secs.get()),
+        Duration::from_secs(config.timeouts.handshake_secs.get()),
     ).await;
     info!(count = config.backends.len(), "connection pool pre-warmed on startup");
 
@@ -292,7 +317,7 @@ async fn run(config_path: PathBuf, config: ReductionConfig) -> Result<()> {
 
     let app = axum::Router::new()
         .fallback(any(proxy_handler))
-        .layer(axum::extract::DefaultBodyLimit::max(config.proxy.max_response_body_bytes))
+        .layer(axum::extract::DefaultBodyLimit::max(config.proxy.max_response_body_bytes as usize))
         .with_state(proxy_state)
         .into_make_service_with_connect_info::<transport::ConnectAddr>();
 
@@ -316,7 +341,7 @@ async fn run(config_path: PathBuf, config: ReductionConfig) -> Result<()> {
                     config.listen.address,
                     quic_config,
                     shutdown_token.clone(),
-                    config.proxy.quic_channel_capacity,
+                    config.proxy.quic_channel_capacity.get() as usize,
                 )?;
 
             if let Some(raw_rx) = listener.take_raw_stream_receiver() {
@@ -372,7 +397,8 @@ async fn drain_connections(
 ) {
     info!(timeout_secs = drain_timeout.as_secs(), "draining in-flight connections");
 
-    let poll_interval: Duration = Duration::from_millis(250);
+    const DRAIN_POLL_INTERVAL_MS: u64 = 250;
+    let poll_interval: Duration = Duration::from_millis(DRAIN_POLL_INTERVAL_MS);
     let deadline: tokio::time::Instant = tokio::time::Instant::now() + drain_timeout;
 
     loop {
@@ -396,13 +422,13 @@ async fn drain_connections(
 async fn main() -> Result<()> {
     rustls::crypto::ring::default_provider()
         .install_default()
-        .map_err(|_| ReductionError::Config("failed to install crypto provider".to_string()))?;
+        .map_err(|_| ReductionError::Config("failed to install crypto provider".into()))?;
 
     let args: Vec<String> = env::args().collect();
 
     if args.len() != 2 {
         return Err(ReductionError::Config(
-            "usage: reduction <config.toml>".to_string(),
+            "usage: reduction <config.toml>".into(),
         ));
     }
 

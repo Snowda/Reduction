@@ -1,6 +1,8 @@
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
+use std::path::{Path, PathBuf};
 
+use arrayvec::ArrayString;
 use ipnet::IpNet;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -38,12 +40,25 @@ pub struct ReductionConfig {
     pub cache: CacheConfig,
 }
 
+// ── Balancer defaults ──
+
+pub const DEFAULT_QUEUE_DEPTH: u32 = 1000;
+pub const DEFAULT_JITTER_FACTOR: f64 = 0.05;
+pub const DEFAULT_DRAIN_TIMEOUT_SECS: u64 = 30;
+pub const DEFAULT_MAX_BACKENDS: u32 = 64;
+pub const HARD_MAX_BACKENDS: u32 = 256;
+
+fn default_queue_depth() -> u32 { return DEFAULT_QUEUE_DEPTH; }
+fn default_jitter_factor() -> f64 { return DEFAULT_JITTER_FACTOR; }
+fn default_drain_timeout_secs() -> u64 { return DEFAULT_DRAIN_TIMEOUT_SECS; }
+fn default_max_backends() -> u32 { return DEFAULT_MAX_BACKENDS; }
+
 #[derive(Debug, Clone, Serialize)]
 pub struct BalancerConfig {
-    pub queue_depth: usize,
+    pub queue_depth: u32,
     pub jitter_factor: f64,
     pub drain_timeout_secs: u64,
-    pub max_backends: usize,
+    pub max_backends: u32,
 }
 
 impl<'de> Deserialize<'de> for BalancerConfig {
@@ -51,13 +66,13 @@ impl<'de> Deserialize<'de> for BalancerConfig {
         #[derive(Deserialize)]
         struct Wire {
             #[serde(default = "default_queue_depth")]
-            queue_depth: usize,
+            queue_depth: u32,
             #[serde(default = "default_jitter_factor")]
             jitter_factor: f64,
             #[serde(default = "default_drain_timeout_secs")]
             drain_timeout_secs: u64,
             #[serde(default = "default_max_backends")]
-            max_backends: usize,
+            max_backends: u32,
         }
         let wire: Wire = Wire::deserialize(deserializer)?;
         validate_jitter_factor(wire.jitter_factor).map_err(serde::de::Error::custom)?;
@@ -74,33 +89,17 @@ impl<'de> Deserialize<'de> for BalancerConfig {
 impl Default for BalancerConfig {
     fn default() -> Self {
         return Self {
-            queue_depth: default_queue_depth(),
-            jitter_factor: default_jitter_factor(),
-            drain_timeout_secs: default_drain_timeout_secs(),
-            max_backends: default_max_backends(),
+            queue_depth: DEFAULT_QUEUE_DEPTH,
+            jitter_factor: DEFAULT_JITTER_FACTOR,
+            drain_timeout_secs: DEFAULT_DRAIN_TIMEOUT_SECS,
+            max_backends: DEFAULT_MAX_BACKENDS,
         };
     }
 }
 
-fn default_queue_depth() -> usize {
-    return 1000;
-}
-
-fn default_jitter_factor() -> f64 {
-    return 0.05;
-}
-
-fn default_drain_timeout_secs() -> u64 {
-    return 30;
-}
-
-fn default_max_backends() -> usize {
-    return 64;
-}
-
-fn validate_max_backends(max_backends: usize) -> std::result::Result<(), String> {
+fn validate_max_backends(max_backends: u32) -> std::result::Result<(), String> {
     if max_backends == 0 {
-        return Err("max_backends must be at least 1".to_string());
+        return Err("max_backends must be at least 1".into());
     }
     if max_backends > HARD_MAX_BACKENDS {
         return Err(format!("max_backends {max_backends} exceeds hard limit {HARD_MAX_BACKENDS}"));
@@ -108,43 +107,39 @@ fn validate_max_backends(max_backends: usize) -> std::result::Result<(), String>
     return Ok(());
 }
 
-pub const HARD_MAX_BACKENDS: usize = 256;
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouteConfig {
-    pub path_prefix: String,
-    pub backend_id: String,
+    pub path_prefix: ArrayString<64>,
+    pub backend_id: ArrayString<256>,
     pub timeout_secs: Option<u64>,
 }
 
-fn default_connect_timeout_secs() -> u64 {
-    return 5;
-}
+// ── Timeout defaults ──
 
-fn default_handshake_timeout_secs() -> u64 {
-    return 5;
-}
+pub const DEFAULT_CONNECT_TIMEOUT_SECS: NonZeroU64 = NonZeroU64::new(5).expect("nonzero constant");
+pub const DEFAULT_HANDSHAKE_TIMEOUT_SECS: NonZeroU64 = NonZeroU64::new(5).expect("nonzero constant");
+pub const DEFAULT_REQUEST_TIMEOUT_SECS: NonZeroU64 = NonZeroU64::new(30).expect("nonzero constant");
 
-fn default_request_timeout_secs() -> u64 {
-    return 30;
-}
+fn default_connect_timeout_secs() -> NonZeroU64 { return DEFAULT_CONNECT_TIMEOUT_SECS; }
+fn default_handshake_timeout_secs() -> NonZeroU64 { return DEFAULT_HANDSHAKE_TIMEOUT_SECS; }
+fn default_request_timeout_secs() -> NonZeroU64 { return DEFAULT_REQUEST_TIMEOUT_SECS; }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TimeoutConfig {
     #[serde(default = "default_connect_timeout_secs")]
-    pub connect_secs: u64,
+    pub connect_secs: NonZeroU64,
     #[serde(default = "default_handshake_timeout_secs")]
-    pub handshake_secs: u64,
+    pub handshake_secs: NonZeroU64,
     #[serde(default = "default_request_timeout_secs")]
-    pub request_secs: u64,
+    pub request_secs: NonZeroU64,
 }
 
 impl Default for TimeoutConfig {
     fn default() -> Self {
         return Self {
-            connect_secs: default_connect_timeout_secs(),
-            handshake_secs: default_handshake_timeout_secs(),
-            request_secs: default_request_timeout_secs(),
+            connect_secs: DEFAULT_CONNECT_TIMEOUT_SECS,
+            handshake_secs: DEFAULT_HANDSHAKE_TIMEOUT_SECS,
+            request_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
         };
     }
 }
@@ -164,8 +159,34 @@ pub enum TransportKind {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TlsConfig {
-    pub server: TlsIdentity,
+    pub server: ServerTlsConfig,
     pub client: TlsIdentity,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ServerTlsConfig {
+    Manual(TlsIdentity),
+    #[cfg(feature = "acme")]
+    Acme(AcmeTlsConfig),
+}
+
+impl ServerTlsConfig {
+    pub fn ca_cert_path(&self) -> &Path {
+        return match self {
+            ServerTlsConfig::Manual(identity) => &identity.ca_cert_path,
+            #[cfg(feature = "acme")]
+            ServerTlsConfig::Acme(acme) => &acme.ca_cert_path,
+        };
+    }
+
+    pub fn as_manual(&self) -> Option<&TlsIdentity> {
+        return match self {
+            ServerTlsConfig::Manual(identity) => Some(identity),
+            #[cfg(feature = "acme")]
+            ServerTlsConfig::Acme(_) => None,
+        };
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -175,19 +196,41 @@ pub struct TlsIdentity {
     pub ca_cert_path: PathBuf,
 }
 
+// ── ACME defaults ──
+
+#[cfg(feature = "acme")]
+pub const DEFAULT_ACME_CACHE_DIR: &str = "./acme_cache";
+
+#[cfg(feature = "acme")]
+fn default_acme_cache_dir() -> PathBuf { return PathBuf::from(DEFAULT_ACME_CACHE_DIR); }
+
+#[cfg(feature = "acme")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AcmeTlsConfig {
+    pub domains: Vec<ArrayString<256>>,
+    pub acme_email: ArrayString<256>,
+    pub ca_cert_path: PathBuf,
+    #[serde(default = "default_acme_cache_dir")]
+    pub cache_dir: PathBuf,
+    #[serde(default)]
+    pub staging: bool,
+}
+
+// ── Backend defaults ──
+
+pub const DEFAULT_MAX_CONNECTIONS: u32 = 256;
+
+fn default_max_connections() -> u32 { return DEFAULT_MAX_CONNECTIONS; }
+
 #[derive(Debug, Clone)]
 pub struct BackendConfig {
-    pub id: String,
-    pub pool: String,
+    pub id: ArrayString<256>,
+    pub pool: ArrayString<32>,
     pub address: SocketAddr,
     pub host: String,
     pub weight: f64,
     pub transport: TransportKind,
     pub max_connections: u32,
-}
-
-fn default_max_connections() -> u32 {
-    return 256;
 }
 
 fn validate_max_connections(max_connections: u32) -> std::result::Result<(), String> {
@@ -221,16 +264,17 @@ fn validate_jitter_factor(jitter_factor: f64) -> std::result::Result<(), String>
 }
 
 impl BackendConfig {
-    pub fn new(id: String, address: SocketAddr, weight: f64, transport: TransportKind) -> Self {
+    pub fn new(id: &str, address: SocketAddr, weight: f64, transport: TransportKind) -> Self {
         validate_weight(weight).expect("invalid backend weight");
+        let id: ArrayString<256> = ArrayString::from(id).expect("backend id exceeds 256 characters");
         let host: String = address.ip().to_string();
-        let pool: String = id.clone();
-        let max_connections: u32 = default_max_connections();
+        let pool: ArrayString<32> = ArrayString::from(id.as_str()).expect("backend id exceeds 32 characters for default pool name");
+        let max_connections: u32 = DEFAULT_MAX_CONNECTIONS;
         return Self { id, pool, address, host, weight, transport, max_connections };
     }
 
-    pub fn with_pool(mut self, pool: String) -> Self {
-        self.pool = pool;
+    pub fn with_pool(mut self, pool: &str) -> Self {
+        self.pool = ArrayString::from(pool).expect("pool name exceeds 32 characters");
         return self;
     }
 
@@ -289,10 +333,17 @@ impl<'de> Deserialize<'de> for BackendConfig {
             .map_err(|e| serde::de::Error::custom(format!("invalid backend address '{}': {e}", wire.address)))?;
         validate_weight(wire.weight).map_err(serde::de::Error::custom)?;
         validate_max_connections(wire.max_connections).map_err(serde::de::Error::custom)?;
-        let pool: String = wire.pool.unwrap_or_else(|| wire.id.clone());
+        let id: ArrayString<256> = ArrayString::from(&wire.id)
+            .map_err(|_| serde::de::Error::custom(format!("backend id '{}' exceeds 256 characters", wire.id)))?;
+        let pool: ArrayString<32> = match wire.pool {
+            Some(p) => ArrayString::from(&p)
+                .map_err(|_| serde::de::Error::custom(format!("pool name '{}' exceeds 32 characters", p)))?,
+            None => ArrayString::from(id.as_str())
+                .map_err(|_| serde::de::Error::custom(format!("backend id '{}' exceeds 32 characters for default pool name", wire.id)))?,
+        };
         let host: String = wire.host.unwrap_or_else(|| address.ip().to_string());
         return Ok(BackendConfig {
-            id: wire.id,
+            id,
             pool,
             address,
             host,
@@ -303,9 +354,11 @@ impl<'de> Deserialize<'de> for BackendConfig {
     }
 }
 
-fn default_requests_per_second() -> u32 {
-    return u32::MAX;
-}
+// ── Rate limit defaults ──
+
+pub const DEFAULT_REQUESTS_PER_SECOND: u32 = u32::MAX;
+
+fn default_requests_per_second() -> u32 { return DEFAULT_REQUESTS_PER_SECOND; }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RateLimitConfig {
@@ -316,7 +369,7 @@ pub struct RateLimitConfig {
 impl Default for RateLimitConfig {
     fn default() -> Self {
         return Self {
-            requests_per_second: default_requests_per_second(),
+            requests_per_second: DEFAULT_REQUESTS_PER_SECOND,
         };
     }
 }
@@ -334,9 +387,11 @@ pub struct MetricsConfig {
     pub otlp_endpoint: Option<String>,
 }
 
-fn default_trace_sample_ratio() -> f64 {
-    return 1.0;
-}
+// ── Tracing defaults ──
+
+pub const DEFAULT_TRACE_SAMPLE_RATIO: f64 = 1.0;
+
+fn default_trace_sample_ratio() -> f64 { return DEFAULT_TRACE_SAMPLE_RATIO; }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TracingConfig {
@@ -349,161 +404,152 @@ impl Default for TracingConfig {
     fn default() -> Self {
         return Self {
             otlp_endpoint: None,
-            sample_ratio: default_trace_sample_ratio(),
+            sample_ratio: DEFAULT_TRACE_SAMPLE_RATIO,
         };
     }
 }
 
-fn default_max_response_body_bytes() -> usize {
-    return 10 * 1024 * 1024;
-}
+// ── Proxy defaults ──
 
-fn default_h2_connections_per_backend() -> usize {
-    return 4;
-}
+pub const DEFAULT_MAX_RESPONSE_BODY_BYTES: u32 = 10 * 1024 * 1024;
+pub const DEFAULT_H2_CONNECTIONS_PER_BACKEND: NonZeroU32 = NonZeroU32::new(4).expect("nonzero constant");
+pub const DEFAULT_MAX_IDLE_QUIC_PER_HOST: u32 = 16;
+pub const DEFAULT_H2_STREAM_WINDOW: u32 = 2 * 1024 * 1024;
+pub const DEFAULT_H2_CONN_WINDOW: u32 = 4 * 1024 * 1024;
+pub const DEFAULT_INLINE_COMPRESS_THRESHOLD: u32 = 8192;
+pub const DEFAULT_QUIC_CHANNEL_CAPACITY: NonZeroU32 = NonZeroU32::new(256).expect("nonzero constant");
 
-fn default_max_idle_quic_per_host() -> usize {
-    return 16;
-}
-
-fn default_h2_stream_window() -> u32 {
-    return 2 * 1024 * 1024;
-}
-
-fn default_h2_conn_window() -> u32 {
-    return 4 * 1024 * 1024;
-}
-
-fn default_inline_compress_threshold() -> usize {
-    return 8192;
-}
-
-fn default_quic_channel_capacity() -> usize {
-    return 256;
-}
+fn default_max_response_body_bytes() -> u32 { return DEFAULT_MAX_RESPONSE_BODY_BYTES; }
+fn default_h2_connections_per_backend() -> NonZeroU32 { return DEFAULT_H2_CONNECTIONS_PER_BACKEND; }
+fn default_max_idle_quic_per_host() -> u32 { return DEFAULT_MAX_IDLE_QUIC_PER_HOST; }
+fn default_h2_stream_window() -> u32 { return DEFAULT_H2_STREAM_WINDOW; }
+fn default_h2_conn_window() -> u32 { return DEFAULT_H2_CONN_WINDOW; }
+fn default_inline_compress_threshold() -> u32 { return DEFAULT_INLINE_COMPRESS_THRESHOLD; }
+fn default_quic_channel_capacity() -> NonZeroU32 { return DEFAULT_QUIC_CHANNEL_CAPACITY; }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProxyConfig {
     #[serde(default = "default_max_response_body_bytes")]
-    pub max_response_body_bytes: usize,
+    pub max_response_body_bytes: u32,
     #[serde(default = "default_h2_connections_per_backend")]
-    pub h2_connections_per_backend: usize,
+    pub h2_connections_per_backend: NonZeroU32,
     #[serde(default = "default_max_idle_quic_per_host")]
-    pub max_idle_quic_per_host: usize,
+    pub max_idle_quic_per_host: u32,
     #[serde(default = "default_h2_stream_window")]
     pub h2_stream_window: u32,
     #[serde(default = "default_h2_conn_window")]
     pub h2_conn_window: u32,
     #[serde(default = "default_inline_compress_threshold")]
-    pub inline_compress_threshold: usize,
+    pub inline_compress_threshold: u32,
     #[serde(default = "default_quic_channel_capacity")]
-    pub quic_channel_capacity: usize,
+    pub quic_channel_capacity: NonZeroU32,
 }
 
 impl Default for ProxyConfig {
     fn default() -> Self {
         return Self {
-            max_response_body_bytes: default_max_response_body_bytes(),
-            h2_connections_per_backend: default_h2_connections_per_backend(),
-            max_idle_quic_per_host: default_max_idle_quic_per_host(),
-            h2_stream_window: default_h2_stream_window(),
-            h2_conn_window: default_h2_conn_window(),
-            inline_compress_threshold: default_inline_compress_threshold(),
-            quic_channel_capacity: default_quic_channel_capacity(),
+            max_response_body_bytes: DEFAULT_MAX_RESPONSE_BODY_BYTES,
+            h2_connections_per_backend: DEFAULT_H2_CONNECTIONS_PER_BACKEND,
+            max_idle_quic_per_host: DEFAULT_MAX_IDLE_QUIC_PER_HOST,
+            h2_stream_window: DEFAULT_H2_STREAM_WINDOW,
+            h2_conn_window: DEFAULT_H2_CONN_WINDOW,
+            inline_compress_threshold: DEFAULT_INLINE_COMPRESS_THRESHOLD,
+            quic_channel_capacity: DEFAULT_QUIC_CHANNEL_CAPACITY,
         };
     }
 }
 
-fn default_compression_level() -> i32 {
-    return 3;
-}
+// ── Compression defaults ──
 
-fn default_min_compress_bytes() -> usize {
-    return 256;
-}
+pub const DEFAULT_COMPRESSION_LEVEL: i32 = 3;
+pub const DEFAULT_MIN_COMPRESS_BYTES: u32 = 256;
+
+fn default_compression_level() -> i32 { return DEFAULT_COMPRESSION_LEVEL; }
+fn default_min_compress_bytes() -> u32 { return DEFAULT_MIN_COMPRESS_BYTES; }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompressionConfig {
     #[serde(default = "default_compression_level")]
     pub level: i32,
     #[serde(default = "default_min_compress_bytes")]
-    pub min_bytes: usize,
+    pub min_bytes: u32,
 }
 
 impl Default for CompressionConfig {
     fn default() -> Self {
         return Self {
-            level: default_compression_level(),
-            min_bytes: default_min_compress_bytes(),
+            level: DEFAULT_COMPRESSION_LEVEL,
+            min_bytes: DEFAULT_MIN_COMPRESS_BYTES,
         };
     }
 }
 
-fn default_staleness_ttl_secs() -> u64 {
-    return 300;
-}
+// ── Health defaults ──
+
+pub const DEFAULT_STALENESS_TTL_SECS: u64 = 300;
+pub const DEFAULT_LATENCY_THRESHOLD_MS: u32 = 500;
+
+fn default_staleness_ttl_secs() -> u64 { return DEFAULT_STALENESS_TTL_SECS; }
+fn default_latency_threshold_ms() -> u32 { return DEFAULT_LATENCY_THRESHOLD_MS; }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HealthConfig {
     #[serde(default = "default_staleness_ttl_secs")]
     pub staleness_ttl_secs: u64,
+    #[serde(default = "default_latency_threshold_ms")]
+    pub latency_threshold_ms: u32,
 }
 
 impl Default for HealthConfig {
     fn default() -> Self {
         return Self {
-            staleness_ttl_secs: default_staleness_ttl_secs(),
+            staleness_ttl_secs: DEFAULT_STALENESS_TTL_SECS,
+            latency_threshold_ms: DEFAULT_LATENCY_THRESHOLD_MS,
         };
     }
 }
 
-fn default_failure_threshold() -> u32 {
-    return 5;
-}
+// ── Circuit breaker defaults ──
 
-fn default_recovery_timeout_secs() -> u64 {
-    return 60;
-}
+pub const DEFAULT_FAILURE_THRESHOLD: NonZeroU32 = NonZeroU32::new(5).expect("nonzero constant");
+pub const DEFAULT_RECOVERY_TIMEOUT_SECS: u64 = 60;
+pub const DEFAULT_HALF_OPEN_MAX_REQUESTS: NonZeroU32 = NonZeroU32::new(2).expect("nonzero constant");
 
-fn default_half_open_max_requests() -> u32 {
-    return 2;
-}
+fn default_failure_threshold() -> NonZeroU32 { return DEFAULT_FAILURE_THRESHOLD; }
+fn default_recovery_timeout_secs() -> u64 { return DEFAULT_RECOVERY_TIMEOUT_SECS; }
+fn default_half_open_max_requests() -> NonZeroU32 { return DEFAULT_HALF_OPEN_MAX_REQUESTS; }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CircuitBreakerConfig {
     #[serde(default = "default_failure_threshold")]
-    pub failure_threshold: u32,
+    pub failure_threshold: NonZeroU32,
     #[serde(default = "default_recovery_timeout_secs")]
     pub recovery_timeout_secs: u64,
     #[serde(default = "default_half_open_max_requests")]
-    pub half_open_max_requests: u32,
+    pub half_open_max_requests: NonZeroU32,
 }
 
 impl Default for CircuitBreakerConfig {
     fn default() -> Self {
         return Self {
-            failure_threshold: default_failure_threshold(),
-            recovery_timeout_secs: default_recovery_timeout_secs(),
-            half_open_max_requests: default_half_open_max_requests(),
+            failure_threshold: DEFAULT_FAILURE_THRESHOLD,
+            recovery_timeout_secs: DEFAULT_RECOVERY_TIMEOUT_SECS,
+            half_open_max_requests: DEFAULT_HALF_OPEN_MAX_REQUESTS,
         };
     }
 }
 
-fn default_max_retries() -> u32 {
-    return 2;
-}
+// ── Retry defaults ──
 
-fn default_retry_base_delay_ms() -> u64 {
-    return 200;
-}
+pub const DEFAULT_MAX_RETRIES: u32 = 2;
+pub const DEFAULT_RETRY_BASE_DELAY_MS: u64 = 200;
+pub const DEFAULT_RETRY_MAX_DELAY_MS: u64 = 2000;
+pub const DEFAULT_RETRY_JITTER_MS: u64 = 100;
 
-fn default_retry_max_delay_ms() -> u64 {
-    return 2000;
-}
-
-fn default_retry_jitter_ms() -> u64 {
-    return 100;
-}
+fn default_max_retries() -> u32 { return DEFAULT_MAX_RETRIES; }
+fn default_retry_base_delay_ms() -> u64 { return DEFAULT_RETRY_BASE_DELAY_MS; }
+fn default_retry_max_delay_ms() -> u64 { return DEFAULT_RETRY_MAX_DELAY_MS; }
+fn default_retry_jitter_ms() -> u64 { return DEFAULT_RETRY_JITTER_MS; }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RetryConfig {
@@ -520,25 +566,27 @@ pub struct RetryConfig {
 impl Default for RetryConfig {
     fn default() -> Self {
         return Self {
-            max_retries: default_max_retries(),
-            base_delay_ms: default_retry_base_delay_ms(),
-            max_delay_ms: default_retry_max_delay_ms(),
-            jitter_ms: default_retry_jitter_ms(),
+            max_retries: DEFAULT_MAX_RETRIES,
+            base_delay_ms: DEFAULT_RETRY_BASE_DELAY_MS,
+            max_delay_ms: DEFAULT_RETRY_MAX_DELAY_MS,
+            jitter_ms: DEFAULT_RETRY_JITTER_MS,
         };
     }
 }
 
-fn default_heartbeat_interval_secs() -> u64 {
-    return 15;
-}
+// ── Tunnel defaults ──
 
-fn default_heartbeat_timeout_secs() -> u64 {
-    return 45;
-}
+pub const DEFAULT_HEARTBEAT_INTERVAL_SECS: u64 = 15;
+pub const DEFAULT_HEARTBEAT_TIMEOUT_SECS: u64 = 45;
+pub const DEFAULT_MAX_SESSIONS_PER_BACKEND: NonZeroU32 = NonZeroU32::new(8).expect("nonzero constant");
+pub const DEFAULT_REGISTRATION_TIMEOUT_SECS: u64 = 10;
+pub const DEFAULT_CONTROL_CHANNEL_CAPACITY: NonZeroU32 = NonZeroU32::new(16).expect("nonzero constant");
 
-fn default_max_sessions_per_backend() -> usize {
-    return 8;
-}
+fn default_heartbeat_interval_secs() -> u64 { return DEFAULT_HEARTBEAT_INTERVAL_SECS; }
+fn default_heartbeat_timeout_secs() -> u64 { return DEFAULT_HEARTBEAT_TIMEOUT_SECS; }
+fn default_max_sessions_per_backend() -> NonZeroU32 { return DEFAULT_MAX_SESSIONS_PER_BACKEND; }
+fn default_registration_timeout_secs() -> u64 { return DEFAULT_REGISTRATION_TIMEOUT_SECS; }
+fn default_control_channel_capacity() -> NonZeroU32 { return DEFAULT_CONTROL_CHANNEL_CAPACITY; }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TunnelConfig {
@@ -550,9 +598,13 @@ pub struct TunnelConfig {
     #[serde(default = "default_heartbeat_timeout_secs")]
     pub heartbeat_timeout_secs: u64,
     #[serde(default)]
-    pub allowed_backend_ids: Vec<String>,
+    pub allowed_backend_ids: Vec<ArrayString<256>>,
     #[serde(default = "default_max_sessions_per_backend")]
-    pub max_sessions_per_backend: usize,
+    pub max_sessions_per_backend: NonZeroU32,
+    #[serde(default = "default_registration_timeout_secs")]
+    pub registration_timeout_secs: u64,
+    #[serde(default = "default_control_channel_capacity")]
+    pub control_channel_capacity: NonZeroU32,
 }
 
 impl Default for TunnelConfig {
@@ -560,45 +612,45 @@ impl Default for TunnelConfig {
         return Self {
             enabled: false,
             listen_address: None,
-            heartbeat_interval_secs: default_heartbeat_interval_secs(),
-            heartbeat_timeout_secs: default_heartbeat_timeout_secs(),
+            heartbeat_interval_secs: DEFAULT_HEARTBEAT_INTERVAL_SECS,
+            heartbeat_timeout_secs: DEFAULT_HEARTBEAT_TIMEOUT_SECS,
             allowed_backend_ids: Vec::new(),
-            max_sessions_per_backend: default_max_sessions_per_backend(),
+            max_sessions_per_backend: DEFAULT_MAX_SESSIONS_PER_BACKEND,
+            registration_timeout_secs: DEFAULT_REGISTRATION_TIMEOUT_SECS,
+            control_channel_capacity: DEFAULT_CONTROL_CHANNEL_CAPACITY,
         };
     }
 }
 
-fn default_cache_max_entries() -> usize {
-    return 1000;
-}
+// ── Cache defaults ──
 
-fn default_cache_max_entry_bytes() -> usize {
-    return 1024 * 1024;
-}
+pub const DEFAULT_CACHE_MAX_ENTRIES: NonZeroUsize = NonZeroUsize::new(1000).expect("nonzero constant");
+pub const DEFAULT_CACHE_MAX_ENTRY_BYTES: NonZeroUsize = NonZeroUsize::new(1024 * 1024).expect("nonzero constant");
+pub const DEFAULT_CACHE_DEFAULT_TTL_SECS: NonZeroU64 = NonZeroU64::new(60).expect("nonzero constant");
 
-fn default_cache_default_ttl_secs() -> u64 {
-    return 60;
-}
+fn default_cache_max_entries() -> NonZeroUsize { return DEFAULT_CACHE_MAX_ENTRIES; }
+fn default_cache_max_entry_bytes() -> NonZeroUsize { return DEFAULT_CACHE_MAX_ENTRY_BYTES; }
+fn default_cache_default_ttl_secs() -> NonZeroU64 { return DEFAULT_CACHE_DEFAULT_TTL_SECS; }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CacheConfig {
     #[serde(default)]
     pub enabled: bool,
     #[serde(default = "default_cache_max_entries")]
-    pub max_entries: usize,
+    pub max_entries: NonZeroUsize,
     #[serde(default = "default_cache_max_entry_bytes")]
-    pub max_entry_bytes: usize,
+    pub max_entry_bytes: NonZeroUsize,
     #[serde(default = "default_cache_default_ttl_secs")]
-    pub default_ttl_secs: u64,
+    pub default_ttl_secs: NonZeroU64,
 }
 
 impl Default for CacheConfig {
     fn default() -> Self {
         return Self {
             enabled: false,
-            max_entries: default_cache_max_entries(),
-            max_entry_bytes: default_cache_max_entry_bytes(),
-            default_ttl_secs: default_cache_default_ttl_secs(),
+            max_entries: DEFAULT_CACHE_MAX_ENTRIES,
+            max_entry_bytes: DEFAULT_CACHE_MAX_ENTRY_BYTES,
+            default_ttl_secs: DEFAULT_CACHE_DEFAULT_TTL_SECS,
         };
     }
 }

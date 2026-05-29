@@ -68,7 +68,7 @@ pub fn shutdown_tracing(provider: Option<SdkTracerProvider>) {
     if let Some(provider) = provider
         && let Err(e) = provider.shutdown()
     {
-        eprintln!("failed to shutdown tracer provider: {e}");
+        tracing::error!("failed to shutdown tracer provider: {e}");
     }
 }
 

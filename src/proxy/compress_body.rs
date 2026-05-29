@@ -1,3 +1,4 @@
+use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
@@ -10,30 +11,35 @@ use crate::compression::DEFAULT_COMPRESSION_LEVEL;
 
 const OUTPUT_BUF_SIZE: usize = 16_384;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum CompressionPhase {
+    Streaming = 0,
+    Flushing = 1,
+    Done = 2,
+}
+
 pin_project! {
     pub struct CompressedBody<B> {
         #[pin]
         inner: B,
         encoder: ZstdEncoder<'static>,
-        finished_input: bool,
-        finished_output: bool,
+        phase: CompressionPhase,
     }
 }
 
 impl<B> CompressedBody<B> {
-    pub fn new(inner: B) -> Self {
+    pub fn new(inner: B) -> io::Result<Self> {
         return Self::with_level(inner, DEFAULT_COMPRESSION_LEVEL);
     }
 
-    pub fn with_level(inner: B, level: i32) -> Self {
-        let encoder: ZstdEncoder<'static> =
-            ZstdEncoder::new(level).expect("zstd encoder init");
-        return Self {
+    pub fn with_level(inner: B, level: i32) -> io::Result<Self> {
+        let encoder: ZstdEncoder<'static> = ZstdEncoder::new(level)?;
+        return Ok(Self {
             inner,
             encoder,
-            finished_input: false,
-            finished_output: false,
-        };
+            phase: CompressionPhase::Streaming,
+        });
     }
 }
 
@@ -50,15 +56,15 @@ where
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         let this = self.project();
 
-        if *this.finished_output {
+        if *this.phase == CompressionPhase::Done {
             return Poll::Ready(None);
         }
 
-        if !*this.finished_input {
+        if *this.phase == CompressionPhase::Streaming {
             match this.inner.poll_frame(cx) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(None) => {
-                    *this.finished_input = true;
+                    *this.phase = CompressionPhase::Flushing;
                 }
                 Poll::Ready(Some(Err(e))) => return Poll::Ready(Some(Err(e))),
                 Poll::Ready(Some(Ok(frame))) => {
@@ -77,9 +83,8 @@ where
             }
         }
 
-        // Inner body finished — flush the encoder
         let flushed: Bytes = finish_encoder(this.encoder);
-        *this.finished_output = true;
+        *this.phase = CompressionPhase::Done;
         if flushed.is_empty() {
             return Poll::Ready(None);
         }
@@ -87,7 +92,7 @@ where
     }
 
     fn is_end_stream(&self) -> bool {
-        return self.finished_output;
+        return self.phase == CompressionPhase::Done;
     }
 }
 
@@ -133,7 +138,7 @@ mod tests {
     async fn test_compressed_body_round_trip() {
         let original: Vec<u8> = "streaming compression test data ".repeat(100).into_bytes();
         let inner: axum::body::Body = axum::body::Body::from(original.clone());
-        let body: CompressedBody<axum::body::Body> = CompressedBody::new(inner);
+        let body: CompressedBody<axum::body::Body> = CompressedBody::new(inner).unwrap();
         let collected: Bytes = http_body_util::BodyExt::collect(body)
             .await
             .unwrap()
@@ -145,7 +150,7 @@ mod tests {
     #[tokio::test]
     async fn test_compressed_body_empty() {
         let inner: axum::body::Body = axum::body::Body::empty();
-        let body: CompressedBody<axum::body::Body> = CompressedBody::new(inner);
+        let body: CompressedBody<axum::body::Body> = CompressedBody::new(inner).unwrap();
         let collected: Bytes = BodyExt::collect(body).await.unwrap().to_bytes();
         // Empty input still produces a valid zstd frame
         let decompressed: Vec<u8> = compression::decompress(&collected).unwrap();
@@ -156,7 +161,7 @@ mod tests {
     async fn test_compressed_body_large_payload() {
         let original: Vec<u8> = vec![42u8; 200_000];
         let inner: axum::body::Body = axum::body::Body::from(original.clone());
-        let body: CompressedBody<axum::body::Body> = CompressedBody::new(inner);
+        let body: CompressedBody<axum::body::Body> = CompressedBody::new(inner).unwrap();
         let collected: Bytes = BodyExt::collect(body).await.unwrap().to_bytes();
         let decompressed: Vec<u8> = compression::decompress(&collected).unwrap();
         assert_eq!(decompressed, original);

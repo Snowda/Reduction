@@ -5,6 +5,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use arrayvec::ArrayString;
 use axum::body::Body;
 use axum::extract::DefaultBodyLimit;
 use axum::http::{Request, Response, StatusCode};
@@ -24,7 +25,7 @@ use dashmap::DashMap;
 use reduction::balancer::BackendPool;
 use reduction::circuit::CircuitBreakers;
 use reduction::config::{self, BackendConfig, CircuitBreakerConfig, ReductionConfig, TimeoutConfig};
-use reduction::health::{BackendHealth, HealthBroadcast, HealthState};
+use reduction::health::{Availability, BackendHealth, HealthBroadcast, HealthState};
 use reduction::metrics::ProxyMetrics;
 use reduction::acl::AccessControl;
 use reduction::cache::ResponseCache;
@@ -409,19 +410,19 @@ struct DemoHandles {
     _watcher: config::watcher::ConfigWatcher,
 }
 
-fn build_backend_pools(config: &ReductionConfig) -> HashMap<String, BackendPool> {
-    let mut pools: HashMap<String, BackendPool> = HashMap::new();
+fn build_backend_pools(config: &ReductionConfig) -> HashMap<ArrayString<256>, BackendPool> {
+    let mut pools: HashMap<ArrayString<256>, BackendPool> = HashMap::new();
     for route in &config.routes {
         let backends: Vec<BackendConfig> = config.backends.iter()
-            .filter(|b| b.pool == route.backend_id)
+            .filter(|b| b.pool.as_str() == route.backend_id.as_str())
             .cloned()
             .collect();
-        if !backends.is_empty() && !pools.contains_key(&route.backend_id) {
+        if !backends.is_empty() && !pools.contains_key(route.backend_id.as_str()) {
             let pool: BackendPool = BackendPool::new(
                 backends,
                 config.balancer.jitter_factor,
             ).expect("too many backends");
-            pools.insert(route.backend_id.clone(), pool);
+            pools.insert(route.backend_id, pool);
         }
     }
     return pools;
@@ -436,9 +437,9 @@ async fn start_services(dir: &Path, config_path: &Path) -> DemoHandles {
 
     // -- Proxy --
     let (server_tls_config, _) = tls::build_server_config(
-        &config.tls.server.cert_path,
-        &config.tls.server.key_path,
-        &config.tls.server.ca_cert_path,
+        &config.tls.server.as_manual().unwrap().cert_path,
+        &config.tls.server.as_manual().unwrap().key_path,
+        &config.tls.server.as_manual().unwrap().ca_cert_path,
     ).unwrap();
     let server_tls: Arc<rustls::ServerConfig> = Arc::new(server_tls_config);
 
@@ -573,8 +574,8 @@ async fn demonstrate_failover(
     health_tx.send_modify(|state| {
         state.update(HealthBroadcast {
             entries: vec![
-                BackendHealth { backend_id: "mcp-a".into(), load: 0.95, latency_ms: 800, available: true },
-                BackendHealth { backend_id: "mcp-b".into(), load: 0.1, latency_ms: 20, available: true },
+                BackendHealth { backend_id: ArrayString::from("mcp-a").unwrap(), load: 0.95, latency_ms: 800, availability: Availability::Online },
+                BackendHealth { backend_id: ArrayString::from("mcp-b").unwrap(), load: 0.1, latency_ms: 20, availability: Availability::Online },
             ],
         });
     });
@@ -598,8 +599,8 @@ async fn demonstrate_failover(
     health_tx.send_modify(|state| {
         state.update(HealthBroadcast {
             entries: vec![
-                BackendHealth { backend_id: "mcp-a".into(), load: 0.0, latency_ms: 0, available: false },
-                BackendHealth { backend_id: "mcp-b".into(), load: 0.3, latency_ms: 50, available: true },
+                BackendHealth { backend_id: ArrayString::from("mcp-a").unwrap(), load: 0.0, latency_ms: 0, availability: Availability::Offline },
+                BackendHealth { backend_id: ArrayString::from("mcp-b").unwrap(), load: 0.3, latency_ms: 50, availability: Availability::Online },
             ],
         });
     });

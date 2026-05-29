@@ -1,4 +1,5 @@
-use std::time::Duration;
+use std::io;
+use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::sync::CancellationToken;
@@ -22,9 +23,9 @@ where
     A: AsyncRead + AsyncWrite + Unpin,
     B: AsyncRead + AsyncWrite + Unpin,
 {
-    let start: std::time::Instant = std::time::Instant::now();
+    let start: Instant = Instant::now();
 
-    let result: std::result::Result<(u64, u64), std::io::Error> = tokio::select! {
+    let result: io::Result<(u64, u64)> = tokio::select! {
         result = tokio::time::timeout(idle_timeout, tokio::io::copy_bidirectional(&mut a, &mut b)) => {
             match result {
                 Ok(r) => r,

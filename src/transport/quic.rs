@@ -15,6 +15,7 @@ use crate::error::{ReductionError, Result};
 
 pub const STREAM_TYPE_HTTP: u8 = 0x01;
 pub const STREAM_TYPE_RAW: u8 = 0x02;
+const STREAM_TYPE_READ_TIMEOUT_SECS: u64 = 5;
 
 pub struct QuicStream {
     send: SendStream,
@@ -165,7 +166,7 @@ async fn handle_connection(
                 tokio::spawn(async move {
                     let mut type_buf: [u8; 1] = [0u8; 1];
                     match tokio::time::timeout(
-                        std::time::Duration::from_secs(5),
+                        std::time::Duration::from_secs(STREAM_TYPE_READ_TIMEOUT_SECS),
                         tokio::io::AsyncReadExt::read_exact(&mut recv, &mut type_buf),
                     ).await {
                         Ok(Ok(_)) => {}

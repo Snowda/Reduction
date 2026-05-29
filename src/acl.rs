@@ -34,6 +34,7 @@ impl AccessControl {
         return Self { allow, deny, mode };
     }
 
+    #[must_use]
     pub fn check(&self, ip: IpAddr) -> Result<()> {
         return match self.mode {
             AclMode::Disabled => Ok(()),
@@ -67,10 +68,12 @@ impl AccessControl {
         };
     }
 
+    #[inline]
     fn is_allowed(&self, ip: IpAddr) -> bool {
         return self.allow.iter().any(|net| net.contains(&ip));
     }
 
+    #[inline]
     fn is_denied(&self, ip: IpAddr) -> bool {
         return self.deny.iter().any(|net| net.contains(&ip));
     }

@@ -5,6 +5,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use arrayvec::ArrayString;
 use axum::body::Body;
 use axum::extract::DefaultBodyLimit;
 use axum::http::{Request, Response, StatusCode};
@@ -285,19 +286,19 @@ async fn backend_handler(req: Request<Body>) -> Response<Body> {
 
 static BACKEND_STARTED: std::sync::Once = std::sync::Once::new();
 
-fn build_backend_pools(config: &ReductionConfig) -> HashMap<String, BackendPool> {
-    let mut pools: HashMap<String, BackendPool> = HashMap::new();
+fn build_backend_pools(config: &ReductionConfig) -> HashMap<ArrayString<256>, BackendPool> {
+    let mut pools: HashMap<ArrayString<256>, BackendPool> = HashMap::new();
     for route in &config.routes {
         let backends: Vec<BackendConfig> = config.backends.iter()
-            .filter(|b| b.pool == route.backend_id)
+            .filter(|b| b.pool.as_str() == route.backend_id.as_str())
             .cloned()
             .collect();
-        if !backends.is_empty() && !pools.contains_key(&route.backend_id) {
+        if !backends.is_empty() && !pools.contains_key(route.backend_id.as_str()) {
             let pool: BackendPool = BackendPool::new(
                 backends,
                 config.balancer.jitter_factor,
             ).expect("too many backends");
-            pools.insert(route.backend_id.clone(), pool);
+            pools.insert(route.backend_id, pool);
         }
     }
     return pools;
@@ -329,9 +330,9 @@ async fn start_proxy(dir: &Path, config_path: &Path, acl: AccessControl) {
 
     // -- Proxy --
     let (server_tls_config, _) = tls::build_server_config(
-        &config.tls.server.cert_path,
-        &config.tls.server.key_path,
-        &config.tls.server.ca_cert_path,
+        &config.tls.server.as_manual().unwrap().cert_path,
+        &config.tls.server.as_manual().unwrap().key_path,
+        &config.tls.server.as_manual().unwrap().ca_cert_path,
     ).unwrap();
     let server_tls: Arc<rustls::ServerConfig> = Arc::new(server_tls_config);
 

@@ -79,7 +79,7 @@ async fn handle_raw_stream(
 
     let backends = {
         let reloadable = state.reloadable.borrow();
-        reloadable.backend_pools.get(&backend_id)
+        reloadable.backend_pools.get(backend_id.as_str())
             .map(|p| p.backends.clone())
     };
 
@@ -91,7 +91,7 @@ async fn handle_raw_stream(
         ReductionError::Forward(format!("no backends in pool for raw relay: {backend_id}"))
     })?;
 
-    let connect_timeout: Duration = Duration::from_secs(state.timeouts.connect_secs);
+    let connect_timeout: Duration = Duration::from_secs(state.timeouts.connect_secs.get());
     let backend_stream: QuicStream = state.conn_pool.acquire_raw_stream(
         backend,
         &state.client_tls_config,

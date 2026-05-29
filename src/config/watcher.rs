@@ -1,11 +1,16 @@
 use std::path::PathBuf;
+use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
 
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::sync::watch;
 use tracing::{error, info, warn};
 
 use super::ReductionConfig;
-use crate::error::{ReductionError, Result};
+use crate::error::Result;
+use crate::fs_util::load_or_recover;
+
+const CONFIG_RELOAD_DEBOUNCE_MS: u64 = 300;
 
 pub struct ConfigWatcher {
     _watcher: RecommendedWatcher,
@@ -17,17 +22,29 @@ impl ConfigWatcher {
         config_tx: watch::Sender<ReductionConfig>,
     ) -> Result<Self> {
         let path_clone: PathBuf = config_path.clone();
+        let debounce_duration: Duration = Duration::from_millis(CONFIG_RELOAD_DEBOUNCE_MS);
+        let last_reload: Arc<RwLock<Instant>> =
+            Arc::new(RwLock::new(Instant::now() - debounce_duration));
 
         let mut watcher: RecommendedWatcher = notify::recommended_watcher(
             move |result: std::result::Result<Event, notify::Error>| {
                 match result {
                     Ok(event) => {
-                        if matches!(event.kind, EventKind::Modify(_) | EventKind::Create(_)) {
-                            info!("config file changed, reloading");
-                            match reload_config(&path_clone, &config_tx) {
-                                Ok(()) => info!("config reloaded successfully"),
-                                Err(e) => error!(error = %e, "failed to reload config"),
-                            }
+                        if !matches!(event.kind, EventKind::Modify(_) | EventKind::Create(_)) {
+                            return;
+                        }
+
+                        let mut last = last_reload.write().unwrap_or_else(|e| e.into_inner());
+                        if last.elapsed() < debounce_duration {
+                            return;
+                        }
+                        *last = Instant::now();
+                        drop(last);
+
+                        info!("config file changed, reloading");
+                        match reload_config(&path_clone, &config_tx) {
+                            Ok(()) => info!("config reloaded successfully"),
+                            Err(e) => error!(error = %e, "failed to reload config"),
                         }
                     }
                     Err(e) => {
@@ -36,11 +53,11 @@ impl ConfigWatcher {
                 }
             },
         )
-        .map_err(|e| ReductionError::Config(format!("watcher init: {e}")))?;
+        .map_err(|e| crate::error::ReductionError::Config(format!("watcher init: {e}")))?;
 
         watcher
             .watch(config_path.as_ref(), RecursiveMode::NonRecursive)
-            .map_err(|e| ReductionError::Config(format!("watch: {e}")))?;
+            .map_err(|e| crate::error::ReductionError::Config(format!("watch: {e}")))?;
 
         info!(path = %config_path.display(), "watching config file for changes");
 
@@ -52,10 +69,7 @@ fn reload_config(
     path: &PathBuf,
     config_tx: &watch::Sender<ReductionConfig>,
 ) -> Result<()> {
-    let contents: String = std::fs::read_to_string(path)
-        .map_err(|e| ReductionError::Config(format!("read: {e}")))?;
-
-    let new_config: ReductionConfig = toml::from_str(&contents)?;
+    let new_config: ReductionConfig = load_or_recover(path, |s| toml::from_str(s))?;
 
     let old_config: watch::Ref<'_, ReductionConfig> = config_tx.borrow();
     if old_config.listen.address != new_config.listen.address {
@@ -73,7 +87,7 @@ fn reload_config(
     drop(old_config);
 
     config_tx.send(new_config)
-        .map_err(|_| ReductionError::Config("all config receivers dropped".to_string()))?;
+        .map_err(|_| crate::error::ReductionError::Config("all config receivers dropped".to_string()))?;
 
     return Ok(());
 }
@@ -82,11 +96,14 @@ fn reload_config(
 mod tests {
     use std::io::Write;
 
+    use arrayvec::ArrayString;
+
     use super::*;
     use crate::config::{
         AccessControlConfig, BackendConfig, BalancerConfig, CacheConfig, CircuitBreakerConfig,
         CompressionConfig, HealthConfig, ListenConfig, MetricsConfig, ProxyConfig,
-        RateLimitConfig, RetryConfig, RouteConfig, TimeoutConfig, TlsConfig, TlsIdentity, TracingConfig, TransportKind, TunnelConfig,
+        RateLimitConfig, RetryConfig, RouteConfig, ServerTlsConfig, TimeoutConfig,
+        TlsConfig, TlsIdentity, TracingConfig, TransportKind, TunnelConfig,
     };
 
     fn test_config() -> ReductionConfig {
@@ -96,11 +113,11 @@ mod tests {
                 transport: TransportKind::Tcp,
             },
             tls: TlsConfig {
-                server: TlsIdentity {
+                server: ServerTlsConfig::Manual(TlsIdentity {
                     cert_path: "certs/server.crt".into(),
                     key_path: "certs/server.key".into(),
                     ca_cert_path: "certs/ca.crt".into(),
-                },
+                }),
                 client: TlsIdentity {
                     cert_path: "certs/client.crt".into(),
                     key_path: "certs/client.key".into(),
@@ -108,14 +125,14 @@ mod tests {
                 },
             },
             backends: vec![BackendConfig::new(
-                "api".to_string(),
+                "api",
                 "10.0.0.1:8080".parse().unwrap(),
                 1.0,
                 TransportKind::Tcp,
             )],
             routes: vec![RouteConfig {
-                path_prefix: "/api".to_string(),
-                backend_id: "api".to_string(),
+                path_prefix: ArrayString::from("/api").unwrap(),
+                backend_id: ArrayString::from("api").unwrap(),
                 timeout_secs: None,
             }],
             balancer: BalancerConfig::default(),
@@ -155,5 +172,33 @@ mod tests {
         reload_config(&config_path, &tx).unwrap();
 
         assert_eq!(rx.borrow().backends[0].weight, 5.0);
+    }
+
+    #[test]
+    fn test_reload_config_quarantines_corrupt_file() {
+        let dir: tempfile::TempDir = tempfile::tempdir().unwrap();
+        let config_path: PathBuf = dir.path().join("config.toml");
+
+        let config: ReductionConfig = test_config();
+        let toml_str: String = toml::to_string(&config).unwrap();
+        std::fs::write(&config_path, &toml_str).unwrap();
+
+        let (tx, _rx): (watch::Sender<ReductionConfig>, watch::Receiver<ReductionConfig>) =
+            watch::channel(config);
+
+        std::fs::write(&config_path, "this is not valid toml {{{").unwrap();
+
+        let result = reload_config(&config_path, &tx);
+        assert!(result.is_err());
+
+        assert!(!config_path.exists(), "corrupt file should be quarantined");
+
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert_eq!(entries.len(), 1);
+        let name: String = entries[0].file_name().to_string_lossy().to_string();
+        assert!(name.starts_with("config.toml.corrupt."), "got: {name}");
     }
 }

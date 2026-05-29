@@ -7,13 +7,14 @@ use quinn::{Endpoint, ServerConfig};
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
+use arrayvec::ArrayString;
 use tracing::{debug, info, warn};
 
 use crate::config::TunnelConfig;
 use crate::error::{ReductionError, Result};
 use crate::metrics::ProxyMetrics;
 use crate::transport::quic::QuicStream;
-use crate::tunnel::protocol::{self, TunnelFrame};
+use crate::tunnel::protocol::{self, SessionId, TunnelFrame};
 use crate::tunnel::registry::{TunnelRegistry, TunnelSession};
 
 pub async fn run_tunnel_listener(
@@ -81,7 +82,7 @@ async fn handle_tunnel_connection(
 
     let mut control_stream: QuicStream = QuicStream::new(send, recv);
 
-    let register_timeout: Duration = Duration::from_secs(10);
+    let register_timeout: Duration = Duration::from_secs(config.registration_timeout_secs);
     let frame: TunnelFrame = timeout(register_timeout, protocol::read_frame(&mut control_stream))
         .await
         .map_err(|_| ReductionError::Tunnel("registration timed out".to_string()))?
@@ -102,35 +103,24 @@ async fn handle_tunnel_connection(
         metrics.tunnel_registration_rejected.add(1, &[]);
         warn!(%backend_id, %remote_addr, "tunnel registration rejected: not in allowlist");
         protocol::write_frame(&mut control_stream, &TunnelFrame::Shutdown {
-            reason: "not in allowlist".to_string(),
+            reason: ArrayString::from("not in allowlist").unwrap(),
         }).await.ok();
         return Err(ReductionError::Tunnel("backend not in allowlist".to_string()));
     }
 
-    let session_id: String = {
-        use std::hash::{Hash, Hasher, DefaultHasher};
-        let mut hasher: DefaultHasher = DefaultHasher::new();
-        remote_addr.hash(&mut hasher);
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-            .hash(&mut hasher);
-        backend_id.hash(&mut hasher);
-        format!("sess-{:016x}", hasher.finish())
-    };
+    let session_id: SessionId = SessionId::generate(&remote_addr, backend_id.as_str());
 
     protocol::write_frame(&mut control_stream, &TunnelFrame::RegisterAck {
-        session_id: session_id.clone(),
+        session_id,
     }).await?;
 
-    info!(%backend_id, %session_id, %remote_addr, ?capabilities, "tunnel backend registered");
+    info!(%backend_id, session_id = %session_id, %remote_addr, ?capabilities, "tunnel backend registered");
 
-    let (control_tx, mut control_rx) = mpsc::channel::<TunnelFrame>(16);
+    let (control_tx, mut control_rx) = mpsc::channel::<TunnelFrame>(config.control_channel_capacity.get() as usize);
 
     let session: TunnelSession = TunnelSession {
-        session_id: session_id.clone(),
-        backend_id: backend_id.clone(),
+        session_id,
+        backend_id,
         pool,
         remote_addr,
         connected_at: Instant::now(),
@@ -185,7 +175,7 @@ async fn handle_tunnel_connection(
             }
             _ = shutdown.cancelled() => {
                 protocol::write_frame(&mut control_stream, &TunnelFrame::Shutdown {
-                    reason: "proxy shutting down".to_string(),
+                    reason: ArrayString::from("proxy shutting down").unwrap(),
                 }).await.ok();
                 break;
             }

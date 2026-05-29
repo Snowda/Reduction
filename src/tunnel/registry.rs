@@ -2,6 +2,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 
+use arrayvec::ArrayString;
 use dashmap::DashMap;
 use quinn::Connection;
 use tokio::sync::mpsc;
@@ -9,14 +10,14 @@ use tracing::{debug, info, warn};
 
 use crate::error::{ReductionError, Result};
 use crate::transport::quic::QuicStream;
-use crate::tunnel::protocol::TunnelFrame;
+use crate::tunnel::protocol::{SessionId, TunnelFrame};
 
 static NEXT_STREAM_ID: AtomicU64 = AtomicU64::new(1);
 
 pub struct TunnelSession {
-    pub session_id: String,
-    pub backend_id: String,
-    pub pool: String,
+    pub session_id: SessionId,
+    pub backend_id: ArrayString<256>,
+    pub pool: ArrayString<32>,
     pub remote_addr: SocketAddr,
     pub connected_at: Instant,
     pub last_heartbeat: Instant,
@@ -25,13 +26,13 @@ pub struct TunnelSession {
 }
 
 pub struct TunnelRegistry {
-    sessions: DashMap<String, Vec<TunnelSession>>,
+    sessions: DashMap<ArrayString<256>, Vec<TunnelSession>>,
     rr_counter: AtomicUsize,
-    max_sessions_per_backend: usize,
+    max_sessions_per_backend: u32,
 }
 
 impl TunnelRegistry {
-    pub fn new(max_sessions_per_backend: usize) -> Self {
+    pub fn new(max_sessions_per_backend: u32) -> Self {
         return Self {
             sessions: DashMap::new(),
             rr_counter: AtomicUsize::new(0),
@@ -40,11 +41,11 @@ impl TunnelRegistry {
     }
 
     pub fn register(&self, session: TunnelSession) -> Result<()> {
-        let backend_id: String = session.backend_id.clone();
-        let session_id: String = session.session_id.clone();
+        let backend_id: ArrayString<256> = session.backend_id;
+        let session_id: SessionId = session.session_id;
 
-        let mut entry = self.sessions.entry(backend_id.clone()).or_default();
-        if entry.len() >= self.max_sessions_per_backend {
+        let mut entry = self.sessions.entry(backend_id).or_default();
+        if entry.len() >= self.max_sessions_per_backend as usize {
             return Err(ReductionError::Tunnel(format!(
                 "max sessions ({}) reached for backend {}",
                 self.max_sessions_per_backend, backend_id,
@@ -55,13 +56,13 @@ impl TunnelRegistry {
         return Ok(());
     }
 
-    pub fn deregister(&self, backend_id: &str, session_id: &str) -> bool {
+    pub fn deregister(&self, backend_id: &str, session_id: &SessionId) -> bool {
         if let Some(mut entry) = self.sessions.get_mut(backend_id) {
             let before: usize = entry.len();
-            entry.retain(|s| s.session_id != session_id);
+            entry.retain(|s| s.session_id != *session_id);
             let removed: bool = entry.len() < before;
             if removed {
-                info!(%backend_id, %session_id, remaining = entry.len(), "tunnel session deregistered");
+                info!(%backend_id, session_id = %session_id, remaining = entry.len(), "tunnel session deregistered");
             }
             if entry.is_empty() {
                 drop(entry);
@@ -115,18 +116,18 @@ impl TunnelRegistry {
             let session: &TunnelSession = &sessions[idx];
 
             if session.connection.close_reason().is_some() {
-                let sid: String = session.session_id.clone();
+                let sid: SessionId = session.session_id;
                 warn!(backend_id, session_id = %sid, "tunnel connection closed, removing");
                 drop(entry);
                 self.deregister(backend_id, &sid);
                 return Err(ReductionError::Tunnel("tunnel connection closed".to_string()));
             }
 
-            (session.connection.clone(), session.session_id.clone())
+            (session.connection.clone(), session.session_id)
         };
 
         let stream_id: u64 = NEXT_STREAM_ID.fetch_add(1, Ordering::Relaxed);
-        debug!(backend_id, %session_id, stream_id, "opening tunnel stream");
+        debug!(backend_id, session_id = %session_id, stream_id, "opening tunnel stream");
 
         let (send, recv) = connection.open_bi().await
             .map_err(|e| ReductionError::Tunnel(format!("open stream: {e}")))?;
@@ -138,7 +139,7 @@ impl TunnelRegistry {
         for entry in self.sessions.iter() {
             for session in entry.value() {
                 let _ = session.control_tx.try_send(TunnelFrame::Shutdown {
-                    reason: "proxy shutting down".to_string(),
+                    reason: ArrayString::from("proxy shutting down").unwrap(),
                 });
                 session.connection.close(0u32.into(), b"shutdown");
             }
@@ -152,7 +153,7 @@ impl TunnelRegistry {
 mod tests {
     use super::*;
 
-    fn make_registry(max: usize) -> TunnelRegistry {
+    fn make_registry(max: u32) -> TunnelRegistry {
         return TunnelRegistry::new(max);
     }
 
@@ -167,7 +168,11 @@ mod tests {
     #[test]
     fn test_deregister_nonexistent() {
         let reg: TunnelRegistry = make_registry(8);
-        assert!(!reg.deregister("api", "sess-1"));
+        let fake_id: SessionId = SessionId::generate(
+            &"127.0.0.1:9000".parse().unwrap(),
+            "api",
+        );
+        assert!(!reg.deregister("api", &fake_id));
     }
 
     #[test]

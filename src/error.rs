@@ -40,6 +40,10 @@ pub enum ReductionError {
 
     #[error("tunnel: {0}")]
     Tunnel(String),
+
+    #[cfg(feature = "acme")]
+    #[error("acme: {0}")]
+    Acme(String),
 }
 
 pub type Result<T> = std::result::Result<T, ReductionError>;

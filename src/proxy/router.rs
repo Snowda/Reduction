@@ -1,14 +1,16 @@
+use arrayvec::ArrayString;
+
 use crate::config::RouteConfig;
 
 #[derive(Clone)]
 pub struct Route {
-    pub path_prefix: String,
-    pub backend_id: String,
+    pub path_prefix: ArrayString<64>,
+    pub backend_id: ArrayString<256>,
     pub timeout_secs: Option<u64>,
 }
 
 pub struct RouteMatch<'a> {
-    pub backend_id: &'a str,
+    pub backend_id: &'a ArrayString<256>,
     pub timeout_secs: Option<u64>,
 }
 
@@ -23,7 +25,7 @@ impl Router {
             .iter()
             .map(|rc| Route {
                 path_prefix: rc.path_prefix.clone(),
-                backend_id: rc.backend_id.clone(),
+                backend_id: rc.backend_id,
                 timeout_secs: rc.timeout_secs,
             })
             .collect();
@@ -37,7 +39,7 @@ impl Router {
     #[tracing::instrument(skip_all)]
     pub fn match_route(&self, path: &str) -> Option<RouteMatch<'_>> {
         for route in &self.routes {
-            if path.starts_with(&route.path_prefix) {
+            if path.starts_with(route.path_prefix.as_str()) {
                 if path.len() == route.path_prefix.len()
                     || route.path_prefix.ends_with('/')
                     || path.as_bytes()[route.path_prefix.len()] == b'/'
@@ -61,8 +63,8 @@ mod tests {
         return pairs
             .iter()
             .map(|(prefix, id)| RouteConfig {
-                path_prefix: prefix.to_string(),
-                backend_id: id.to_string(),
+                path_prefix: ArrayString::from(prefix).unwrap(),
+                backend_id: ArrayString::from(id).unwrap(),
                 timeout_secs: None,
             })
             .collect();
@@ -70,7 +72,7 @@ mod tests {
 
     fn assert_match(router: &Router, path: &str, expected_backend: &str) {
         let m: RouteMatch<'_> = router.match_route(path).expect("expected a route match");
-        assert_eq!(m.backend_id, expected_backend);
+        assert_eq!(m.backend_id.as_str(), expected_backend);
     }
 
     fn assert_no_match(router: &Router, path: &str) {
@@ -151,18 +153,18 @@ mod tests {
     fn test_per_route_timeout_returned() {
         let routes: Vec<RouteConfig> = vec![
             RouteConfig {
-                path_prefix: "/slow".to_string(),
-                backend_id: "slow-backend".to_string(),
+                path_prefix: ArrayString::from("/slow").unwrap(),
+                backend_id: ArrayString::from("slow-backend").unwrap(),
                 timeout_secs: Some(120),
             },
             RouteConfig {
-                path_prefix: "/fast".to_string(),
-                backend_id: "fast-backend".to_string(),
+                path_prefix: ArrayString::from("/fast").unwrap(),
+                backend_id: ArrayString::from("fast-backend").unwrap(),
                 timeout_secs: Some(5),
             },
             RouteConfig {
-                path_prefix: "/".to_string(),
-                backend_id: "default".to_string(),
+                path_prefix: ArrayString::from("/").unwrap(),
+                backend_id: ArrayString::from("default").unwrap(),
                 timeout_secs: None,
             },
         ];

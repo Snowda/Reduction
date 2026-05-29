@@ -4,6 +4,7 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use arrayvec::ArrayString;
 use axum::body::Body;
 use axum::extract::{ConnectInfo, State};
 use axum::http::header::{ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_LENGTH, HOST};
@@ -42,7 +43,7 @@ use crate::transport::ConnectAddr;
 #[derive(Clone)]
 pub struct ReloadableState {
     pub router: Router,
-    pub backend_pools: HashMap<String, BackendPool>,
+    pub backend_pools: HashMap<ArrayString<256>, BackendPool>,
 }
 
 pub struct ProxyState {
@@ -53,8 +54,8 @@ pub struct ProxyState {
     pub conn_pool: ConnPool,
     pub acl: AccessControl,
     pub rate_limiter: RateLimit,
-    pub queues: DashMap<String, Arc<RequestQueue>>,
-    pub default_queue_depth: usize,
+    pub queues: DashMap<ArrayString<256>, Arc<RequestQueue>>,
+    pub default_queue_depth: u32,
     pub metrics: ProxyMetrics,
     pub circuit_breakers: CircuitBreakers,
     pub shutdown: CancellationToken,
@@ -76,7 +77,7 @@ fn select_backend(
     let health: watch::Ref<'_, HealthState> = health_rx.borrow();
     let pressure_fn = |id: &str| -> f64 {
         let max: u32 = pool.backends.iter()
-            .find(|b| b.id == id)
+            .find(|b| b.id.as_str() == id)
             .map(|b| b.max_connections)
             .unwrap_or(256);
         conn_pool.connection_pressure(id, max)
@@ -88,7 +89,7 @@ fn select_backend(
 }
 
 struct ResolvedRoute {
-    backend_id: String,
+    backend_id: ArrayString<256>,
     pool: BackendPool,
     timeout_secs: Option<u64>,
 }
@@ -110,10 +111,10 @@ fn resolve_backend_pool(
         }
     };
 
-    let pool: &BackendPool = match state.backend_pools.get(route_match.backend_id) {
+    let pool: &BackendPool = match state.backend_pools.get(route_match.backend_id.as_str()) {
         Some(p) => p,
         None => {
-            error!(backend_id = route_match.backend_id, "route matched but no backend pool found");
+            error!(backend_id = route_match.backend_id.as_str(), "route matched but no backend pool found");
             return Err(Response::builder()
                 .status(StatusCode::BAD_GATEWAY)
                 .body(Body::from("backend pool not found"))
@@ -122,7 +123,7 @@ fn resolve_backend_pool(
     };
 
     return Ok(ResolvedRoute {
-        backend_id: route_match.backend_id.to_string(),
+        backend_id: *route_match.backend_id,
         pool: pool.clone(),
         timeout_secs: route_match.timeout_secs,
     });
@@ -154,10 +155,11 @@ impl Injector for HeaderInjector<'_> {
     }
 }
 
+#[cold]
 fn error_response(status: StatusCode, message: &str) -> Response<Body> {
     return Response::builder()
         .status(status)
-        .body(Body::from(message.to_string()))
+        .body(Body::from(String::from(message)))
         .expect("failed to build response");
 }
 
@@ -211,7 +213,7 @@ pub async fn proxy_handler(
         req.method() == hyper::Method::GET || req.method() == hyper::Method::HEAD;
 
     if state.cache_config.enabled && is_cacheable_method {
-        if let Some(cached) = state.response_cache.get(req.method().as_str(), req.uri().path()) {
+        if let Some(cached) = state.response_cache.get(req.method().as_str(), req.uri().path_and_query().map(|pq| pq.as_str()).unwrap_or(req.uri().path())) {
             state.metrics.cache_hits.add(1, &[]);
             state.metrics.track_connection(-1);
             return cached;
@@ -241,18 +243,19 @@ pub async fn proxy_handler(
             return response;
         }
     };
-    let backend_id: String = resolved.backend_id;
+    let backend_id: ArrayString<256> = resolved.backend_id;
     let pool: BackendPool = resolved.pool;
     let request_timeout: Duration = Duration::from_secs(
-        resolved.timeout_secs.unwrap_or(state.timeouts.request_secs),
+        resolved.timeout_secs.unwrap_or(state.timeouts.request_secs.get()),
     );
 
-    let backend_attr: [KeyValue; 1] = [KeyValue::new("backend", backend_id.clone())];
+    let backend_str: String = backend_id.as_str().into();
+    let backend_attr: [KeyValue; 1] = [KeyValue::new("backend", backend_str.clone())];
 
-    let queue_depth: usize = state.default_queue_depth;
+    let queue_depth: u32 = state.default_queue_depth;
     let queue: Arc<RequestQueue> = state
         .queues
-        .entry(backend_id.clone())
+        .entry(backend_id)
         .or_insert_with(|| Arc::new(RequestQueue::new(queue_depth)))
         .clone();
 
@@ -261,55 +264,55 @@ pub async fn proxy_handler(
         Ok(guard) => guard,
         Err(e) => {
             state.metrics.queue_depth.add(-1, &backend_attr);
-            error!(backend = %backend_id, error = %e, "queue full");
-            record_completion(&state, start, StatusCode::SERVICE_UNAVAILABLE, &backend_id);
+            error!(backend = backend_id.as_str(), error = %e, "queue full");
+            record_completion(&state, start, StatusCode::SERVICE_UNAVAILABLE, backend_id.as_str());
             return error_response(StatusCode::SERVICE_UNAVAILABLE, &format!("{e}"));
         }
     };
 
     let backend: BackendConfig = match select_backend(&pool, client_ip, &state.health_rx, &state.conn_pool) {
         Ok(b) => {
-            state.metrics.backend_selections.add(1, &[KeyValue::new("backend", b.id.clone())]);
+            state.metrics.backend_selections.add(1, &[KeyValue::new("backend", String::from(b.id.as_str()))]);
             b
         }
         Err(e) => {
             state.metrics.queue_depth.add(-1, &backend_attr);
-            error!(backend = %backend_id, error = %e, "dispatch failed");
-            record_completion(&state, start, StatusCode::BAD_GATEWAY, &backend_id);
+            error!(backend = backend_id.as_str(), error = %e, "dispatch failed");
+            record_completion(&state, start, StatusCode::BAD_GATEWAY, backend_id.as_str());
             return error_response(StatusCode::BAD_GATEWAY, &format!("{e}"));
         }
     };
 
     let _conn_guard: ConnPermitGuard = match state.conn_pool.try_acquire_conn_permit(&backend) {
         Ok(permit) => {
-            state.metrics.backend_active_connections.add(1, &[KeyValue::new("backend", backend.id.clone())]);
+            state.metrics.backend_active_connections.add(1, &[KeyValue::new("backend", backend_str.clone())]);
             ConnPermitGuard {
                 counter: state.metrics.backend_active_connections.clone(),
-                backend_id: backend.id.clone(),
+                backend_kv: KeyValue::new("backend", backend_str.clone()),
                 _permit: permit,
             }
         }
         Err(_) => {
-            state.metrics.backend_conn_limit_rejected.add(1, &[KeyValue::new("backend", backend.id.clone())]);
+            state.metrics.backend_conn_limit_rejected.add(1, &[KeyValue::new("backend", backend_str.clone())]);
             state.metrics.queue_depth.add(-1, &backend_attr);
-            warn!(backend = %backend.id, max = backend.max_connections, "connection limit reached");
-            record_completion(&state, start, StatusCode::SERVICE_UNAVAILABLE, &backend_id);
+            warn!(backend = backend.id.as_str(), max = backend.max_connections, "connection limit reached");
+            record_completion(&state, start, StatusCode::SERVICE_UNAVAILABLE, backend_id.as_str());
             return error_response(StatusCode::SERVICE_UNAVAILABLE, "backend connection limit reached");
         }
     };
 
     let _half_open_guard: Option<HalfOpenGuard>;
-    match state.circuit_breakers.check(&backend.id) {
+    match state.circuit_breakers.check(backend.id.as_str()) {
         (CircuitState::Open, _) => {
-            state.metrics.circuit_open_total.add(1, &[KeyValue::new("backend", backend.id.clone())]);
+            state.metrics.circuit_open_total.add(1, &[KeyValue::new("backend", backend_str.clone())]);
             state.metrics.queue_depth.add(-1, &backend_attr);
-            warn!(backend = %backend.id, "circuit breaker open, rejecting request");
-            record_completion(&state, start, StatusCode::SERVICE_UNAVAILABLE, &backend_id);
+            warn!(backend = backend.id.as_str(), "circuit breaker open, rejecting request");
+            record_completion(&state, start, StatusCode::SERVICE_UNAVAILABLE, backend_id.as_str());
             return error_response(StatusCode::SERVICE_UNAVAILABLE, "circuit open");
         }
         (CircuitState::HalfOpen, guard) => {
             _half_open_guard = guard;
-            state.metrics.circuit_half_open_probes.add(1, &[KeyValue::new("backend", backend.id.clone())]);
+            state.metrics.circuit_half_open_probes.add(1, &[KeyValue::new("backend", backend_str.clone())]);
         }
         (CircuitState::Closed, _) => {
             _half_open_guard = None;
@@ -322,7 +325,7 @@ pub async fn proxy_handler(
             Ok(r) => r,
             Err(response) => {
                 state.metrics.queue_depth.add(-1, &backend_attr);
-                record_completion(&state, start, StatusCode::BAD_REQUEST, &backend_id);
+                record_completion(&state, start, StatusCode::BAD_REQUEST, backend_id.as_str());
                 return response;
             }
         }
@@ -330,26 +333,32 @@ pub async fn proxy_handler(
         req
     };
 
-    info!(backend = %backend.id, path = %req.uri().path(), "forwarding request");
+    info!(backend = backend.id.as_str(), path = %req.uri().path(), "forwarding request");
 
-    let req_method: String = req.method().to_string();
-    let req_path: String = req.uri().path().to_string();
+    let should_cache: bool = state.cache_config.enabled && is_cacheable_method;
+    let req_method: String = if should_cache { req.method().as_str().into() } else { String::new() };
+    let req_path: String = if should_cache { req.uri().path_and_query().map(|pq| pq.as_str()).unwrap_or(req.uri().path()).into() } else { String::new() };
 
-    // Buffer the request body so we can replay it on retries.
+    let max_attempts: u32 = state.retry_config.max_retries + 1;
+
+    // Only buffer the request body when retries are enabled — otherwise stream directly.
     let (parts, body) = req.into_parts();
-    let body_bytes: Bytes = match body.collect().await {
-        Ok(collected) => collected.to_bytes(),
-        Err(e) => {
-            state.metrics.queue_depth.add(-1, &backend_attr);
-            warn!(error = %e, "failed to buffer request body");
-            record_completion(&state, start, StatusCode::BAD_REQUEST, &backend_id);
-            return error_response(StatusCode::BAD_REQUEST, "failed to read request body");
+    let (body_bytes, mut streaming_body): (Option<Bytes>, Option<Body>) = if max_attempts > 1 {
+        match body.collect().await {
+            Ok(collected) => (Some(collected.to_bytes()), None),
+            Err(e) => {
+                state.metrics.queue_depth.add(-1, &backend_attr);
+                warn!(error = %e, "failed to buffer request body");
+                record_completion(&state, start, StatusCode::BAD_REQUEST, backend_id.as_str());
+                return error_response(StatusCode::BAD_REQUEST, "failed to read request body");
+            }
         }
+    } else {
+        (None, Some(body))
     };
 
     let deadline: Instant = start + request_timeout;
-    let connect_budget: Duration = Duration::from_secs(state.timeouts.connect_secs);
-    let max_attempts: u32 = state.retry_config.max_retries + 1;
+    let connect_budget: Duration = Duration::from_secs(state.timeouts.connect_secs.get());
 
     let mut last_response: Option<Response<Body>> = None;
     let mut last_error_msg: Option<String> = None;
@@ -359,34 +368,35 @@ pub async fn proxy_handler(
         let remaining: Duration = match deadline.checked_duration_since(now) {
             Some(d) if d > connect_budget => d,
             _ => {
-                // Not enough time budget for another attempt
-                warn!(backend = %backend.id, attempt, "retry budget exhausted");
+                warn!(backend = backend.id.as_str(), attempt, "retry budget exhausted");
                 break;
             }
         };
 
-        // Circuit breaker may have tripped during a previous attempt
         if attempt > 0
-            && let (CircuitState::Open, _) = state.circuit_breakers.check(&backend.id)
+            && let (CircuitState::Open, _) = state.circuit_breakers.check(backend.id.as_str())
         {
-            warn!(backend = %backend.id, attempt, "circuit opened during retry");
+            warn!(backend = backend.id.as_str(), attempt, "circuit opened during retry");
             break;
         }
 
-        let retry_req: Request<Body> = Request::from_parts(parts.clone(), Body::from(body_bytes.clone()));
+        let retry_req: Request<Body> = match &body_bytes {
+            Some(bytes) => Request::from_parts(parts.clone(), Body::from(bytes.clone())),
+            None => Request::from_parts(parts.clone(), Body::from(streaming_body.take().expect("streaming body consumed"))),
+        };
 
         match forward_request(retry_req, &backend, &state, remaining).await {
             Ok(response) => {
                 let status: StatusCode = response.status();
                 if is_retryable_status(status) {
-                    state.circuit_breakers.record_failure(&backend.id);
+                    state.circuit_breakers.record_failure(backend.id.as_str());
                     state.metrics.retry_attempts.add(1, &[
-                        KeyValue::new("backend", backend.id.clone()),
+                        KeyValue::new("backend", backend_str.clone()),
                         KeyValue::new("attempt", (attempt + 1) as i64),
                         KeyValue::new("outcome", "retryable_status"),
                     ]);
                     if attempt + 1 < max_attempts {
-                        warn!(backend = %backend.id, attempt, status = status.as_u16(), "retryable status, will retry");
+                        warn!(backend = backend.id.as_str(), attempt, status = status.as_u16(), "retryable status, will retry");
                         tokio::time::sleep(backoff_delay(attempt, &state.retry_config)).await;
                         last_response = Some(response);
                         continue;
@@ -395,9 +405,9 @@ pub async fn proxy_handler(
                 }
 
                 if status.is_server_error() {
-                    state.circuit_breakers.record_failure(&backend.id);
+                    state.circuit_breakers.record_failure(backend.id.as_str());
                 } else {
-                    state.circuit_breakers.record_success(&backend.id);
+                    state.circuit_breakers.record_success(backend.id.as_str());
                 }
 
                 state.metrics.queue_depth.add(-1, &backend_attr);
@@ -414,7 +424,7 @@ pub async fn proxy_handler(
                         Ok(collected) => collected.to_bytes(),
                         Err(e) => {
                             warn!(error = %e, "failed to buffer response for caching");
-                            record_completion(&state, start, status, &backend_id);
+                            record_completion(&state, start, status, backend_id.as_str());
                             return error_response(StatusCode::BAD_GATEWAY, "failed to read response");
                         }
                     };
@@ -435,11 +445,11 @@ pub async fn proxy_handler(
                         && status != StatusCode::PARTIAL_CONTENT
                         && !cache_directives.no_transform
                     {
-                        record_completion(&state, start, status, &backend_id);
+                        record_completion(&state, start, status, backend_id.as_str());
                         return compress_response(response, state.compression_config.min_bytes, state.compression_config.level);
                     }
 
-                    record_completion(&state, start, status, &backend_id);
+                    record_completion(&state, start, status, backend_id.as_str());
                     return response;
                 }
 
@@ -448,29 +458,29 @@ pub async fn proxy_handler(
                     && status != StatusCode::PARTIAL_CONTENT
                     && !cache_directives.no_transform
                 {
-                    record_completion(&state, start, status, &backend_id);
+                    record_completion(&state, start, status, backend_id.as_str());
                     return compress_response(response, state.compression_config.min_bytes, state.compression_config.level);
                 }
 
-                record_completion(&state, start, status, &backend_id);
+                record_completion(&state, start, status, backend_id.as_str());
                 return response;
             }
             Err(e) => {
-                state.circuit_breakers.record_failure(&backend.id);
+                state.circuit_breakers.record_failure(backend.id.as_str());
                 state.metrics.retry_attempts.add(1, &[
-                    KeyValue::new("backend", backend.id.clone()),
+                    KeyValue::new("backend", backend_str.clone()),
                     KeyValue::new("attempt", (attempt + 1) as i64),
                     KeyValue::new("outcome", "error"),
                 ]);
                 if attempt + 1 < max_attempts {
-                    warn!(backend = %backend.id, attempt, error = %e, "forward failed, will retry");
+                    warn!(backend = backend.id.as_str(), attempt, error = %e, "forward failed, will retry");
                     tokio::time::sleep(backoff_delay(attempt, &state.retry_config)).await;
                     last_error_msg = Some(format!("{e}"));
                     continue;
                 }
-                error!(backend = %backend.id, error = %e, "failed to forward request after all attempts");
+                error!(backend = backend.id.as_str(), error = %e, "failed to forward request after all attempts");
                 state.metrics.queue_depth.add(-1, &backend_attr);
-                record_completion(&state, start, StatusCode::BAD_GATEWAY, &backend_id);
+                record_completion(&state, start, StatusCode::BAD_GATEWAY, backend_id.as_str());
                 return error_response(StatusCode::BAD_GATEWAY, "backend error");
             }
         }
@@ -480,32 +490,32 @@ pub async fn proxy_handler(
     state.metrics.queue_depth.add(-1, &backend_attr);
     if let Some(response) = last_response {
         let status: StatusCode = response.status();
-        record_completion(&state, start, status, &backend_id);
+        record_completion(&state, start, status, backend_id.as_str());
         return response;
     }
-    let msg: String = last_error_msg.unwrap_or_else(|| "backend error".to_string());
-    error!(backend = %backend.id, error = %msg, "all retry attempts exhausted");
-    record_completion(&state, start, StatusCode::BAD_GATEWAY, &backend_id);
+    let msg: String = last_error_msg.unwrap_or_else(|| "backend error".into());
+    error!(backend = backend.id.as_str(), error = %msg, "all retry attempts exhausted");
+    record_completion(&state, start, StatusCode::BAD_GATEWAY, backend_id.as_str());
     return error_response(StatusCode::BAD_GATEWAY, "backend error");
 }
 
 struct ConnPermitGuard {
     counter: opentelemetry::metrics::UpDownCounter<i64>,
-    backend_id: String,
+    backend_kv: KeyValue,
     _permit: OwnedSemaphorePermit,
 }
 
 impl Drop for ConnPermitGuard {
     fn drop(&mut self) {
-        self.counter.add(-1, &[KeyValue::new("backend", self.backend_id.clone())]);
+        self.counter.add(-1, &[self.backend_kv.clone()]);
     }
 }
 
-fn record_completion(state: &ProxyState, start: Instant, status: StatusCode, backend_id: &str) {
+fn record_completion(state: &ProxyState, start: Instant, status: StatusCode, backend_str: &str) {
     let duration_ms: f64 = start.elapsed().as_secs_f64() * 1000.0;
-    let attrs: Vec<KeyValue> = vec![
+    let attrs: [KeyValue; 2] = [
         KeyValue::new("status", status.as_u16() as i64),
-        KeyValue::new("backend", backend_id.to_string()),
+        KeyValue::new("backend", String::from(backend_str)),
     ];
     state.metrics.requests_total.add(1, &attrs);
     state.metrics.request_duration_ms.record(duration_ms, &attrs);
@@ -514,15 +524,17 @@ fn record_completion(state: &ProxyState, start: Instant, status: StatusCode, bac
     // Populate deferred span fields for OTel trace export
     let span = tracing::Span::current();
     span.record("http.status_code", status.as_u16());
-    span.record("proxy.backend", backend_id);
+    span.record("proxy.backend", backend_str);
 }
 
+#[inline]
 fn response_is_encoded(response: &Response<Body>) -> bool {
     return response
         .headers()
         .contains_key(CONTENT_ENCODING);
 }
 
+#[inline]
 fn is_retryable_status(status: StatusCode) -> bool {
     return matches!(
         status.as_u16(),
@@ -553,7 +565,7 @@ fn backoff_delay(attempt: u32, config: &RetryConfig) -> Duration {
 }
 
 #[tracing::instrument(skip_all)]
-async fn decompress_request(req: Request<Body>, max_body: usize, inline_threshold: usize) -> std::result::Result<Request<Body>, Response<Body>> {
+async fn decompress_request(req: Request<Body>, max_body: u32, inline_threshold: u32) -> std::result::Result<Request<Body>, Response<Body>> {
     let (mut parts, body) = req.into_parts();
 
     let body_bytes: Bytes = body
@@ -565,15 +577,16 @@ async fn decompress_request(req: Request<Body>, max_body: usize, inline_threshol
             error_response(StatusCode::BAD_REQUEST, "failed to read request body")
         })?;
 
-    let decompressed: Vec<u8> = if body_bytes.len() <= inline_threshold {
-        compression::decompress_bounded(&body_bytes, max_body)
+    let max_body_usize: usize = max_body as usize;
+    let decompressed: Vec<u8> = if body_bytes.len() <= inline_threshold as usize {
+        compression::decompress_bounded(&body_bytes, max_body_usize)
             .map_err(|e| {
                 warn!(error = %e, "request decompression failed");
                 error_response(StatusCode::BAD_REQUEST, "invalid zstd body")
             })?
     } else {
         tokio::task::spawn_blocking(move || {
-            compression::decompress_bounded(&body_bytes, max_body)
+            compression::decompress_bounded(&body_bytes, max_body_usize)
         })
         .await
         .map_err(|e| {
@@ -595,10 +608,10 @@ async fn decompress_request(req: Request<Body>, max_body: usize, inline_threshol
     return Ok(Request::from_parts(parts, Body::from(decompressed)));
 }
 
-fn compress_response(response: Response<Body>, min_bytes: usize, compression_level: i32) -> Response<Body> {
+fn compress_response(response: Response<Body>, min_bytes: u32, compression_level: i32) -> Response<Body> {
     let (mut parts, body) = response.into_parts();
 
-    if let Some(len) = parts.headers.get(CONTENT_LENGTH).and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<usize>().ok())
+    if let Some(len) = parts.headers.get(CONTENT_LENGTH).and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<u32>().ok())
         && len < min_bytes
     {
         return Response::from_parts(parts, body);
@@ -610,20 +623,25 @@ fn compress_response(response: Response<Body>, min_bytes: usize, compression_lev
     );
     parts.headers.remove(CONTENT_LENGTH);
 
-    let compressed: CompressedBody<Body> = CompressedBody::with_level(body, compression_level);
+    let compressed: CompressedBody<Body> = match CompressedBody::with_level(body, compression_level) {
+        Ok(c) => c,
+        Err(_) => {
+            return Response::from_parts(parts, Body::empty());
+        }
+    };
     return Response::from_parts(parts, Body::new(compressed));
 }
 
 
-#[tracing::instrument(skip_all, fields(backend = %backend.id))]
+#[tracing::instrument(skip_all, fields(backend = backend.id.as_str()))]
 async fn forward_request(
     req: Request<Body>,
     backend: &BackendConfig,
     state: &Arc<ProxyState>,
     request_timeout: Duration,
 ) -> Result<Response<Body>> {
-    let connect_timeout: Duration = Duration::from_secs(state.timeouts.connect_secs);
-    let handshake_timeout: Duration = Duration::from_secs(state.timeouts.handshake_secs);
+    let connect_timeout: Duration = Duration::from_secs(state.timeouts.connect_secs.get());
+    let handshake_timeout: Duration = Duration::from_secs(state.timeouts.handshake_secs.get());
     let mut sender: HttpSender =
         state.conn_pool.acquire(backend, &state.tls_connector, &state.client_tls_config, connect_timeout, handshake_timeout).await?;
 
@@ -650,12 +668,12 @@ async fn forward_request(
 
     let response: Response<Incoming> = timeout(request_timeout, sender.send_request(backend_req))
         .await
-        .map_err(|_| ReductionError::Forward("send request: timed out".to_string()))?
+        .map_err(|_| ReductionError::Forward("send request: timed out".into()))?
         .map_err(|e| ReductionError::Forward(format!("send request: {e}")))?;
 
     let (parts, incoming_body) = response.into_parts();
     let limited_body: Limited<Incoming> =
-        Limited::new(incoming_body, state.proxy_config.max_response_body_bytes);
+        Limited::new(incoming_body, state.proxy_config.max_response_body_bytes as usize);
     let pooled_body: PooledBody<Limited<Incoming>> =
         PooledBody::new(limited_body, sender);
 
@@ -722,18 +740,19 @@ mod tests {
         let route_configs: Vec<RouteConfig> = routes
             .iter()
             .map(|(prefix, id)| RouteConfig {
-                path_prefix: prefix.to_string(),
-                backend_id: id.to_string(),
+                path_prefix: ArrayString::from(prefix).unwrap(),
+                backend_id: ArrayString::from(id).unwrap(),
                 timeout_secs: None,
             })
             .collect();
 
         let router = Router::new(&route_configs);
-        let mut grouped: HashMap<String, Vec<BackendConfig>> = HashMap::new();
+        let mut grouped: HashMap<ArrayString<256>, Vec<BackendConfig>> = HashMap::new();
         for b in backends {
-            grouped.entry(b.pool.clone()).or_default().push(b);
+            let key: ArrayString<256> = ArrayString::from(b.pool.as_str()).unwrap();
+            grouped.entry(key).or_default().push(b);
         }
-        let backend_pools: HashMap<String, BackendPool> = grouped
+        let backend_pools: HashMap<ArrayString<256>, BackendPool> = grouped
             .into_iter()
             .map(|(id, bs)| (id, BackendPool::new(bs, 0.0).unwrap()))
             .collect();
@@ -752,7 +771,7 @@ mod tests {
         let result = resolve_backend_pool(&rx, "/api/test");
         assert!(result.is_ok());
         let resolved = result.unwrap();
-        assert_eq!(resolved.backend_id, "api");
+        assert_eq!(resolved.backend_id.as_str(), "api");
         assert_eq!(resolved.pool.backends.len(), 1);
         assert_eq!(resolved.timeout_secs, None);
     }
@@ -774,8 +793,8 @@ mod tests {
     #[test]
     fn test_resolve_backend_pool_route_but_no_pool() {
         let route_configs = vec![RouteConfig {
-            path_prefix: "/api".into(),
-            backend_id: "missing-pool".into(),
+            path_prefix: ArrayString::from("/api").unwrap(),
+            backend_id: ArrayString::from("missing-pool").unwrap(),
             timeout_secs: None,
         }];
         let router = Router::new(&route_configs);
@@ -805,7 +824,7 @@ mod tests {
 
         let result = select_backend(&pool, ip, &health_rx, &conn_pool);
         assert!(result.is_ok());
-        assert_eq!(result.unwrap().id, "api");
+        assert_eq!(result.unwrap().id.as_str(), "api");
     }
 
     #[test]
@@ -910,12 +929,12 @@ mod tests {
     fn test_proxy_config_defaults() {
         let cfg: ProxyConfig = ProxyConfig::default();
         assert_eq!(cfg.max_response_body_bytes, 10 * 1024 * 1024);
-        assert_eq!(cfg.h2_connections_per_backend, 4);
+        assert_eq!(cfg.h2_connections_per_backend.get(), 4);
         assert_eq!(cfg.max_idle_quic_per_host, 16);
         assert_eq!(cfg.h2_stream_window, 2 * 1024 * 1024);
         assert_eq!(cfg.h2_conn_window, 4 * 1024 * 1024);
         assert_eq!(cfg.inline_compress_threshold, 8192);
-        assert_eq!(cfg.quic_channel_capacity, 256);
+        assert_eq!(cfg.quic_channel_capacity.get(), 256);
     }
 
     #[test]
@@ -928,9 +947,9 @@ mod tests {
     #[test]
     fn test_timeout_config_defaults() {
         let cfg: TimeoutConfig = TimeoutConfig::default();
-        assert_eq!(cfg.connect_secs, 5);
-        assert_eq!(cfg.handshake_secs, 5);
-        assert_eq!(cfg.request_secs, 30);
+        assert_eq!(cfg.connect_secs.get(), 5);
+        assert_eq!(cfg.handshake_secs.get(), 5);
+        assert_eq!(cfg.request_secs.get(), 30);
     }
 
     #[tokio::test]

@@ -1,3 +1,8 @@
+use std::fmt;
+use std::fmt::Write;
+use std::hash::{DefaultHasher, Hash, Hasher};
+
+use arrayvec::{ArrayString, ArrayVec};
 use bitcode::{Decode, Encode};
 
 use crate::error::{ReductionError, Result};
@@ -5,15 +10,57 @@ use crate::error::{ReductionError, Result};
 const LENGTH_PREFIX_SIZE: usize = 4;
 const MAX_FRAME_SIZE: usize = 64 * 1024;
 
+pub const SESSION_ID_LEN: usize = 21;
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Encode, Decode)]
+pub struct SessionId(pub [u8; SESSION_ID_LEN]);
+
+impl SessionId {
+    pub fn generate(remote_addr: &std::net::SocketAddr, backend_id: &str) -> Self {
+        let mut hasher: DefaultHasher = DefaultHasher::new();
+        remote_addr.hash(&mut hasher);
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+            .hash(&mut hasher);
+        backend_id.hash(&mut hasher);
+        let hash: u64 = hasher.finish();
+
+        let mut buf: [u8; SESSION_ID_LEN] = [0u8; SESSION_ID_LEN];
+        let mut tmp: ArrayString<24> = ArrayString::new();
+        let _ = write!(tmp, "sess-{hash:016x}");
+        buf.copy_from_slice(tmp.as_bytes());
+        return Self(buf);
+    }
+
+    pub fn as_str(&self) -> &str {
+        // Session IDs are always ASCII hex, so this is infallible in practice
+        return std::str::from_utf8(&self.0).unwrap_or("sess-????????????????");
+    }
+}
+
+impl fmt::Display for SessionId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        return f.write_str(self.as_str());
+    }
+}
+
+impl fmt::Debug for SessionId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        return write!(f, "SessionId({})", self.as_str());
+    }
+}
+
 #[derive(Debug, Clone, Encode, Decode, PartialEq)]
 pub enum TunnelFrame {
     Register {
-        backend_id: String,
-        pool: String,
-        capabilities: Vec<String>,
+        backend_id: ArrayString<256>,
+        pool: ArrayString<32>,
+        capabilities: ArrayVec<ArrayString<8>, 4>,
     },
     RegisterAck {
-        session_id: String,
+        session_id: SessionId,
     },
     Heartbeat {
         timestamp_ms: u64,
@@ -23,14 +70,15 @@ pub enum TunnelFrame {
         stream_id: u64,
     },
     Shutdown {
-        reason: String,
+        reason: ArrayString<64>,
     },
 }
 
 pub fn encode(frame: &TunnelFrame) -> Result<Vec<u8>> {
     let payload: Vec<u8> = bitcode::encode(frame);
-    let len: u32 = payload.len() as u32;
-    if len as usize > MAX_FRAME_SIZE {
+    let len: u32 = u32::try_from(payload.len())
+        .map_err(|_| ReductionError::Tunnel(format!("frame payload too large: {} bytes", payload.len())))?;
+    if (len as usize) > MAX_FRAME_SIZE {
         return Err(ReductionError::Tunnel(format!(
             "frame too large: {} bytes",
             len
@@ -42,9 +90,17 @@ pub fn encode(frame: &TunnelFrame) -> Result<Vec<u8>> {
     return Ok(buf);
 }
 
+fn safe_decode(payload: &[u8]) -> Result<TunnelFrame> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        bitcode::decode::<TunnelFrame>(payload)
+    }))
+    .map_err(|_| ReductionError::Tunnel("decode panic (possibly oversized field)".into()))?
+    .map_err(|e| ReductionError::Tunnel(format!("decode error: {e}")))
+}
+
 pub fn decode(buf: &[u8]) -> Result<TunnelFrame> {
     if buf.len() < LENGTH_PREFIX_SIZE {
-        return Err(ReductionError::Tunnel("frame too short for length prefix".to_string()));
+        return Err(ReductionError::Tunnel("frame too short for length prefix".into()));
     }
     let len: u32 = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
     let expected_total: usize = LENGTH_PREFIX_SIZE + len as usize;
@@ -62,9 +118,7 @@ pub fn decode(buf: &[u8]) -> Result<TunnelFrame> {
         )));
     }
     let payload: &[u8] = &buf[LENGTH_PREFIX_SIZE..expected_total];
-    let frame: TunnelFrame = bitcode::decode(payload)
-        .map_err(|e| ReductionError::Tunnel(format!("decode error: {e}")))?;
-    return Ok(frame);
+    return safe_decode(payload);
 }
 
 pub async fn read_frame<R: tokio::io::AsyncReadExt + Unpin>(reader: &mut R) -> Result<TunnelFrame> {
@@ -81,9 +135,7 @@ pub async fn read_frame<R: tokio::io::AsyncReadExt + Unpin>(reader: &mut R) -> R
     reader.read_exact(&mut payload).await
         .map_err(|e| ReductionError::Tunnel(format!("read payload: {e}")))?;
 
-    let frame: TunnelFrame = bitcode::decode(&payload)
-        .map_err(|e| ReductionError::Tunnel(format!("decode error: {e}")))?;
-    return Ok(frame);
+    return safe_decode(&payload);
 }
 
 pub async fn write_frame<W: tokio::io::AsyncWriteExt + Unpin>(
@@ -91,8 +143,9 @@ pub async fn write_frame<W: tokio::io::AsyncWriteExt + Unpin>(
     frame: &TunnelFrame,
 ) -> Result<()> {
     let payload: Vec<u8> = bitcode::encode(frame);
-    let len: u32 = payload.len() as u32;
-    if len as usize > MAX_FRAME_SIZE {
+    let len: u32 = u32::try_from(payload.len())
+        .map_err(|_| ReductionError::Tunnel(format!("frame payload too large: {} bytes", payload.len())))?;
+    if (len as usize) > MAX_FRAME_SIZE {
         return Err(ReductionError::Tunnel(format!("frame too large: {} bytes", len)));
     }
     writer.write_all(&len.to_be_bytes()).await
@@ -111,9 +164,9 @@ mod tests {
     #[test]
     fn test_encode_decode_register() {
         let frame: TunnelFrame = TunnelFrame::Register {
-            backend_id: "api-1".to_string(),
-            pool: "api".to_string(),
-            capabilities: vec!["http".to_string(), "raw".to_string()],
+            backend_id: ArrayString::from("api-1").unwrap(),
+            pool: ArrayString::from("api").unwrap(),
+            capabilities: ["http", "raw"].iter().map(|s| ArrayString::from(s).unwrap()).collect(),
         };
         let encoded: Vec<u8> = encode(&frame).unwrap();
         let decoded: TunnelFrame = decode(&encoded).unwrap();
@@ -122,9 +175,11 @@ mod tests {
 
     #[test]
     fn test_encode_decode_register_ack() {
-        let frame: TunnelFrame = TunnelFrame::RegisterAck {
-            session_id: "sess-abc123".to_string(),
-        };
+        let session_id: SessionId = SessionId::generate(
+            &"127.0.0.1:9000".parse().unwrap(),
+            "test-backend",
+        );
+        let frame: TunnelFrame = TunnelFrame::RegisterAck { session_id };
         let encoded: Vec<u8> = encode(&frame).unwrap();
         let decoded: TunnelFrame = decode(&encoded).unwrap();
         assert_eq!(frame, decoded);
@@ -159,7 +214,7 @@ mod tests {
     #[test]
     fn test_encode_decode_shutdown() {
         let frame: TunnelFrame = TunnelFrame::Shutdown {
-            reason: "graceful".to_string(),
+            reason: ArrayString::from("graceful").unwrap(),
         };
         let encoded: Vec<u8> = encode(&frame).unwrap();
         let decoded: TunnelFrame = decode(&encoded).unwrap();
@@ -195,9 +250,9 @@ mod tests {
     #[tokio::test]
     async fn test_read_write_frame_round_trip() {
         let frame: TunnelFrame = TunnelFrame::Register {
-            backend_id: "db-1".to_string(),
-            pool: "db".to_string(),
-            capabilities: vec!["raw".to_string()],
+            backend_id: ArrayString::from("db-1").unwrap(),
+            pool: ArrayString::from("db").unwrap(),
+            capabilities: ["raw"].iter().map(|s| ArrayString::from(s).unwrap()).collect(),
         };
 
         let mut buf: Vec<u8> = Vec::new();
@@ -213,7 +268,7 @@ mod tests {
         let frames: Vec<TunnelFrame> = vec![
             TunnelFrame::Heartbeat { timestamp_ms: 1000 },
             TunnelFrame::HeartbeatAck,
-            TunnelFrame::Shutdown { reason: "done".to_string() },
+            TunnelFrame::Shutdown { reason: ArrayString::from("done").unwrap() },
         ];
 
         let mut buf: Vec<u8> = Vec::new();
