@@ -1,21 +1,59 @@
 # Reduction
 
-An opinionated reverse proxy built in Rust for machine-to-machine communication over constrained networks.
+An opinionated reverse proxy built in Rust for machine-to-machine communication over constrained networks. Designed for AI agents and devices talking to cloud backends over unreliable connections — low overhead, mutual TLS, efficient binary serialization, no browser concerns.
 
-Reduction is designed for environments where AI agents and devices communicate with cloud backends over unreliable connections. It prioritizes low overhead, mutual TLS authentication, and efficient binary serialization — with no browser or human-facing concerns.
+## Why Reduction?
+
+Most reverse proxies are built for the browser era: HTTP semantics, cookie handling, WebSocket upgrades, enormous configuration surfaces. Reduction strips all of that away and focuses on what M2M traffic actually needs:
+
+- **Single binary, single TOML file.** No YAML sprawl, no control plane, no sidecar.
+- **QUIC-native.** QUIC by default, TCP as fallback.
+- **NAT traversal built in.** Backends behind NATs register via reverse QUIC tunnels — no VPNs, no port forwarding.
+- **Zero-alloc hot paths.** Stack-allocated IDs, no heap churn on the request path.
+- **Rust-to-Rust.** If your services are in Rust, Reduction speaks your language end to end.
+
+### Non-goals
+
+Reduction intentionally does not support: WebSocket, gRPC transcoding, HTTP/3 browser negotiation, cookie-based sessions, HTML error pages, JWT or OAuth validation, or plugin/scripting interfaces. If you need these, use a general-purpose proxy.
 
 ## Features
 
-- **QUIC-first networking** — QUIC via `quinn` is the default transport. TCP is available as a fallback. Transport is configured independently on the listener and backend sides.
-- **mTLS only** — Mutual TLS is the sole authentication mechanism. Both client and server present certificates, validated against a shared CA. No token auth, no API keys.
-- **Zstd compression** — Zstd is the only supported compression algorithm. Configurable level (1–22), minimum size threshold, and built-in zip-bomb protection.
-- **Circuit breaker** — Per-backend failure detection with configurable thresholds. Automatically stops sending traffic to failing backends and probes them during recovery.
-- **Retry with backoff** — Exponential backoff with jitter on failed requests. Configurable retry count, delay bounds, and jitter.
-- **Access control** — IP-based allow/deny lists with CIDR support.
-- **Rate limiting** — Per-IP token-bucket rate limiting via `governor`.
-- **Hot-reload** — Config file changes (routes, backends, weights) and TLS certificates are picked up automatically without restarting the proxy.
-- **TOML configuration** — All configuration lives in a single TOML file.
-- **Graceful shutdown** — In-flight connections drain before the proxy exits, with a configurable timeout.
+### Transport and security
+
+- **QUIC-first networking** — QUIC by default, TCP with HTTP/1.1 and HTTP/2 as fallback. Listener and backend transports configured independently.
+- **mTLS only** — Both sides present certificates validated against a shared CA. No token auth, no API keys.
+- **Let's Encrypt / ACME** — Optional automatic server certificate provisioning via `tls-alpn-01`. Client mTLS still enforced. Enabled with `--features acme`.
+- **TLS certificate hot-reload** — Certificates reload automatically via file watcher, no restart needed.
+- **Connection pooling** — Per-backend HTTP/2 and QUIC connection reuse, pre-warmed on startup and after config reload.
+
+### NAT traversal
+
+- **Reverse QUIC tunnels** — Backends behind NATs establish outbound QUIC connections to the proxy and register themselves. Inbound requests route through these tunnels transparently.
+- **Session management** — Max sessions per backend, heartbeat keepalive, and allowed-backend whitelist.
+- **Stream multiplexing** — Each request opens a new bidirectional stream within an established tunnel. No head-of-line blocking.
+- **Raw stream relay** — Non-HTTP QUIC streams relayed bidirectionally for custom binary protocols.
+
+### Reliability
+
+- **Circuit breaker** — Per-backend state machine (closed → open → half-open → closed) with configurable failure threshold, recovery timeout, and probe limit.
+- **Retry with backoff** — Exponential backoff with jitter. Configurable retry count and delay bounds.
+- **Backpressure** — Per-backend bounded request queue that factors into backend selection so overloaded backends receive less traffic.
+- **Connection limits** — Per-backend connection cap with rejection metrics.
+
+### Traffic management
+
+- **Response caching** — LRU cache with Cache-Control parsing (`no-store`, `private`, `max-age`) and method-aware keys.
+- **Zstd compression** — Configurable level (1–22), minimum size threshold, and bounded decompression.
+- **Access control** — IP allow/deny lists with CIDR support.
+- **Rate limiting** — Per-IP token-bucket rate limiting.
+- **Path-based routing** — Longest-prefix-first matching with per-route timeout overrides.
+
+### Operations
+
+- **Hot-reload** — Config and TLS certificates picked up automatically. Backend pools rebuild atomically; removed backends drain in-flight connections.
+- **Graceful shutdown** — Drains in-flight connections and tunnel sessions, force-closes after a configurable timeout.
+- **TOML configuration** — Single file with validation on load and sensible defaults.
+- **Granular timeouts** — Independent connect, handshake, request, idle relay, and drain timeouts, with per-route overrides.
 
 ## Architecture
 
@@ -28,10 +66,13 @@ Clients (Rust services / AI agents)
   │   Proxy   │                     │
   └─────┬─────┘                     │
         │                           │
-        ▼                           │
-  Path-based routing          Config watcher
-        │                    (hot reload via fs notify)
-        ▼
+   ┌────┴────┐                Config watcher
+   │         │             (hot reload via fs notify)
+   ▼         ▼
+ Path      Tunnel            Backends behind NATs
+ router    registry  ◄─────  register via reverse
+   │         │                QUIC tunnels
+   ▼         ▼
   ┌─────────────────┐
   │  Backend Pool   │
   │  (rendezvous    │
@@ -42,49 +83,18 @@ Clients (Rust services / AI agents)
      ┌─────┼─────┐
      ▼     ▼     ▼
    [ Backend servers ]
+     (direct or tunneled)
 ```
 
 ### Load balancing
 
-Reduction uses **rendezvous hashing** (highest random weight) to assign clients to backends deterministically. This gives stable client affinity with minimal disruption when backends are added or removed.
+**Rendezvous hashing** assigns clients to backends deterministically with stable affinity and minimal disruption when backends change. **IP-seeded jitter** prevents thundering-herd scenarios, and per-backend **backpressure** steers traffic away from overloaded backends.
 
-On top of base weights, **IP-seeded jitter** prevents thundering-herd scenarios when many clients arrive simultaneously. A per-backend **request queue with backpressure** buffers requests ahead of dispatch and factors into backend selection so overloaded backends receive less traffic.
-
-Backend health data (received via a pub/sub control plane) factors into weight calculations. If the control plane is unreachable, the proxy falls back to local-only decisions using base weights and queue backpressure.
+Backend health data factors into weight calculations with configurable latency thresholds and staleness TTL. If the control plane is unreachable, the proxy falls back to local-only decisions.
 
 ### Observability
 
-Reduction exposes metrics via OpenTelemetry and supports OTLP trace export with configurable sampling.
-
-| Metric | Type | Description |
-|---|---|---|
-| `proxy.requests.total` | Counter | Total proxied requests |
-| `proxy.request.duration_ms` | Histogram | End-to-end request latency |
-| `proxy.connections.active` | Gauge | Currently open connections |
-| `proxy.queue.depth` | Gauge | Requests waiting in backend queues |
-| `proxy.rate_limit.rejections` | Counter | Requests rejected by rate limiter |
-| `proxy.backend.selections` | Counter | Backend selection events |
-| `proxy.backend.active_connections` | Gauge | Active connections per backend |
-| `proxy.backend.conn_limit_rejected` | Counter | Requests rejected due to connection limits |
-| `proxy.circuit.open_total` | Counter | Circuit breaker open transitions |
-| `proxy.circuit.half_open_probes` | Counter | Half-open probe attempts |
-| `proxy.retry.attempts` | Counter | Retry attempts |
-
-### Modules
-
-| Module | Purpose |
-|---|---|
-| `balancer` | Rendezvous hashing, jitter, request queue with backpressure |
-| `circuit` | Per-backend circuit breaker (closed → open → half-open → closed) |
-| `compression` | Zstd compress/decompress with zip-bomb protection |
-| `config` | TOML loading, validation, hot-reload file watcher |
-| `health` | Backend health state tracking and subscriber notifications |
-| `metrics` | OpenTelemetry counters, gauges, and histograms (OTLP export) |
-| `proxy` | Request handler, path-based router, connection pooling |
-| `ratelimit` | Token-bucket rate limiting (via `governor`) |
-| `tls` | mTLS setup and certificate hot-reload |
-| `transport` | QUIC and TCP listener implementations |
-| `acl` | IP allow/deny access control with CIDR matching |
+OpenTelemetry metrics (OTLP export) cover requests, latency, connections, queue depth, rate limiting, circuit breaker transitions, cache hits, tunnel sessions, and raw relay activity. W3C Trace Context (`traceparent`) is propagated across hops with configurable sampling. See [docs/configuration.md](docs/configuration.md) for the full metrics reference.
 
 ## Getting started
 
@@ -162,6 +172,15 @@ path_prefix = "/api"
 backend_id = "api-primary"
 ```
 
+To enable reverse tunneling for backends behind NATs:
+
+```toml
+[tunnel]
+enabled = true
+listen_address = "0.0.0.0:8444"
+allowed_backend_ids = ["edge-agent-1", "edge-agent-2"]
+```
+
 All other sections are optional and use sensible defaults. See `config.example.toml` for the full reference.
 
 ### Run
@@ -187,6 +206,39 @@ RUST_LOG=debug cargo run -- config.toml
 ```sh
 cargo test
 ```
+
+## Examples
+
+| Example | What it demonstrates |
+|---|---|
+| [`demo.rs`](examples/demo.rs) | mTLS setup, JSON echo backend, request forwarding, health updates, config reload |
+| [`mcp_demo.rs`](examples/mcp_demo.rs) | MCP servers as backends, rendezvous hashing determinism, health-aware failover |
+| [`acl_demo.rs`](examples/acl_demo.rs) | All four ACL modes: allow-only, deny-only, combined, disabled |
+| [`tunnel_demo.rs`](examples/tunnel_demo.rs) | NAT traversal with a simulated backend registering via reverse QUIC tunnel |
+| [`profile_loadtest.rs`](examples/profile_loadtest.rs) | Concurrent load driver with latency percentile reporting and optional Perfetto trace output |
+
+Run any example with:
+
+```sh
+cargo run --example demo
+```
+
+## Benchmarks
+
+Criterion benchmarks cover the hot-path components:
+
+```sh
+cargo bench
+```
+
+| Benchmark | Target |
+|---|---|
+| `router_bench` | Path-prefix matching throughput |
+| `balancer_bench` | Rendezvous hashing + jitter selection |
+| `compression_bench` | Zstd compress/decompress at various levels |
+| `ratelimit_bench` | Per-IP token-bucket throughput |
+| `health_bench` | Health weight factor calculations |
+| `tls_cache_bench` | Certificate resolver cache performance |
 
 ## Configuration reference
 
