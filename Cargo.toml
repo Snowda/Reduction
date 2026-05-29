@@ -44,7 +44,7 @@ toml = "1.1.2"
 tracing = "0.1.44"
 tracing-opentelemetry = "0.33.0"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
-x509-parser = { version = "0.17", optional = true }
+x509-parser = { version = "0.18", optional = true }
 zstd = "0.13.3"
 
 [dev-dependencies]
