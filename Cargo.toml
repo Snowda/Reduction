@@ -48,7 +48,7 @@ x509-parser = { version = "0.17", optional = true }
 zstd = "0.13.3"
 
 [dev-dependencies]
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = { version = "0.8", features = ["html_reports"] }
 tracing-chrome = "0.7"
 
 [profile.release]
