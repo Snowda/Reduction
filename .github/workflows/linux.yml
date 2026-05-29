@@ -3,10 +3,10 @@ name: Linux
 on:
   push:
     branches: [ main ]
-    paths: [ '**.rs' ]
+    paths: [ '**.rs', '**/Cargo.toml', '**/Cargo.lock' ]
   pull_request:
     branches: [ main ]
-    paths: [ '**.rs' ]
+    paths: [ '**.rs', '**/Cargo.toml', '**/Cargo.lock' ]
 
 env:
   CARGO_TERM_COLOR: always
@@ -21,3 +21,31 @@ jobs:
       run: cargo build --verbose
     - name: Run tests
       run: cargo test --verbose
+
+  # Software Composition Analysis: scan the dependency tree for known
+  # security vulnerabilities (RustSec advisory DB) and unmaintained crates.
+  cargo-audit:
+    name: SCA / cargo-audit
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install cargo-audit
+      run: cargo install cargo-audit --locked
+    - name: Audit dependencies
+      run: cargo audit
+
+  # Software Composition Analysis: review Cargo dependency changes introduced
+  # by a pull request, flagging vulnerable or disallowed-license dependencies
+  # before they are merged. Runs only on pull requests.
+  dependency-review:
+    name: SCA / dependency-review
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+
+    steps:
+    - uses: actions/checkout@v4
+    - name: Review dependency changes
+      uses: actions/dependency-review-action@v4
+      with:
+        fail-on-severity: high
