@@ -17,7 +17,7 @@ bitcode = { version = "0.6.9", features = ["arrayvec"] }
 dashmap = "6.2.1"
 governor = "0.10.4"
 bytes = "1"
-instant-acme = { version = "0.7", optional = true }
+instant-acme = { version = "0.8", optional = true }
 serde_json = "1"
 ipnet = { version = "2", features = ["serde"] }
 http-body = "1"
