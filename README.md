@@ -1,6 +1,6 @@
 # Reduction
 
-An opinionated reverse proxy built in Rust for machine-to-machine communication over constrained networks. Designed for AI agents and devices talking to cloud backends over unreliable connections — low overhead, mutual TLS, efficient binary serialization, no browser concerns.
+An reverse proxy built in Rust for machine-to-machine communication over networks with constrained bandwidth. Designed for AI agents and devices talking to cloud backends over unreliable connections — low overhead, mutual TLS, efficient binary serialization, no browser concerns.
 
 ## Why Reduction?
 
