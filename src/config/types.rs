@@ -6,6 +6,24 @@ use arrayvec::ArrayString;
 use ipnet::IpNet;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+use crate::error::{ReductionError, Result};
+
+// Const NonZero constructors. `MIN.saturating_add(value - 1)` builds the value without the
+// banned unwrap()/expect()/panic that `NonZeroX::new(value).unwrap()` would require: MIN is 1,
+// so saturating_add(value - 1) yields `value`. Inputs are compile-time literals >= 1; passing 0
+// underflows `value - 1` into a const-eval error, which correctly rejects a zero default.
+const fn nonzero_u32(value: u32) -> NonZeroU32 {
+    return NonZeroU32::MIN.saturating_add(value - 1);
+}
+
+const fn nonzero_u64(value: u64) -> NonZeroU64 {
+    return NonZeroU64::MIN.saturating_add(value - 1);
+}
+
+const fn nonzero_usize(value: usize) -> NonZeroUsize {
+    return NonZeroUsize::MIN.saturating_add(value - 1);
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReductionConfig {
     pub listen: ListenConfig,
@@ -116,9 +134,9 @@ pub struct RouteConfig {
 
 // ── Timeout defaults ──
 
-pub const DEFAULT_CONNECT_TIMEOUT_SECS: NonZeroU64 = NonZeroU64::new(5).expect("nonzero constant");
-pub const DEFAULT_HANDSHAKE_TIMEOUT_SECS: NonZeroU64 = NonZeroU64::new(5).expect("nonzero constant");
-pub const DEFAULT_REQUEST_TIMEOUT_SECS: NonZeroU64 = NonZeroU64::new(30).expect("nonzero constant");
+pub const DEFAULT_CONNECT_TIMEOUT_SECS: NonZeroU64 = nonzero_u64(5);
+pub const DEFAULT_HANDSHAKE_TIMEOUT_SECS: NonZeroU64 = nonzero_u64(5);
+pub const DEFAULT_REQUEST_TIMEOUT_SECS: NonZeroU64 = nonzero_u64(30);
 
 fn default_connect_timeout_secs() -> NonZeroU64 { return DEFAULT_CONNECT_TIMEOUT_SECS; }
 fn default_handshake_timeout_secs() -> NonZeroU64 { return DEFAULT_HANDSHAKE_TIMEOUT_SECS; }
@@ -235,7 +253,7 @@ pub struct BackendConfig {
 
 fn validate_max_connections(max_connections: u32) -> std::result::Result<(), String> {
     if max_connections == 0 {
-        return Err("max_connections must be at least 1".to_string());
+        return Err("max_connections must be at least 1".to_owned());
     }
     return Ok(());
 }
@@ -264,18 +282,21 @@ fn validate_jitter_factor(jitter_factor: f64) -> std::result::Result<(), String>
 }
 
 impl BackendConfig {
-    pub fn new(id: &str, address: SocketAddr, weight: f64, transport: TransportKind) -> Self {
-        validate_weight(weight).expect("invalid backend weight");
-        let id: ArrayString<256> = ArrayString::from(id).expect("backend id exceeds 256 characters");
+    pub fn new(id: &str, address: SocketAddr, weight: f64, transport: TransportKind) -> Result<Self> {
+        validate_weight(weight).map_err(ReductionError::Config)?;
+        let id: ArrayString<256> = ArrayString::from(id)
+            .map_err(|_| ReductionError::Config("backend id exceeds 256 characters".to_owned()))?;
         let host: String = address.ip().to_string();
-        let pool: ArrayString<32> = ArrayString::from(id.as_str()).expect("backend id exceeds 32 characters for default pool name");
+        let pool: ArrayString<32> = ArrayString::from(id.as_str())
+            .map_err(|_| ReductionError::Config("backend id exceeds 32 characters for default pool name".to_owned()))?;
         let max_connections: u32 = DEFAULT_MAX_CONNECTIONS;
-        return Self { id, pool, address, host, weight, transport, max_connections };
+        return Ok(Self { id, pool, address, host, weight, transport, max_connections });
     }
 
-    pub fn with_pool(mut self, pool: &str) -> Self {
-        self.pool = ArrayString::from(pool).expect("pool name exceeds 32 characters");
-        return self;
+    pub fn with_pool(mut self, pool: &str) -> Result<Self> {
+        self.pool = ArrayString::from(pool)
+            .map_err(|_| ReductionError::Config("pool name exceeds 32 characters".to_owned()))?;
+        return Ok(self);
     }
 
     pub fn with_host(mut self, host: String) -> Self {
@@ -283,10 +304,10 @@ impl BackendConfig {
         return self;
     }
 
-    pub fn with_max_connections(mut self, max_connections: u32) -> Self {
-        validate_max_connections(max_connections).expect("invalid max_connections");
+    pub fn with_max_connections(mut self, max_connections: u32) -> Result<Self> {
+        validate_max_connections(max_connections).map_err(ReductionError::Config)?;
         self.max_connections = max_connections;
-        return self;
+        return Ok(self);
     }
 }
 
@@ -412,12 +433,12 @@ impl Default for TracingConfig {
 // ── Proxy defaults ──
 
 pub const DEFAULT_MAX_RESPONSE_BODY_BYTES: u32 = 10 * 1024 * 1024;
-pub const DEFAULT_H2_CONNECTIONS_PER_BACKEND: NonZeroU32 = NonZeroU32::new(4).expect("nonzero constant");
+pub const DEFAULT_H2_CONNECTIONS_PER_BACKEND: NonZeroU32 = nonzero_u32(4);
 pub const DEFAULT_MAX_IDLE_QUIC_PER_HOST: u32 = 16;
 pub const DEFAULT_H2_STREAM_WINDOW: u32 = 2 * 1024 * 1024;
 pub const DEFAULT_H2_CONN_WINDOW: u32 = 4 * 1024 * 1024;
 pub const DEFAULT_INLINE_COMPRESS_THRESHOLD: u32 = 8192;
-pub const DEFAULT_QUIC_CHANNEL_CAPACITY: NonZeroU32 = NonZeroU32::new(256).expect("nonzero constant");
+pub const DEFAULT_QUIC_CHANNEL_CAPACITY: NonZeroU32 = nonzero_u32(256);
 
 fn default_max_response_body_bytes() -> u32 { return DEFAULT_MAX_RESPONSE_BODY_BYTES; }
 fn default_h2_connections_per_backend() -> NonZeroU32 { return DEFAULT_H2_CONNECTIONS_PER_BACKEND; }
@@ -511,9 +532,9 @@ impl Default for HealthConfig {
 
 // ── Circuit breaker defaults ──
 
-pub const DEFAULT_FAILURE_THRESHOLD: NonZeroU32 = NonZeroU32::new(5).expect("nonzero constant");
+pub const DEFAULT_FAILURE_THRESHOLD: NonZeroU32 = nonzero_u32(5);
 pub const DEFAULT_RECOVERY_TIMEOUT_SECS: u64 = 60;
-pub const DEFAULT_HALF_OPEN_MAX_REQUESTS: NonZeroU32 = NonZeroU32::new(2).expect("nonzero constant");
+pub const DEFAULT_HALF_OPEN_MAX_REQUESTS: NonZeroU32 = nonzero_u32(2);
 
 fn default_failure_threshold() -> NonZeroU32 { return DEFAULT_FAILURE_THRESHOLD; }
 fn default_recovery_timeout_secs() -> u64 { return DEFAULT_RECOVERY_TIMEOUT_SECS; }
@@ -578,9 +599,9 @@ impl Default for RetryConfig {
 
 pub const DEFAULT_HEARTBEAT_INTERVAL_SECS: u64 = 15;
 pub const DEFAULT_HEARTBEAT_TIMEOUT_SECS: u64 = 45;
-pub const DEFAULT_MAX_SESSIONS_PER_BACKEND: NonZeroU32 = NonZeroU32::new(8).expect("nonzero constant");
+pub const DEFAULT_MAX_SESSIONS_PER_BACKEND: NonZeroU32 = nonzero_u32(8);
 pub const DEFAULT_REGISTRATION_TIMEOUT_SECS: u64 = 10;
-pub const DEFAULT_CONTROL_CHANNEL_CAPACITY: NonZeroU32 = NonZeroU32::new(16).expect("nonzero constant");
+pub const DEFAULT_CONTROL_CHANNEL_CAPACITY: NonZeroU32 = nonzero_u32(16);
 
 fn default_heartbeat_interval_secs() -> u64 { return DEFAULT_HEARTBEAT_INTERVAL_SECS; }
 fn default_heartbeat_timeout_secs() -> u64 { return DEFAULT_HEARTBEAT_TIMEOUT_SECS; }
@@ -624,9 +645,9 @@ impl Default for TunnelConfig {
 
 // ── Cache defaults ──
 
-pub const DEFAULT_CACHE_MAX_ENTRIES: NonZeroUsize = NonZeroUsize::new(1000).expect("nonzero constant");
-pub const DEFAULT_CACHE_MAX_ENTRY_BYTES: NonZeroUsize = NonZeroUsize::new(1024 * 1024).expect("nonzero constant");
-pub const DEFAULT_CACHE_DEFAULT_TTL_SECS: NonZeroU64 = NonZeroU64::new(60).expect("nonzero constant");
+pub const DEFAULT_CACHE_MAX_ENTRIES: NonZeroUsize = nonzero_usize(1000);
+pub const DEFAULT_CACHE_MAX_ENTRY_BYTES: NonZeroUsize = nonzero_usize(1024 * 1024);
+pub const DEFAULT_CACHE_DEFAULT_TTL_SECS: NonZeroU64 = nonzero_u64(60);
 
 fn default_cache_max_entries() -> NonZeroUsize { return DEFAULT_CACHE_MAX_ENTRIES; }
 fn default_cache_max_entry_bytes() -> NonZeroUsize { return DEFAULT_CACHE_MAX_ENTRY_BYTES; }

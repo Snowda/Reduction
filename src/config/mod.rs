@@ -147,7 +147,7 @@ address = "127.0.0.1:8443"
                     "10.0.0.1:8080".parse().unwrap(),
                     2.5,
                     TransportKind::Quic,
-                ),
+                ).unwrap(),
             ],
             routes: vec![
                 RouteConfig {
@@ -504,7 +504,7 @@ backend_id = "api"
             "10.0.0.1:8080".parse().unwrap(),
             1.0,
             TransportKind::Tcp,
-        );
+        ).unwrap();
         assert_eq!(backend.max_connections, 256);
     }
 
@@ -515,19 +515,19 @@ backend_id = "api"
             "10.0.0.1:8080".parse().unwrap(),
             1.0,
             TransportKind::Tcp,
-        ).with_max_connections(50);
+        ).unwrap().with_max_connections(50).unwrap();
         assert_eq!(backend.max_connections, 50);
     }
 
     #[test]
-    #[should_panic(expected = "invalid max_connections")]
-    fn test_max_connections_zero_panics() {
-        BackendConfig::new(
+    fn test_max_connections_zero_errors() {
+        let result: Result<BackendConfig> = BackendConfig::new(
             "test".into(),
             "10.0.0.1:8080".parse().unwrap(),
             1.0,
             TransportKind::Tcp,
-        ).with_max_connections(0);
+        ).unwrap().with_max_connections(0);
+        assert!(result.is_err());
     }
 
     #[test]

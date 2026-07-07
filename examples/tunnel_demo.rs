@@ -1,3 +1,13 @@
+// Example/demo code, outside the production lint gate (which lints only --lib --bins). Demos use
+// unwrap/expect/panic, `&str` .to_string(), and lossy casts freely to stay readable; relax those
+// restriction lints here rather than clutter the demo with error plumbing.
+#![allow(clippy::unwrap_used)]
+#![allow(clippy::expect_used)]
+#![allow(clippy::panic)]
+#![allow(clippy::str_to_string)]
+#![allow(clippy::cast_possible_truncation)]
+#![allow(clippy::cast_sign_loss)]
+
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
@@ -178,7 +188,8 @@ fn generate_signed_cert(
     params.distinguished_name.push(DnType::CommonName, cn);
     params.subject_alt_names = sans;
     let key = KeyPair::generate().unwrap();
-    let cert = params.signed_by(&key, ca_cert, ca_key).unwrap();
+    let issuer = rcgen::Issuer::from_ca_cert_der(ca_cert.der(), ca_key).unwrap();
+    let cert = params.signed_by(&key, &issuer).unwrap();
     (cert, key)
 }
 
@@ -229,7 +240,7 @@ async fn start_proxy(
             "0.0.0.0:0".parse().unwrap(),
             1.0,
             TransportKind::Tcp,
-        ),
+        ).unwrap(),
     ];
     let routes: Vec<(&str, &str)> = vec![("/api", BACKEND_ID)];
 

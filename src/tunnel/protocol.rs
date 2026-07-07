@@ -1,6 +1,8 @@
 use std::fmt;
 use std::fmt::Write;
 use std::hash::{DefaultHasher, Hash, Hasher};
+use std::net::SocketAddr;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use arrayvec::{ArrayString, ArrayVec};
 use bitcode::{Decode, Encode};
@@ -16,11 +18,11 @@ pub const SESSION_ID_LEN: usize = 21;
 pub struct SessionId(pub [u8; SESSION_ID_LEN]);
 
 impl SessionId {
-    pub fn generate(remote_addr: &std::net::SocketAddr, backend_id: &str) -> Self {
+    pub fn generate(remote_addr: &SocketAddr, backend_id: &str) -> Self {
         let mut hasher: DefaultHasher = DefaultHasher::new();
         remote_addr.hash(&mut hasher);
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos()
             .hash(&mut hasher);

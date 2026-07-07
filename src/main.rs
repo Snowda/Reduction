@@ -216,8 +216,7 @@ async fn run(config_path: PathBuf, config: ReductionConfig) -> Result<()> {
         "access control configured",
     );
 
-    let rate_limiter: RateLimit = RateLimit::new(config.ratelimit.requests_per_second)
-        .expect("invalid rate limit config");
+    let rate_limiter: RateLimit = RateLimit::new(config.ratelimit.requests_per_second)?;
     info!(rps = config.ratelimit.requests_per_second, "rate limiting enabled");
 
     let shutdown_token: CancellationToken = CancellationToken::new();
@@ -374,10 +373,16 @@ async fn shutdown_signal(token: CancellationToken) {
 
     #[cfg(unix)]
     let terminate = async {
-        signal::unix::signal(signal::unix::SignalKind::terminate())
-            .expect("failed to install SIGTERM handler")
-            .recv()
-            .await;
+        match signal::unix::signal(signal::unix::SignalKind::terminate()) {
+            Ok(mut stream) => {
+                stream.recv().await;
+            }
+            Err(e) => {
+                // If the handler can't be installed, fall back to ctrl-c only rather than panicking.
+                error!(error = %e, "failed to install SIGTERM handler; SIGTERM shutdown disabled");
+                std::future::pending::<()>().await;
+            }
+        }
     };
 
     #[cfg(not(unix))]

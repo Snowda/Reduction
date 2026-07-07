@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use arrayvec::ArrayVec;
 
-use crate::config::{BackendConfig, HARD_MAX_BACKENDS};
+use crate::config::{BackendConfig, DEFAULT_MAX_BACKENDS, HARD_MAX_BACKENDS};
 use crate::error::{ReductionError, Result};
 use crate::health::HealthState;
 
@@ -23,7 +23,7 @@ pub struct BackendPool {
 
 impl BackendPool {
     pub fn new(backends: Vec<BackendConfig>, jitter_factor: f64) -> Result<Self> {
-        return Self::with_max(backends, jitter_factor, 64);
+        return Self::with_max(backends, jitter_factor, DEFAULT_MAX_BACKENDS);
     }
 
     pub fn with_max(backends: Vec<BackendConfig>, jitter_factor: f64, max_backends: u32) -> Result<Self> {
@@ -115,7 +115,7 @@ mod tests {
                     format!("10.0.{a}.{b}:8080").parse().unwrap(),
                     1.0,
                     TransportKind::Tcp,
-                )
+                ).unwrap()
             })
             .collect();
     }

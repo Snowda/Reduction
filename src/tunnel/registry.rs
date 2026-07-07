@@ -120,7 +120,7 @@ impl TunnelRegistry {
                 warn!(backend_id, session_id = %sid, "tunnel connection closed, removing");
                 drop(entry);
                 self.deregister(backend_id, &sid);
-                return Err(ReductionError::Tunnel("tunnel connection closed".to_string()));
+                return Err(ReductionError::Tunnel("tunnel connection closed".to_owned()));
             }
 
             (session.connection.clone(), session.session_id)
@@ -139,7 +139,7 @@ impl TunnelRegistry {
         for entry in self.sessions.iter() {
             for session in entry.value() {
                 let _ = session.control_tx.try_send(TunnelFrame::Shutdown {
-                    reason: ArrayString::from("proxy shutting down").unwrap(),
+                    reason: ArrayString::from("proxy shutting down").unwrap_or_default(),
                 });
                 session.connection.close(0u32.into(), b"shutdown");
             }

@@ -81,7 +81,7 @@ mod tests {
     use super::*;
     use crate::tls::certs::build_server_config;
 
-    fn generate_ca() -> rcgen::CertifiedKey {
+    fn generate_ca() -> rcgen::CertifiedKey<rcgen::KeyPair> {
         let key = rcgen::KeyPair::generate().unwrap();
         let mut params = rcgen::CertificateParams::new(vec![]).unwrap();
         params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
@@ -90,10 +90,10 @@ mod tests {
             rcgen::DnValue::Utf8String("Test CA".to_string()),
         );
         let cert = params.self_signed(&key).unwrap();
-        return rcgen::CertifiedKey { cert, key_pair: key };
+        return rcgen::CertifiedKey { cert, signing_key: key };
     }
 
-    fn generate_signed_cert(ca: &rcgen::CertifiedKey) -> rcgen::CertifiedKey {
+    fn generate_signed_cert(ca: &rcgen::CertifiedKey<rcgen::KeyPair>) -> rcgen::CertifiedKey<rcgen::KeyPair> {
         let key = rcgen::KeyPair::generate().unwrap();
         let mut params =
             rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
@@ -101,8 +101,9 @@ mod tests {
             rcgen::DnType::CommonName,
             rcgen::DnValue::Utf8String("localhost".to_string()),
         );
-        let cert = params.signed_by(&key, &ca.cert, &ca.key_pair).unwrap();
-        return rcgen::CertifiedKey { cert, key_pair: key };
+        let issuer = rcgen::Issuer::from_ca_cert_der(ca.cert.der(), &ca.signing_key).unwrap();
+        let cert = params.signed_by(&key, &issuer).unwrap();
+        return rcgen::CertifiedKey { cert, signing_key: key };
     }
 
     fn write_pem(content: &str) -> NamedTempFile {
@@ -119,7 +120,7 @@ mod tests {
 
         let ca_file = write_pem(&ca.cert.pem());
         let cert_file = write_pem(&leaf.cert.pem());
-        let key_file = write_pem(&leaf.key_pair.serialize_pem());
+        let key_file = write_pem(&leaf.signing_key.serialize_pem());
 
         let (config, _resolver) = build_server_config(
             cert_file.path(),

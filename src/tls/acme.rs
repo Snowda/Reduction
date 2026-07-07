@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use instant_acme::{
     Account, AccountCredentials, AuthorizationStatus, ChallengeType, Identifier,
@@ -15,7 +15,7 @@ use rustls::sign::CertifiedKey;
 use tokio::sync::watch;
 use tokio::time::sleep;
 use tracing::{error, info, warn};
-use x509_parser::prelude::*;
+use x509_parser::prelude::{FromDer, X509Certificate};
 
 use crate::config::AcmeTlsConfig;
 use crate::error::{ReductionError, Result};
@@ -34,7 +34,7 @@ const CERT_FILENAME: &str = "cert.pem";
 const KEY_FILENAME: &str = "key.pem";
 
 pub struct AcmeCertResolver {
-    pub(crate) cert: parking_lot::RwLock<Option<Arc<CertifiedKey>>>,
+    pub cert: parking_lot::RwLock<Option<Arc<CertifiedKey>>>,
     challenge_cert: parking_lot::RwLock<Option<Arc<CertifiedKey>>>,
 }
 
@@ -186,7 +186,7 @@ impl AcmeRenewalTask {
             let challenge = authz.challenges.iter()
                 .find(|c| c.r#type == ChallengeType::TlsAlpn01)
                 .ok_or_else(|| ReductionError::Acme(
-                    "no tls-alpn-01 challenge found".to_string()
+                    "no tls-alpn-01 challenge found".to_owned()
                 ))?;
 
             let key_auth: KeyAuthorization = order.key_authorization(challenge);
@@ -206,7 +206,7 @@ impl AcmeRenewalTask {
                 if attempts > ACME_MAX_POLL_ATTEMPTS {
                     self.resolver.set_challenge_cert(None);
                     return Err(ReductionError::Acme(
-                        "timed out waiting for challenge validation".to_string()
+                        "timed out waiting for challenge validation".to_owned()
                     ));
                 }
 
@@ -232,7 +232,7 @@ impl AcmeRenewalTask {
                     None => {
                         self.resolver.set_challenge_cert(None);
                         return Err(ReductionError::Acme(
-                            "authorization disappeared during polling".to_string()
+                            "authorization disappeared during polling".to_owned()
                         ));
                     }
                 }
@@ -266,7 +266,7 @@ impl AcmeRenewalTask {
             attempts += 1;
             if attempts > ACME_MAX_POLL_ATTEMPTS {
                 return Err(ReductionError::Acme(
-                    "timed out waiting for certificate".to_string()
+                    "timed out waiting for certificate".to_owned()
                 ));
             }
 
@@ -367,8 +367,8 @@ fn time_until_renewal_from_certified(certified_key: &CertifiedKey) -> Duration {
     match X509Certificate::from_der(cert_der) {
         Ok((_, cert)) => {
             let not_after = cert.validity().not_after.timestamp();
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
                 .unwrap_or(Duration::ZERO)
                 .as_secs() as i64;
 
@@ -428,7 +428,7 @@ fn build_certified_key_from_pem(cert_pem: &str, key_pem: &str) -> Result<Certifi
         .map_err(|e| ReductionError::Acme(format!("failed to parse cert PEM: {e}")))?;
 
     if certs.is_empty() {
-        return Err(ReductionError::Acme("no certificates in PEM".to_string()));
+        return Err(ReductionError::Acme("no certificates in PEM".to_owned()));
     }
 
     let key_reader = &mut BufReader::new(key_pem.as_bytes());

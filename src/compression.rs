@@ -12,17 +12,21 @@ pub const MIN_COMPRESS_BYTES: usize = 256;
 // Above this, compression is offloaded to spawn_blocking.
 pub const INLINE_COMPRESS_THRESHOLD: usize = 8192;
 
+// Thread-local encoders are stored as Option so a (practically impossible) construction
+// failure degrades to a meaningful error at call time rather than panicking on init.
 thread_local! {
-    static COMPRESSOR: RefCell<zstd::bulk::Compressor<'static>> =
-        RefCell::new(zstd::bulk::Compressor::new(DEFAULT_COMPRESSION_LEVEL).unwrap());
+    static COMPRESSOR: RefCell<Option<zstd::bulk::Compressor<'static>>> =
+        RefCell::new(zstd::bulk::Compressor::new(DEFAULT_COMPRESSION_LEVEL).ok());
 
-    static DECOMPRESSOR: RefCell<zstd::bulk::Decompressor<'static>> =
-        RefCell::new(zstd::bulk::Decompressor::new().unwrap());
+    static DECOMPRESSOR: RefCell<Option<zstd::bulk::Decompressor<'static>>> =
+        RefCell::new(zstd::bulk::Decompressor::new().ok());
 }
 
 pub fn compress(data: &[u8]) -> Result<Vec<u8>> {
     return COMPRESSOR.with_borrow_mut(|c| {
-        c.compress(data)
+        let compressor: &mut zstd::bulk::Compressor<'static> = c.as_mut()
+            .ok_or_else(|| ReductionError::Transport("zstd compressor unavailable".to_owned()))?;
+        compressor.compress(data)
             .map_err(|e| ReductionError::Transport(format!("zstd compress: {e}")))
     });
 }
@@ -39,7 +43,9 @@ pub fn decompress(data: &[u8]) -> Result<Vec<u8>> {
 
     if capacity > 0 {
         return DECOMPRESSOR.with_borrow_mut(|d| {
-            d.decompress(data, capacity)
+            let decompressor: &mut zstd::bulk::Decompressor<'static> = d.as_mut()
+                .ok_or_else(|| ReductionError::Transport("zstd decompressor unavailable".to_owned()))?;
+            decompressor.decompress(data, capacity)
                 .map_err(|e| ReductionError::Transport(format!("zstd decompress: {e}")))
         });
     }

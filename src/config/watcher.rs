@@ -87,7 +87,7 @@ fn reload_config(
     drop(old_config);
 
     config_tx.send(new_config)
-        .map_err(|_| crate::error::ReductionError::Config("all config receivers dropped".to_string()))?;
+        .map_err(|_| crate::error::ReductionError::Config("all config receivers dropped".to_owned()))?;
 
     return Ok(());
 }
@@ -129,7 +129,7 @@ mod tests {
                 "10.0.0.1:8080".parse().unwrap(),
                 1.0,
                 TransportKind::Tcp,
-            )],
+            ).unwrap()],
             routes: vec![RouteConfig {
                 path_prefix: ArrayString::from("/api").unwrap(),
                 backend_id: ArrayString::from("api").unwrap(),

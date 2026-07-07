@@ -24,8 +24,9 @@ impl RequestQueue {
     }
 
     pub fn depth(&self) -> u32 {
-        // Safe: available_permits <= max_depth (u32), so subtraction fits in u32
-        return self.max_depth - self.semaphore.available_permits() as u32;
+        // available_permits <= max_depth (u32); the fallback is unreachable but avoids a panic.
+        let available: u32 = u32::try_from(self.semaphore.available_permits()).unwrap_or(self.max_depth);
+        return self.max_depth.saturating_sub(available);
     }
 
     pub fn max_depth(&self) -> u32 {

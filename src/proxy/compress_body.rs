@@ -102,7 +102,10 @@ fn compress_chunk(encoder: &mut ZstdEncoder<'static>, input: &[u8]) -> Bytes {
     let mut out_buf = zstd::stream::raw::OutBuffer::around(&mut *output);
 
     while in_buf.pos() < input.len() {
-        encoder.run(&mut in_buf, &mut out_buf).expect("zstd compress");
+        // In-memory zstd encoding does not fail in practice; stop and emit what we have if it does.
+        if encoder.run(&mut in_buf, &mut out_buf).is_err() {
+            break;
+        }
         if out_buf.pos() == out_buf.capacity() {
             break;
         }
@@ -117,7 +120,8 @@ fn finish_encoder(encoder: &mut ZstdEncoder<'static>) -> Bytes {
     let mut output: BytesMut = BytesMut::zeroed(OUTPUT_BUF_SIZE);
     loop {
         let mut out_buf = zstd::stream::raw::OutBuffer::around(&mut *output);
-        let remaining: usize = encoder.finish(&mut out_buf, true).expect("zstd finish");
+        // In-memory zstd finish does not fail in practice; treat an error as "no bytes remaining".
+        let remaining: usize = encoder.finish(&mut out_buf, true).unwrap_or(0);
         let written: usize = out_buf.pos();
         output.truncate(written);
         if remaining == 0 {

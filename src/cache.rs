@@ -70,9 +70,10 @@ impl ResponseCache {
         }
 
         let body_bytes: Vec<u8> = entry.body.clone();
-        let response: Response<Body> = builder
-            .body(Body::from(body_bytes))
-            .expect("failed to build cached response");
+        let response: Response<Body> = match builder.body(Body::from(body_bytes)) {
+            Ok(response) => response,
+            Err(_) => return None,
+        };
 
         return Some(response);
     }
