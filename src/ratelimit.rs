@@ -21,7 +21,7 @@ pub struct RateLimit {
 impl RateLimit {
     pub fn new(requests_per_second: u32) -> Result<Self> {
         let rps: NonZeroU32 = NonZeroU32::new(requests_per_second).ok_or_else(|| {
-            ReductionError::Config("rate limit must be > 0".to_string())
+            ReductionError::Config("rate limit must be > 0".to_owned())
         })?;
 
         let quota: Quota = Quota::per_second(rps);

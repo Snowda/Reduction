@@ -34,7 +34,8 @@ fn main() {
     // Generate a client cert signed by the CA (for mTLS)
     let client_key = rcgen::KeyPair::generate().unwrap();
     let client_params = rcgen::CertificateParams::new(vec!["client-1".to_string()]).unwrap();
-    let client_cert = client_params.signed_by(&client_key, &ca_cert, &ca_key).unwrap();
+    let issuer = rcgen::Issuer::from_ca_cert_der(ca_cert.der(), &ca_key).unwrap();
+    let client_cert = client_params.signed_by(&client_key, &issuer).unwrap();
 
     let mut client_cert_file = NamedTempFile::new().unwrap();
     client_cert_file.write_all(client_cert.pem().as_bytes()).unwrap();

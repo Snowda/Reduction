@@ -85,7 +85,7 @@ async fn handle_tunnel_connection(
     let register_timeout: Duration = Duration::from_secs(config.registration_timeout_secs);
     let frame: TunnelFrame = timeout(register_timeout, protocol::read_frame(&mut control_stream))
         .await
-        .map_err(|_| ReductionError::Tunnel("registration timed out".to_string()))?
+        .map_err(|_| ReductionError::Tunnel("registration timed out".to_owned()))?
         .map_err(|e| ReductionError::Tunnel(format!("read register frame: {e}")))?;
 
     let (backend_id, pool, capabilities) = match frame {
@@ -103,9 +103,9 @@ async fn handle_tunnel_connection(
         metrics.tunnel_registration_rejected.add(1, &[]);
         warn!(%backend_id, %remote_addr, "tunnel registration rejected: not in allowlist");
         protocol::write_frame(&mut control_stream, &TunnelFrame::Shutdown {
-            reason: ArrayString::from("not in allowlist").unwrap(),
+            reason: ArrayString::from("not in allowlist").unwrap_or_default(),
         }).await.ok();
-        return Err(ReductionError::Tunnel("backend not in allowlist".to_string()));
+        return Err(ReductionError::Tunnel("backend not in allowlist".to_owned()));
     }
 
     let session_id: SessionId = SessionId::generate(&remote_addr, backend_id.as_str());
@@ -175,7 +175,7 @@ async fn handle_tunnel_connection(
             }
             _ = shutdown.cancelled() => {
                 protocol::write_frame(&mut control_stream, &TunnelFrame::Shutdown {
-                    reason: ArrayString::from("proxy shutting down").unwrap(),
+                    reason: ArrayString::from("proxy shutting down").unwrap_or_default(),
                 }).await.ok();
                 break;
             }

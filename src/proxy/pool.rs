@@ -35,6 +35,8 @@ use crate::tunnel::registry::TunnelRegistry;
 const MAX_IDLE_PER_HOST: u32 = 16;
 const READY_TIMEOUT: Duration = Duration::from_millis(50);
 const H2_CONNS_PER_BACKEND: u32 = 4;
+const H2_STREAM_WINDOW: u32 = 2 * 1024 * 1024;
+const H2_CONN_WINDOW: u32 = 4 * 1024 * 1024;
 const QUIC_BIND_ADDR: SocketAddr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0));
 
 pub enum HttpSender {
@@ -77,8 +79,8 @@ impl ConnPool {
             conn_limits: DashMap::new(),
             h2_conns_per_backend: H2_CONNS_PER_BACKEND,
             max_idle_quic_per_host: MAX_IDLE_PER_HOST,
-            h2_stream_window: 2 * 1024 * 1024,
-            h2_conn_window: 4 * 1024 * 1024,
+            h2_stream_window: H2_STREAM_WINDOW,
+            h2_conn_window: H2_CONN_WINDOW,
             tunnel_registry: None,
         };
     }
@@ -189,7 +191,7 @@ impl ConnPool {
         let (sender, conn_driver): (http1::SendRequest<Body>, _) =
             timeout(handshake_timeout, http1::handshake(io))
                 .await
-                .map_err(|_| ReductionError::Forward("tunnel http handshake: timed out".to_string()))?
+                .map_err(|_| ReductionError::Forward("tunnel http handshake: timed out".to_owned()))?
                 .map_err(|e| ReductionError::Forward(format!("tunnel http handshake: {e}")))?;
 
         tokio::spawn(async move {
@@ -246,7 +248,7 @@ impl ConnPool {
 
         let (mut send, recv) = timeout(handshake_timeout, conn.open_bi())
             .await
-            .map_err(|_| ReductionError::Forward("QUIC stream open: timed out".to_string()))?
+            .map_err(|_| ReductionError::Forward("QUIC stream open: timed out".to_owned()))?
             .map_err(|e| ReductionError::Forward(format!("QUIC stream open: {e}")))?;
 
         tokio::io::AsyncWriteExt::write_all(&mut send, &[quic::STREAM_TYPE_HTTP])
@@ -262,7 +264,7 @@ impl ConnPool {
         let (sender, conn_driver): (http1::SendRequest<Body>, _) =
             timeout(handshake_timeout, http1::handshake(io))
                 .await
-                .map_err(|_| ReductionError::Forward("http handshake: timed out".to_string()))?
+                .map_err(|_| ReductionError::Forward("http handshake: timed out".to_owned()))?
                 .map_err(|e| ReductionError::Forward(format!("http handshake: {e}")))?;
 
         tokio::spawn(async move {
@@ -284,7 +286,7 @@ impl ConnPool {
         let tcp_stream: TcpStream =
             timeout(connect_timeout, TcpStream::connect(backend.address))
                 .await
-                .map_err(|_| ReductionError::Forward("connect: timed out".to_string()))?
+                .map_err(|_| ReductionError::Forward("connect: timed out".to_owned()))?
                 .map_err(|e| {
                     ReductionError::Forward(format!("connect {}: {e}", backend.address))
                 })?;
@@ -297,7 +299,7 @@ impl ConnPool {
         let tls_stream: TlsStream<TcpStream> =
             timeout(handshake_timeout, tls_connector.connect(server_name, tcp_stream))
                 .await
-                .map_err(|_| ReductionError::Forward("tls handshake: timed out".to_string()))?
+                .map_err(|_| ReductionError::Forward("tls handshake: timed out".to_owned()))?
                 .map_err(|e| ReductionError::Forward(format!("tls handshake: {e}")))?;
 
         let io: TokioIo<TlsStream<TcpStream>> = TokioIo::new(tls_stream);
@@ -311,7 +313,7 @@ impl ConnPool {
                     .handshake(io),
             )
                 .await
-                .map_err(|_| ReductionError::Forward("http2 handshake: timed out".to_string()))?
+                .map_err(|_| ReductionError::Forward("http2 handshake: timed out".to_owned()))?
                 .map_err(|e| ReductionError::Forward(format!("http2 handshake: {e}")))?;
 
         tokio::spawn(async move {
@@ -369,7 +371,7 @@ impl ConnPool {
 
         let connection: Connection = timeout(connect_timeout, connecting)
             .await
-            .map_err(|_| ReductionError::Forward("QUIC handshake: timed out".to_string()))?
+            .map_err(|_| ReductionError::Forward("QUIC handshake: timed out".to_owned()))?
             .map_err(|e| ReductionError::Forward(format!("QUIC handshake: {e}")))?;
 
         debug!(backend = %backend.id, "QUIC connection established");
@@ -613,7 +615,7 @@ mod tests {
             "127.0.0.1:1".parse().unwrap(),
             1.0,
             TransportKind::Tcp,
-        );
+        ).unwrap();
         let connect_timeout: Duration = Duration::from_secs(state.timeouts.connect_secs.get());
         let handshake_timeout: Duration = Duration::from_secs(state.timeouts.handshake_secs.get());
         let result: Result<HttpSender> =
@@ -844,7 +846,7 @@ mod tests {
             "127.0.0.1:1".parse().unwrap(),
             1.0,
             TransportKind::Quic,
-        );
+        ).unwrap();
         let connect_timeout: Duration = Duration::from_secs(state.timeouts.connect_secs.get());
         let handshake_timeout: Duration = Duration::from_secs(state.timeouts.handshake_secs.get());
         let result: Result<HttpSender> = state.conn_pool.acquire(&backend, &state.tls_connector, &state.client_tls_config, connect_timeout, handshake_timeout).await;
@@ -917,7 +919,7 @@ mod tests {
             "127.0.0.1:8080".parse().unwrap(),
             1.0,
             TransportKind::Tcp,
-        ).with_max_connections(2);
+        ).unwrap().with_max_connections(2).unwrap();
 
         let _p1 = pool.try_acquire_conn_permit(&backend).unwrap();
         let _p2 = pool.try_acquire_conn_permit(&backend).unwrap();
@@ -931,7 +933,7 @@ mod tests {
             "127.0.0.1:8080".parse().unwrap(),
             1.0,
             TransportKind::Tcp,
-        ).with_max_connections(1);
+        ).unwrap().with_max_connections(1).unwrap();
 
         let _p1 = pool.try_acquire_conn_permit(&backend).unwrap();
         let result = pool.try_acquire_conn_permit(&backend);
@@ -946,7 +948,7 @@ mod tests {
             "127.0.0.1:8080".parse().unwrap(),
             1.0,
             TransportKind::Tcp,
-        ).with_max_connections(1);
+        ).unwrap().with_max_connections(1).unwrap();
 
         {
             let _p1 = pool.try_acquire_conn_permit(&backend).unwrap();
@@ -969,7 +971,7 @@ mod tests {
             "127.0.0.1:8080".parse().unwrap(),
             1.0,
             TransportKind::Tcp,
-        ).with_max_connections(4);
+        ).unwrap().with_max_connections(4).unwrap();
 
         let _p1 = pool.try_acquire_conn_permit(&backend).unwrap();
         let pressure: f64 = pool.connection_pressure("test", 4);
@@ -988,7 +990,7 @@ mod tests {
             "127.0.0.1:8080".parse().unwrap(),
             1.0,
             TransportKind::Tcp,
-        ).with_max_connections(1);
+        ).unwrap().with_max_connections(1).unwrap();
 
         let _p1 = pool.try_acquire_conn_permit(&backend).unwrap();
         let pressure: f64 = pool.connection_pressure("test", 1);
@@ -1003,13 +1005,13 @@ mod tests {
             "127.0.0.1:8080".parse().unwrap(),
             1.0,
             TransportKind::Tcp,
-        ).with_max_connections(1);
+        ).unwrap().with_max_connections(1).unwrap();
         let backend_b = BackendConfig::new(
             "b".into(),
             "127.0.0.2:8080".parse().unwrap(),
             1.0,
             TransportKind::Tcp,
-        ).with_max_connections(1);
+        ).unwrap().with_max_connections(1).unwrap();
 
         let _pa = pool.try_acquire_conn_permit(&backend_a).unwrap();
         let _pb = pool.try_acquire_conn_permit(&backend_b).unwrap();

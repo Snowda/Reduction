@@ -117,7 +117,7 @@ fn build_certified_key(cert_path: &Path, key_path: &Path) -> Result<CertifiedKey
     let key = load_private_key(key_path)?;
 
     let provider = rustls::crypto::CryptoProvider::get_default()
-        .ok_or_else(|| ReductionError::Config("no default crypto provider installed".to_string()))?;
+        .ok_or_else(|| ReductionError::Config("no default crypto provider installed".to_owned()))?;
 
     let certified_key = CertifiedKey::from_der(certs, key, provider)
         .map_err(|e| ReductionError::Config(format!("failed to build certified key: {e}")))?;
@@ -219,7 +219,7 @@ mod tests {
     use super::*;
     use tempfile::NamedTempFile;
 
-    fn generate_ca() -> rcgen::CertifiedKey {
+    fn generate_ca() -> rcgen::CertifiedKey<rcgen::KeyPair> {
         let key = rcgen::KeyPair::generate().unwrap();
         let mut params = rcgen::CertificateParams::new(vec![]).unwrap();
         params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
@@ -228,10 +228,10 @@ mod tests {
             rcgen::DnValue::Utf8String("Test CA".to_string()),
         );
         let cert = params.self_signed(&key).unwrap();
-        return rcgen::CertifiedKey { cert, key_pair: key };
+        return rcgen::CertifiedKey { cert, signing_key: key };
     }
 
-    fn generate_signed_cert(ca: &rcgen::CertifiedKey) -> rcgen::CertifiedKey {
+    fn generate_signed_cert(ca: &rcgen::CertifiedKey<rcgen::KeyPair>) -> rcgen::CertifiedKey<rcgen::KeyPair> {
         let key = rcgen::KeyPair::generate().unwrap();
         let mut params =
             rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
@@ -239,8 +239,9 @@ mod tests {
             rcgen::DnType::CommonName,
             rcgen::DnValue::Utf8String("localhost".to_string()),
         );
-        let cert = params.signed_by(&key, &ca.cert, &ca.key_pair).unwrap();
-        return rcgen::CertifiedKey { cert, key_pair: key };
+        let issuer = rcgen::Issuer::from_ca_cert_der(ca.cert.der(), &ca.signing_key).unwrap();
+        let cert = params.signed_by(&key, &issuer).unwrap();
+        return rcgen::CertifiedKey { cert, signing_key: key };
     }
 
     fn write_pem(content: &str) -> NamedTempFile {
@@ -257,7 +258,7 @@ mod tests {
         let leaf = generate_signed_cert(&ca);
 
         let cert_file = write_pem(&leaf.cert.pem());
-        let key_file = write_pem(&leaf.key_pair.serialize_pem());
+        let key_file = write_pem(&leaf.signing_key.serialize_pem());
 
         let resolver = ReloadingCertResolver::new(cert_file.path(), key_file.path()).unwrap();
         let key = resolver.current();
@@ -272,13 +273,13 @@ mod tests {
         let leaf2 = generate_signed_cert(&ca);
 
         let cert_file = write_pem(&leaf1.cert.pem());
-        let key_file = write_pem(&leaf1.key_pair.serialize_pem());
+        let key_file = write_pem(&leaf1.signing_key.serialize_pem());
 
         let resolver = ReloadingCertResolver::new(cert_file.path(), key_file.path()).unwrap();
         let key_before = resolver.current();
 
         std::fs::write(cert_file.path(), leaf2.cert.pem()).unwrap();
-        std::fs::write(key_file.path(), leaf2.key_pair.serialize_pem()).unwrap();
+        std::fs::write(key_file.path(), leaf2.signing_key.serialize_pem()).unwrap();
 
         resolver.reload().unwrap();
         let key_after = resolver.current();
@@ -293,7 +294,7 @@ mod tests {
         let leaf = generate_signed_cert(&ca);
 
         let cert_file = write_pem(&leaf.cert.pem());
-        let key_file = write_pem(&leaf.key_pair.serialize_pem());
+        let key_file = write_pem(&leaf.signing_key.serialize_pem());
 
         let resolver = ReloadingCertResolver::new(cert_file.path(), key_file.path()).unwrap();
         let key_before = resolver.current();
@@ -314,7 +315,7 @@ mod tests {
         let leaf = generate_signed_cert(&ca);
 
         let cert_file = write_pem(&leaf.cert.pem());
-        let key_file = write_pem(&leaf.key_pair.serialize_pem());
+        let key_file = write_pem(&leaf.signing_key.serialize_pem());
 
         let resolver = ReloadingClientCertResolver::new(cert_file.path(), key_file.path()).unwrap();
         assert!(resolver.has_certs());
@@ -331,12 +332,12 @@ mod tests {
         let leaf2 = generate_signed_cert(&ca);
 
         let cert_file = write_pem(&leaf1.cert.pem());
-        let key_file = write_pem(&leaf1.key_pair.serialize_pem());
+        let key_file = write_pem(&leaf1.signing_key.serialize_pem());
 
         let resolver = ReloadingClientCertResolver::new(cert_file.path(), key_file.path()).unwrap();
 
         std::fs::write(cert_file.path(), leaf2.cert.pem()).unwrap();
-        std::fs::write(key_file.path(), leaf2.key_pair.serialize_pem()).unwrap();
+        std::fs::write(key_file.path(), leaf2.signing_key.serialize_pem()).unwrap();
 
         resolver.reload().unwrap();
         let key = resolver.current();

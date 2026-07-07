@@ -49,7 +49,8 @@ impl HealthState {
     pub fn new() -> Self {
         return Self {
             entries: LruCache::new(
-                NonZeroUsize::new(MAX_BACKENDS).expect("MAX_BACKENDS must be > 0"),
+                // MAX_BACKENDS is a non-zero compile-time constant; MIN is an unreachable fallback.
+                NonZeroUsize::new(MAX_BACKENDS).unwrap_or(NonZeroUsize::MIN),
             ),
             staleness_ttl: DEFAULT_STALENESS_TTL,
             latency_threshold_ms: DEFAULT_LATENCY_THRESHOLD_MS,
@@ -60,7 +61,8 @@ impl HealthState {
         let cap: usize = (capacity as usize).min(MAX_BACKENDS).max(1);
         return Self {
             entries: LruCache::new(
-                NonZeroUsize::new(cap).expect("capacity must be > 0"),
+                // cap is clamped to at least 1 above; MIN is an unreachable fallback.
+                NonZeroUsize::new(cap).unwrap_or(NonZeroUsize::MIN),
             ),
             staleness_ttl,
             latency_threshold_ms,

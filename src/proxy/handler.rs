@@ -30,7 +30,7 @@ use crate::cache_control::CacheDirectives;
 use crate::balancer::{BackendPool, RequestQueue};
 use crate::circuit::{CircuitBreakers, CircuitState, HalfOpenGuard};
 use crate::compression;
-use crate::config::{BackendConfig, CacheConfig, CompressionConfig, ProxyConfig, RetryConfig, TimeoutConfig};
+use crate::config::{BackendConfig, CacheConfig, CompressionConfig, DEFAULT_MAX_CONNECTIONS, ProxyConfig, RetryConfig, TimeoutConfig};
 use crate::proxy::compress_body::CompressedBody;
 use crate::error::{ReductionError, Result};
 use crate::health::HealthState;
@@ -39,6 +39,14 @@ use crate::proxy::pool::{ConnPool, HttpSender, PooledBody};
 use crate::proxy::router::{RouteMatch, Router};
 use crate::ratelimit::RateLimit;
 use crate::transport::ConnectAddr;
+
+// Retry-After value (seconds) advertised to clients while the proxy is draining for shutdown.
+const SHUTDOWN_RETRY_AFTER_SECS: &str = "5";
+
+// HTTP status codes treated as transient, so the request is safe to retry against another backend.
+const STATUS_TOO_MANY_REQUESTS: u16 = 429;
+const STATUS_BAD_GATEWAY: u16 = 502;
+const STATUS_SERVICE_UNAVAILABLE: u16 = 503;
 
 #[derive(Clone)]
 pub struct ReloadableState {
@@ -79,7 +87,7 @@ fn select_backend(
         let max: u32 = pool.backends.iter()
             .find(|b| b.id.as_str() == id)
             .map(|b| b.max_connections)
-            .unwrap_or(256);
+            .unwrap_or(DEFAULT_MAX_CONNECTIONS);
         conn_pool.connection_pressure(id, max)
     };
     match pool.select_with_pressure(client_ip, &health, &pressure_fn) {
@@ -104,10 +112,7 @@ fn resolve_backend_pool(
     let route_match: RouteMatch<'_> = match state.router.match_route(path) {
         Some(m) => m,
         None => {
-            return Err(Response::builder()
-                .status(StatusCode::NOT_FOUND)
-                .body(Body::from("no route matched"))
-                .expect("failed to build response"));
+            return Err(error_response(StatusCode::NOT_FOUND, "no route matched"));
         }
     };
 
@@ -115,10 +120,7 @@ fn resolve_backend_pool(
         Some(p) => p,
         None => {
             error!(backend_id = route_match.backend_id.as_str(), "route matched but no backend pool found");
-            return Err(Response::builder()
-                .status(StatusCode::BAD_GATEWAY)
-                .body(Body::from("backend pool not found"))
-                .expect("failed to build response"));
+            return Err(error_response(StatusCode::BAD_GATEWAY, "backend pool not found"));
         }
     };
 
@@ -157,10 +159,10 @@ impl Injector for HeaderInjector<'_> {
 
 #[cold]
 fn error_response(status: StatusCode, message: &str) -> Response<Body> {
-    return Response::builder()
-        .status(status)
-        .body(Body::from(String::from(message)))
-        .expect("failed to build response");
+    // Build without the fallible `Response::builder` so a status code can never produce a panic.
+    let mut response: Response<Body> = Response::new(Body::from(String::from(message)));
+    *response.status_mut() = status;
+    return response;
 }
 
 #[tracing::instrument(skip_all, fields(
@@ -189,11 +191,9 @@ pub async fn proxy_handler(
         .unwrap_or_else(|| IpAddr::from([127, 0, 0, 1]));
 
     if state.shutdown.is_cancelled() {
-        return Response::builder()
-            .status(StatusCode::SERVICE_UNAVAILABLE)
-            .header("Retry-After", "5")
-            .body(Body::from("server is shutting down"))
-            .expect("failed to build response");
+        let mut response: Response<Body> = error_response(StatusCode::SERVICE_UNAVAILABLE, "server is shutting down");
+        response.headers_mut().insert("Retry-After", HeaderValue::from_static(SHUTDOWN_RETRY_AFTER_SECS));
+        return response;
     }
 
     state.metrics.track_connection(1);
@@ -382,7 +382,14 @@ pub async fn proxy_handler(
 
         let retry_req: Request<Body> = match &body_bytes {
             Some(bytes) => Request::from_parts(parts.clone(), Body::from(bytes.clone())),
-            None => Request::from_parts(parts.clone(), Body::from(streaming_body.take().expect("streaming body consumed"))),
+            None => match streaming_body.take() {
+                Some(body) => Request::from_parts(parts.clone(), body),
+                None => {
+                    // A streaming body can only be sent once; without a buffered copy we cannot retry.
+                    warn!(backend = backend.id.as_str(), attempt, "streaming body already consumed; cannot retry");
+                    break;
+                }
+            },
         };
 
         match forward_request(retry_req, &backend, &state, remaining).await {
@@ -538,7 +545,7 @@ fn response_is_encoded(response: &Response<Body>) -> bool {
 fn is_retryable_status(status: StatusCode) -> bool {
     return matches!(
         status.as_u16(),
-        502 | 503 | 429
+        STATUS_BAD_GATEWAY | STATUS_SERVICE_UNAVAILABLE | STATUS_TOO_MANY_REQUESTS
     );
 }
 
@@ -766,7 +773,7 @@ mod tests {
     fn test_resolve_backend_pool_success() {
         let backend = BackendConfig::new(
             "api".into(), "127.0.0.1:8080".parse().unwrap(), 1.0, TransportKind::Tcp,
-        );
+        ).unwrap();
         let rx = make_reloadable_state(&[("/api", "api")], vec![backend]);
         let result = resolve_backend_pool(&rx, "/api/test");
         assert!(result.is_ok());
@@ -780,7 +787,7 @@ mod tests {
     fn test_resolve_backend_pool_no_route() {
         let backend = BackendConfig::new(
             "api".into(), "127.0.0.1:8080".parse().unwrap(), 1.0, TransportKind::Tcp,
-        );
+        ).unwrap();
         let rx = make_reloadable_state(&[("/api", "api")], vec![backend]);
         let result = resolve_backend_pool(&rx, "/health");
         let resp = match result {
@@ -815,7 +822,7 @@ mod tests {
     fn test_select_backend_success() {
         let backend = BackendConfig::new(
             "api".into(), "127.0.0.1:8080".parse().unwrap(), 1.0, TransportKind::Tcp,
-        );
+        ).unwrap();
         let pool = BackendPool::new(vec![backend], 0.0).unwrap();
         let health = HealthState::new();
         let (_tx, health_rx) = watch::channel(health);
