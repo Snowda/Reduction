@@ -24,6 +24,7 @@ enum AclMode {
 }
 
 impl AccessControl {
+    #[must_use]
     pub fn new(allow: Vec<IpNet>, deny: Vec<IpNet>) -> Self {
         let mode: AclMode = match (allow.is_empty(), deny.is_empty()) {
             (true, true) => AclMode::Disabled,
@@ -34,7 +35,6 @@ impl AccessControl {
         return Self { allow, deny, mode };
     }
 
-    #[must_use]
     pub fn check(&self, ip: IpAddr) -> Result<()> {
         return match self.mode {
             AclMode::Disabled => Ok(()),

@@ -345,7 +345,7 @@ async fn start_services(dir: &Path, config_path: &Path) -> DemoHandles {
     // Config watcher + reload task
     let (config_tx, config_rx) = watch::channel(config.clone());
     let watcher = config::watcher::ConfigWatcher::new(
-        config_path.to_path_buf(), config_tx,
+        config_path, config_tx,
     ).unwrap();
 
     tokio::spawn({

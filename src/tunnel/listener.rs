@@ -116,7 +116,9 @@ async fn handle_tunnel_connection(
 
     info!(%backend_id, session_id = %session_id, %remote_addr, ?capabilities, "tunnel backend registered");
 
-    let (control_tx, mut control_rx) = mpsc::channel::<TunnelFrame>(config.control_channel_capacity.get() as usize);
+    let (control_tx, mut control_rx) = mpsc::channel::<TunnelFrame>(
+        usize::try_from(config.control_channel_capacity.get()).unwrap_or(usize::MAX),
+    );
 
     let session: TunnelSession = TunnelSession {
         session_id,

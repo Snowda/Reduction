@@ -13,6 +13,8 @@ use crate::health::HealthState;
 
 pub use queue::RequestQueue;
 
+// const context has no infallible u32->usize conversion; the value (256) fits trivially.
+#[allow(clippy::as_conversions)]
 pub const MAX_BACKENDS: usize = HARD_MAX_BACKENDS as usize;
 
 #[derive(Debug, Clone)]
@@ -27,7 +29,7 @@ impl BackendPool {
     }
 
     pub fn with_max(backends: Vec<BackendConfig>, jitter_factor: f64, max_backends: u32) -> Result<Self> {
-        if backends.len() > max_backends as usize {
+        if backends.len() > usize::try_from(max_backends).unwrap_or(usize::MAX) {
             return Err(ReductionError::Config(format!(
                 "backend count {} exceeds maximum {max_backends}",
                 backends.len(),

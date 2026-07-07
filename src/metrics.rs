@@ -33,7 +33,14 @@ pub struct ProxyMetrics {
     active_count: AtomicI64,
 }
 
+impl Default for ProxyMetrics {
+    fn default() -> Self {
+        return Self::new();
+    }
+}
+
 impl ProxyMetrics {
+    #[must_use]
     pub fn new() -> Self {
         let meter: Meter = global::meter("reduction");
 

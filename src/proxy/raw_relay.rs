@@ -20,7 +20,7 @@ async fn read_routing_header(stream: &mut QuicStream) -> crate::error::Result<St
     stream.read_exact(&mut len_buf).await
         .map_err(|e| ReductionError::Forward(format!("read routing header length: {e}")))?;
 
-    let len: usize = u16::from_be_bytes(len_buf) as usize;
+    let len: usize = usize::from(u16::from_be_bytes(len_buf));
     if len == 0 || len > MAX_BACKEND_ID_LEN {
         return Err(ReductionError::Forward(format!(
             "invalid backend_id length: {len}"

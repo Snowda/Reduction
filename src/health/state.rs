@@ -20,6 +20,7 @@ pub enum Availability {
 
 impl Availability {
     #[inline]
+    #[must_use]
     pub fn is_online(self) -> bool {
         return self == Availability::Online;
     }
@@ -45,7 +46,14 @@ pub struct HealthState {
     latency_threshold_ms: u32,
 }
 
+impl Default for HealthState {
+    fn default() -> Self {
+        return Self::new();
+    }
+}
+
 impl HealthState {
+    #[must_use]
     pub fn new() -> Self {
         return Self {
             entries: LruCache::new(
@@ -57,8 +65,9 @@ impl HealthState {
         };
     }
 
+    #[must_use]
     pub fn with_config(capacity: u32, staleness_ttl: Duration, latency_threshold_ms: u32) -> Self {
-        let cap: usize = (capacity as usize).min(MAX_BACKENDS).max(1);
+        let cap: usize = usize::try_from(capacity).unwrap_or(usize::MAX).clamp(1, MAX_BACKENDS);
         return Self {
             entries: LruCache::new(
                 // cap is clamped to at least 1 above; MIN is an unreachable fallback.
@@ -69,6 +78,7 @@ impl HealthState {
         };
     }
 
+    #[must_use]
     pub fn with_staleness_ttl(mut self, ttl: Duration) -> Self {
         self.staleness_ttl = ttl;
         return self;
@@ -82,6 +92,7 @@ impl HealthState {
     }
 
     #[inline]
+    #[must_use]
     pub fn is_valid(&self, backend_id: &str) -> bool {
         match self.entries.peek(backend_id) {
             None => return false,
@@ -91,6 +102,7 @@ impl HealthState {
         }
     }
 
+    #[must_use]
     pub fn weight_factor(&self, backend_id: &str) -> f64 {
         if !self.is_valid(backend_id) {
             return 1.0;
@@ -106,7 +118,7 @@ impl HealthState {
                 let load_factor: f64 = 1.0 - health.load.clamp(0.0, 1.0);
 
                 let latency_factor: f64 = if health.latency_ms > self.latency_threshold_ms {
-                    (self.latency_threshold_ms as f64) / (health.latency_ms as f64)
+                    f64::from(self.latency_threshold_ms) / f64::from(health.latency_ms)
                 } else {
                     1.0
                 };

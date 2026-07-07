@@ -24,6 +24,7 @@ pub struct QuicStream {
 }
 
 impl QuicStream {
+    #[must_use]
     pub fn new(send: SendStream, recv: RecvStream) -> Self {
         return Self { send, recv };
     }

@@ -8,6 +8,7 @@ pub struct TokenCache {
 }
 
 impl TokenCache {
+    #[must_use]
     pub fn new(ttl: Duration) -> Self {
         return Self {
             entries: DashMap::new(),
@@ -19,6 +20,7 @@ impl TokenCache {
         self.entries.insert(fingerprint, (token, Instant::now()));
     }
 
+    #[must_use]
     pub fn get(&self, fingerprint: &str) -> Option<Vec<u8>> {
         match self.entries.get(fingerprint) {
             Some(entry) => {
@@ -42,10 +44,12 @@ impl TokenCache {
         self.entries.clear();
     }
 
+    #[must_use]
     pub fn len(&self) -> usize {
         return self.entries.len();
     }
 
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         return self.entries.is_empty();
     }

@@ -44,6 +44,7 @@ pub struct ResponseCache {
 }
 
 impl ResponseCache {
+    #[must_use]
     pub fn new(config: &CacheConfig) -> Self {
         return Self {
             store: Mutex::new(LruCache::new(config.max_entries)),
@@ -54,10 +55,7 @@ impl ResponseCache {
     pub fn get(&self, method: &str, path: &str) -> Option<Response<Body>> {
         let key: CacheKey = CacheKey::new(method, path);
         let mut store = self.store.lock();
-        let entry: &CachedResponse = match store.get(&key) {
-            Some(e) => e,
-            None => return None,
-        };
+        let entry: &CachedResponse = store.get(&key)?;
 
         if entry.is_expired() {
             store.pop(&key);
@@ -116,6 +114,11 @@ impl ResponseCache {
 
     pub fn len(&self) -> usize {
         return self.store.lock().len();
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        return self.store.lock().is_empty();
     }
 }
 
