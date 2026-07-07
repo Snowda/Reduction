@@ -5,6 +5,8 @@ edition = "2024"
 rust-version = "1.96.0"
 description = "Low Bandwidth Reverse Proxy"
 license = "MIT"
+# Internal application binary — not published to a registry.
+publish = false
 
 [features]
 default = []
@@ -32,7 +34,9 @@ opentelemetry = { version = "0.32.0", features = ["trace"] }
 opentelemetry-otlp = { version = "0.32.0", features = ["trace"] }
 opentelemetry_sdk = { version = "0.32.1", features = ["trace", "rt-tokio"] }
 quinn = "0.11.9"
-rcgen = "0.14.8"
+# x509-parser feature enables rcgen::Issuer::from_ca_cert_der, used by test/example PKI helpers
+# to sign leaf certs from an in-memory CA. Reuses the x509-parser 0.18 already in the tree.
+rcgen = { version = "0.14.8", features = ["x509-parser"] }
 rustls = "0.23.40"
 serde = { version = "1.0.228", features = ["derive"] }
 tempfile = "3.27.0"
@@ -84,17 +88,24 @@ name = "tls_cache_bench"
 harness = false
 
 [lints.rust]
-unsafe_code = "forbid"
+# deny (not forbid) so a dependency's macro-generated #[allow(unsafe_code)] can compile;
+# first-party unsafe is still rejected unless explicitly allowed.
+unsafe_code = "deny"
 
 [lints.clippy]
-# Financial safety — no floats in calculations
-float_arithmetic = "deny"
+# float_arithmetic is intentionally relaxed: this is a load balancer / reverse proxy whose core
+# domain math is inherently floating-point — weighted rendezvous/jitter balancing, health load &
+# latency factors, connection-pressure ratios, OTLP sample ratios, and metric durations. This
+# mirrors how the Athene project relaxed float_arithmetic for its graphics/stats domain. Direct
+# float equality is still a real bug, so float_cmp / float_cmp_const remain deny.
+float_arithmetic = "allow"
 float_cmp = "deny"
 float_cmp_const = "deny"
 
 # No panicking in app code
 unwrap_used = "deny"
-expect_used = "warn"
+expect_used = "deny"
+panic = "deny"
 
 # Import hygiene
 wildcard_imports = "deny"
@@ -118,8 +129,13 @@ redundant_allocation = "warn"
 # Style preferences
 needless_return = "allow"       # conflicts with project explicit-return style
 must_use_candidate = "warn"
-str_to_string = "warn"
+str_to_string = "deny"
 
 # Iterator preference
 manual_filter_map = "warn"
 manual_find_map = "warn"
+
+# Disallowed types are intentionally NOT enforced here: this is a concurrent reverse proxy
+# where shared state via Arc/RwLock is the core architecture (125+ Arc, 14 RwLock uses). The
+# framework's disallowed_types deny (prefer borrowing/actors) does not fit this domain.
+disallowed_types = "allow"
