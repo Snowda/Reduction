@@ -13,7 +13,7 @@ default = []
 acme = ["dep:instant-acme", "dep:x509-parser"]
 
 [dependencies]
-arrayvec = { version = "0.7.6", features = ["serde"] }
+arrayvec = { version = "0.7.8", features = ["serde"] }
 axum = { version = "0.8.9", features = ["http2"] }
 bitcode = { version = "0.6.9", features = ["arrayvec"] }
 dashmap = "6.2.1"
@@ -33,7 +33,7 @@ parking_lot = "0.12.5"
 opentelemetry = { version = "0.32.0", features = ["trace"] }
 opentelemetry-otlp = { version = "0.32.0", features = ["trace"] }
 opentelemetry_sdk = { version = "0.32.1", features = ["trace", "rt-tokio"] }
-quinn = "0.11.9"
+quinn = "0.11.11"
 # x509-parser feature enables rcgen::Issuer::from_ca_cert_der, used by test/example PKI helpers
 # to sign leaf certs from an in-memory CA. Reuses the x509-parser 0.18 already in the tree.
 rcgen = { version = "0.14.8", features = ["x509-parser"] }
