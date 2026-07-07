@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -18,10 +18,10 @@ pub struct ConfigWatcher {
 
 impl ConfigWatcher {
     pub fn new(
-        config_path: PathBuf,
+        config_path: &Path,
         config_tx: watch::Sender<ReductionConfig>,
     ) -> Result<Self> {
-        let path_clone: PathBuf = config_path.clone();
+        let path_clone: PathBuf = config_path.to_path_buf();
         let debounce_duration: Duration = Duration::from_millis(CONFIG_RELOAD_DEBOUNCE_MS);
         let last_reload: Arc<RwLock<Instant>> =
             Arc::new(RwLock::new(Instant::now() - debounce_duration));
@@ -56,7 +56,7 @@ impl ConfigWatcher {
         .map_err(|e| crate::error::ReductionError::Config(format!("watcher init: {e}")))?;
 
         watcher
-            .watch(config_path.as_ref(), RecursiveMode::NonRecursive)
+            .watch(config_path, RecursiveMode::NonRecursive)
             .map_err(|e| crate::error::ReductionError::Config(format!("watch: {e}")))?;
 
         info!(path = %config_path.display(), "watching config file for changes");
@@ -66,7 +66,7 @@ impl ConfigWatcher {
 }
 
 fn reload_config(
-    path: &PathBuf,
+    path: &Path,
     config_tx: &watch::Sender<ReductionConfig>,
 ) -> Result<()> {
     let new_config: ReductionConfig = load_or_recover(path, |s| toml::from_str(s))?;

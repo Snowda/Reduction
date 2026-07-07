@@ -21,6 +21,7 @@ impl CacheDirectives {
         return Self::parse(header_value);
     }
 
+    #[must_use]
     pub fn parse(header: &str) -> Self {
         let mut directives: CacheDirectives = CacheDirectives::default();
 

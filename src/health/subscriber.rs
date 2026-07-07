@@ -8,6 +8,7 @@ pub struct HealthSubscriber {
 }
 
 impl HealthSubscriber {
+    #[must_use]
     pub fn new(health_tx: watch::Sender<HealthState>) -> Self {
         return Self { health_tx };
     }

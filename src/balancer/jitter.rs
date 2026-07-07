@@ -7,6 +7,7 @@ use super::MAX_BACKENDS;
 
 // Generate a deterministic jitter multiplier from a client IP.
 // Returns a value in the range [1 - factor, 1 + factor].
+#[must_use]
 pub fn ip_jitter(client_ip: IpAddr, backend_id: &str, factor: f64) -> f64 {
     let mut hasher: DefaultHasher = DefaultHasher::new();
     client_ip.hash(&mut hasher);
@@ -15,6 +16,9 @@ pub fn ip_jitter(client_ip: IpAddr, backend_id: &str, factor: f64) -> f64 {
     0xDEAD_BEEF_u64.hash(&mut hasher);
     let hash: u64 = hasher.finish();
 
+    // Hash-to-unit-interval mapping: no infallible u64->f64 exists and low-bit
+    // precision loss is irrelevant for jitter.
+    #[allow(clippy::as_conversions)]
     let normalized: f64 = (hash as f64) / (u64::MAX as f64);
 
     // Map [0, 1) to [1 - factor, 1 + factor]
@@ -22,6 +26,7 @@ pub fn ip_jitter(client_ip: IpAddr, backend_id: &str, factor: f64) -> f64 {
 }
 
 // Apply jitter to a set of base weights for a given client IP.
+#[must_use]
 pub fn apply_jitter(
     client_ip: IpAddr,
     backend_ids: &[&str],

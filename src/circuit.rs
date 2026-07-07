@@ -80,6 +80,7 @@ pub struct CircuitBreakers {
 }
 
 impl CircuitBreakers {
+    #[must_use]
     pub fn new(config: &CircuitBreakerConfig) -> Self {
         return Self {
             breakers: DashMap::new(),
@@ -188,6 +189,7 @@ impl CircuitBreakers {
         }
     }
 
+    #[must_use]
     pub fn state(&self, backend_id: &str) -> CircuitState {
         return self.breakers.get(backend_id)
             .map(|b| CircuitState::from(b.state.load(Ordering::Acquire)))

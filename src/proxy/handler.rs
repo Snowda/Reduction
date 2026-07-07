@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher, DefaultHasher};
 use std::net::IpAddr;
+use std::slice::from_ref;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -399,7 +400,7 @@ pub async fn proxy_handler(
                     state.circuit_breakers.record_failure(backend.id.as_str());
                     state.metrics.retry_attempts.add(1, &[
                         KeyValue::new("backend", backend_str.clone()),
-                        KeyValue::new("attempt", (attempt + 1) as i64),
+                        KeyValue::new("attempt", i64::from(attempt + 1)),
                         KeyValue::new("outcome", "retryable_status"),
                     ]);
                     if attempt + 1 < max_attempts {
@@ -476,7 +477,7 @@ pub async fn proxy_handler(
                 state.circuit_breakers.record_failure(backend.id.as_str());
                 state.metrics.retry_attempts.add(1, &[
                     KeyValue::new("backend", backend_str.clone()),
-                    KeyValue::new("attempt", (attempt + 1) as i64),
+                    KeyValue::new("attempt", i64::from(attempt + 1)),
                     KeyValue::new("outcome", "error"),
                 ]);
                 if attempt + 1 < max_attempts {
@@ -514,14 +515,14 @@ struct ConnPermitGuard {
 
 impl Drop for ConnPermitGuard {
     fn drop(&mut self) {
-        self.counter.add(-1, &[self.backend_kv.clone()]);
+        self.counter.add(-1, from_ref(&self.backend_kv));
     }
 }
 
 fn record_completion(state: &ProxyState, start: Instant, status: StatusCode, backend_str: &str) {
     let duration_ms: f64 = start.elapsed().as_secs_f64() * 1000.0;
     let attrs: [KeyValue; 2] = [
-        KeyValue::new("status", status.as_u16() as i64),
+        KeyValue::new("status", i64::from(status.as_u16())),
         KeyValue::new("backend", String::from(backend_str)),
     ];
     state.metrics.requests_total.add(1, &attrs);
@@ -584,8 +585,8 @@ async fn decompress_request(req: Request<Body>, max_body: u32, inline_threshold:
             error_response(StatusCode::BAD_REQUEST, "failed to read request body")
         })?;
 
-    let max_body_usize: usize = max_body as usize;
-    let decompressed: Vec<u8> = if body_bytes.len() <= inline_threshold as usize {
+    let max_body_usize: usize = usize::try_from(max_body).unwrap_or(usize::MAX);
+    let decompressed: Vec<u8> = if body_bytes.len() <= usize::try_from(inline_threshold).unwrap_or(usize::MAX) {
         compression::decompress_bounded(&body_bytes, max_body_usize)
             .map_err(|e| {
                 warn!(error = %e, "request decompression failed");
@@ -680,7 +681,7 @@ async fn forward_request(
 
     let (parts, incoming_body) = response.into_parts();
     let limited_body: Limited<Incoming> =
-        Limited::new(incoming_body, state.proxy_config.max_response_body_bytes as usize);
+        Limited::new(incoming_body, usize::try_from(state.proxy_config.max_response_body_bytes).unwrap_or(usize::MAX));
     let pooled_body: PooledBody<Limited<Incoming>> =
         PooledBody::new(limited_body, sender);
 

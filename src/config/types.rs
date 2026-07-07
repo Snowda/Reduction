@@ -190,6 +190,7 @@ pub enum ServerTlsConfig {
 }
 
 impl ServerTlsConfig {
+    #[must_use]
     pub fn ca_cert_path(&self) -> &Path {
         return match self {
             ServerTlsConfig::Manual(identity) => &identity.ca_cert_path,
@@ -198,6 +199,7 @@ impl ServerTlsConfig {
         };
     }
 
+    #[must_use]
     pub fn as_manual(&self) -> Option<&TlsIdentity> {
         return match self {
             ServerTlsConfig::Manual(identity) => Some(identity),
@@ -299,6 +301,7 @@ impl BackendConfig {
         return Ok(self);
     }
 
+    #[must_use]
     pub fn with_host(mut self, host: String) -> Self {
         self.host = host;
         return self;

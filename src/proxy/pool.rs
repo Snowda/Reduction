@@ -69,7 +69,14 @@ pub struct ConnPool {
     tunnel_registry: Option<Arc<TunnelRegistry>>,
 }
 
+impl Default for ConnPool {
+    fn default() -> Self {
+        return Self::new();
+    }
+}
+
 impl ConnPool {
+    #[must_use]
     pub fn new() -> Self {
         return Self {
             tcp_h2: DashMap::new(),
@@ -111,7 +118,7 @@ impl ConnPool {
         let sem: Arc<Semaphore> = self
             .conn_limits
             .entry(backend.id)
-            .or_insert_with(|| Arc::new(Semaphore::new(backend.max_connections as usize)))
+            .or_insert_with(|| Arc::new(Semaphore::new(usize::try_from(backend.max_connections).unwrap_or(usize::MAX))))
             .clone();
         return sem.try_acquire_owned().map_err(|_| {
             ReductionError::BackendUnavailable
@@ -119,7 +126,7 @@ impl ConnPool {
     }
 
     pub fn connection_pressure(&self, backend_id: &str, max_connections: u32) -> f64 {
-        let max: usize = max_connections as usize;
+        let max: usize = usize::try_from(max_connections).unwrap_or(usize::MAX);
         if max == 0 {
             return 1.0;
         }
@@ -129,6 +136,8 @@ impl ConnPool {
             .map(|sem| sem.available_permits())
             .unwrap_or(max);
         let in_use: usize = max.saturating_sub(available);
+        // Both operands are bounded by max_connections (u32), so exactly representable in f64.
+        #[allow(clippy::as_conversions)]
         return in_use as f64 / max as f64;
     }
 
@@ -154,7 +163,7 @@ impl ConnPool {
         let Ok(mut queue) = entry.try_lock() else {
             return;
         };
-        if queue.len() < self.max_idle_quic_per_host as usize {
+        if queue.len() < usize::try_from(self.max_idle_quic_per_host).unwrap_or(usize::MAX) {
             queue.push_back(conn);
         }
     }
@@ -168,10 +177,10 @@ impl ConnPool {
         connect_timeout: Duration,
         handshake_timeout: Duration,
     ) -> Result<HttpSender> {
-        if let Some(registry) = &self.tunnel_registry {
-            if registry.is_tunnel_backend(&backend.id) {
-                return self.acquire_tunnel(registry, backend, handshake_timeout).await;
-            }
+        if let Some(registry) = &self.tunnel_registry
+            && registry.is_tunnel_backend(&backend.id)
+        {
+            return self.acquire_tunnel(registry, backend, handshake_timeout).await;
         }
         return match backend.transport {
             TransportKind::Tcp => self.acquire_tcp(backend, tls_connector, connect_timeout, handshake_timeout).await,
@@ -324,7 +333,7 @@ impl ConnPool {
 
         self.tcp_h2
             .entry(backend.address)
-            .or_insert_with(Vec::new)
+            .or_default()
             .push(sender.clone());
 
         return Ok(HttpSender::H2(sender));
@@ -384,11 +393,11 @@ impl ConnPool {
         client_tls_config: &Arc<rustls::ClientConfig>,
         connect_timeout: Duration,
     ) -> Result<QuicStream> {
-        if let Some(registry) = &self.tunnel_registry {
-            if registry.is_tunnel_backend(&backend.id) {
-                let stream: QuicStream = registry.acquire_stream(&backend.id).await?;
-                return Ok(stream);
-            }
+        if let Some(registry) = &self.tunnel_registry
+            && registry.is_tunnel_backend(&backend.id)
+        {
+            let stream: QuicStream = registry.acquire_stream(&backend.id).await?;
+            return Ok(stream);
         }
 
         let conn: Connection = if let Some(conn) = self.take_quic(&backend.address) {
@@ -412,11 +421,11 @@ impl ConnPool {
     pub fn drain_backends(&self, addrs: &[SocketAddr]) {
         for addr in addrs {
             self.tcp_h2.remove(addr);
-            if let Some((_, mutex)) = self.quic_idle.remove(addr) {
-                if let Ok(mut queue) = mutex.try_lock() {
-                    for conn in queue.drain(..) {
-                        conn.close(0u32.into(), b"draining");
-                    }
+            if let Some((_, mutex)) = self.quic_idle.remove(addr)
+                && let Ok(mut queue) = mutex.try_lock()
+            {
+                for conn in queue.drain(..) {
+                    conn.close(0u32.into(), b"draining");
                 }
             }
         }
@@ -453,7 +462,7 @@ impl ConnPool {
                     let existing: usize = self.tcp_h2.get(&backend.address)
                         .map(|e| e.value().len())
                         .unwrap_or(0);
-                    for i in existing..self.h2_conns_per_backend as usize {
+                    for i in existing..usize::try_from(self.h2_conns_per_backend).unwrap_or(usize::MAX) {
                         match self.connect_tcp_h2(backend, tls_connector, connect_timeout, handshake_timeout).await {
                             Ok(_sender) => {
                                 debug!(backend = %backend.id, conn = i, "pre-warmed H2 connection");

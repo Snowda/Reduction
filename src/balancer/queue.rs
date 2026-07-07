@@ -9,9 +9,10 @@ pub struct RequestQueue {
 }
 
 impl RequestQueue {
+    #[must_use]
     pub fn new(max_depth: u32) -> Self {
         return Self {
-            semaphore: Semaphore::new(max_depth as usize),
+            semaphore: Semaphore::new(usize::try_from(max_depth).unwrap_or(usize::MAX)),
             max_depth,
         };
     }

@@ -20,11 +20,12 @@ pub struct Router {
 }
 
 impl Router {
+    #[must_use]
     pub fn new(route_configs: &[RouteConfig]) -> Self {
         let mut routes: Vec<Route> = route_configs
             .iter()
             .map(|rc| Route {
-                path_prefix: rc.path_prefix.clone(),
+                path_prefix: rc.path_prefix,
                 backend_id: rc.backend_id,
                 timeout_secs: rc.timeout_secs,
             })
@@ -39,16 +40,15 @@ impl Router {
     #[tracing::instrument(skip_all)]
     pub fn match_route(&self, path: &str) -> Option<RouteMatch<'_>> {
         for route in &self.routes {
-            if path.starts_with(route.path_prefix.as_str()) {
-                if path.len() == route.path_prefix.len()
+            if path.starts_with(route.path_prefix.as_str())
+                && (path.len() == route.path_prefix.len()
                     || route.path_prefix.ends_with('/')
-                    || path.as_bytes()[route.path_prefix.len()] == b'/'
-                {
-                    return Some(RouteMatch {
-                        backend_id: &route.backend_id,
-                        timeout_secs: route.timeout_secs,
-                    });
-                }
+                    || path.as_bytes()[route.path_prefix.len()] == b'/')
+            {
+                return Some(RouteMatch {
+                    backend_id: &route.backend_id,
+                    timeout_secs: route.timeout_secs,
+                });
             }
         }
         return None;

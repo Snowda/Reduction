@@ -4,13 +4,16 @@ use std::net::IpAddr;
 // Compute a rendezvous hash score for a (client_ip, backend_id) pair.
 // Higher score = preferred backend for this client.
 #[inline]
+#[must_use]
 pub fn rendezvous_score(client_ip: IpAddr, backend_id: &str, weight: f64) -> f64 {
     let mut hasher: DefaultHasher = DefaultHasher::new();
     client_ip.hash(&mut hasher);
     backend_id.hash(&mut hasher);
     let hash: u64 = hasher.finish();
 
-    // Normalize hash to [0, 1) and multiply by weight
+    // Normalize hash to [0, 1); no infallible u64->f64 exists and low-bit
+    // precision loss is irrelevant here.
+    #[allow(clippy::as_conversions)]
     let normalized: f64 = (hash as f64) / (u64::MAX as f64);
     return normalized * weight;
 }

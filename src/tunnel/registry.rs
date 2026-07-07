@@ -32,6 +32,7 @@ pub struct TunnelRegistry {
 }
 
 impl TunnelRegistry {
+    #[must_use]
     pub fn new(max_sessions_per_backend: u32) -> Self {
         return Self {
             sessions: DashMap::new(),
@@ -45,7 +46,7 @@ impl TunnelRegistry {
         let session_id: SessionId = session.session_id;
 
         let mut entry = self.sessions.entry(backend_id).or_default();
-        if entry.len() >= self.max_sessions_per_backend as usize {
+        if entry.len() >= usize::try_from(self.max_sessions_per_backend).unwrap_or(usize::MAX) {
             return Err(ReductionError::Tunnel(format!(
                 "max sessions ({}) reached for backend {}",
                 self.max_sessions_per_backend, backend_id,

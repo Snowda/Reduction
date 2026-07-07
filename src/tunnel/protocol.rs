@@ -18,6 +18,7 @@ pub const SESSION_ID_LEN: usize = 21;
 pub struct SessionId(pub [u8; SESSION_ID_LEN]);
 
 impl SessionId {
+    #[must_use]
     pub fn generate(remote_addr: &SocketAddr, backend_id: &str) -> Self {
         let mut hasher: DefaultHasher = DefaultHasher::new();
         remote_addr.hash(&mut hasher);
@@ -36,6 +37,7 @@ impl SessionId {
         return Self(buf);
     }
 
+    #[must_use]
     pub fn as_str(&self) -> &str {
         // Session IDs are always ASCII hex, so this is infallible in practice
         return std::str::from_utf8(&self.0).unwrap_or("sess-????????????????");
@@ -80,7 +82,7 @@ pub fn encode(frame: &TunnelFrame) -> Result<Vec<u8>> {
     let payload: Vec<u8> = bitcode::encode(frame);
     let len: u32 = u32::try_from(payload.len())
         .map_err(|_| ReductionError::Tunnel(format!("frame payload too large: {} bytes", payload.len())))?;
-    if (len as usize) > MAX_FRAME_SIZE {
+    if payload.len() > MAX_FRAME_SIZE {
         return Err(ReductionError::Tunnel(format!(
             "frame too large: {} bytes",
             len
@@ -105,7 +107,8 @@ pub fn decode(buf: &[u8]) -> Result<TunnelFrame> {
         return Err(ReductionError::Tunnel("frame too short for length prefix".into()));
     }
     let len: u32 = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
-    let expected_total: usize = LENGTH_PREFIX_SIZE + len as usize;
+    let len_usize: usize = usize::try_from(len).unwrap_or(usize::MAX);
+    let expected_total: usize = LENGTH_PREFIX_SIZE.saturating_add(len_usize);
     if buf.len() < expected_total {
         return Err(ReductionError::Tunnel(format!(
             "frame truncated: expected {} bytes, got {}",
@@ -113,7 +116,7 @@ pub fn decode(buf: &[u8]) -> Result<TunnelFrame> {
             buf.len()
         )));
     }
-    if len as usize > MAX_FRAME_SIZE {
+    if len_usize > MAX_FRAME_SIZE {
         return Err(ReductionError::Tunnel(format!(
             "frame too large: {} bytes",
             len
@@ -129,11 +132,12 @@ pub async fn read_frame<R: tokio::io::AsyncReadExt + Unpin>(reader: &mut R) -> R
         .map_err(|e| ReductionError::Tunnel(format!("read length: {e}")))?;
 
     let len: u32 = u32::from_be_bytes(len_buf);
-    if len as usize > MAX_FRAME_SIZE {
+    let len_usize: usize = usize::try_from(len).unwrap_or(usize::MAX);
+    if len_usize > MAX_FRAME_SIZE {
         return Err(ReductionError::Tunnel(format!("frame too large: {} bytes", len)));
     }
 
-    let mut payload: Vec<u8> = vec![0u8; len as usize];
+    let mut payload: Vec<u8> = vec![0u8; len_usize];
     reader.read_exact(&mut payload).await
         .map_err(|e| ReductionError::Tunnel(format!("read payload: {e}")))?;
 
@@ -147,7 +151,7 @@ pub async fn write_frame<W: tokio::io::AsyncWriteExt + Unpin>(
     let payload: Vec<u8> = bitcode::encode(frame);
     let len: u32 = u32::try_from(payload.len())
         .map_err(|_| ReductionError::Tunnel(format!("frame payload too large: {} bytes", payload.len())))?;
-    if (len as usize) > MAX_FRAME_SIZE {
+    if payload.len() > MAX_FRAME_SIZE {
         return Err(ReductionError::Tunnel(format!("frame too large: {} bytes", len)));
     }
     writer.write_all(&len.to_be_bytes()).await

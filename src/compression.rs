@@ -61,7 +61,7 @@ pub fn decompress_bounded(data: &[u8], max_bytes: usize) -> Result<Vec<u8>> {
     let decoder: zstd::Decoder<'static, BufReader<&[u8]>> = zstd::Decoder::new(data)
         .map_err(|e| ReductionError::Transport(format!("zstd init: {e}")))?;
     let mut limited: Take<zstd::Decoder<'static, BufReader<&[u8]>>> =
-        decoder.take((max_bytes + 1) as u64);
+        decoder.take(u64::try_from(max_bytes + 1).unwrap_or(u64::MAX));
     let mut output: Vec<u8> = Vec::new();
     limited
         .read_to_end(&mut output)

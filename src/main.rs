@@ -150,7 +150,7 @@ async fn run(config_path: PathBuf, config: ReductionConfig) -> Result<()> {
         watch::channel(config.clone());
 
     let _config_watcher: config::watcher::ConfigWatcher =
-        config::watcher::ConfigWatcher::new(config_path, config_tx)?;
+        config::watcher::ConfigWatcher::new(&config_path, config_tx)?;
 
     let (client_tls_config, client_cert_resolver) = tls::build_client_config(
         &config.tls.client.cert_path,
@@ -316,7 +316,9 @@ async fn run(config_path: PathBuf, config: ReductionConfig) -> Result<()> {
 
     let app = axum::Router::new()
         .fallback(any(proxy_handler))
-        .layer(axum::extract::DefaultBodyLimit::max(config.proxy.max_response_body_bytes as usize))
+        .layer(axum::extract::DefaultBodyLimit::max(
+            usize::try_from(config.proxy.max_response_body_bytes).unwrap_or(usize::MAX),
+        ))
         .with_state(proxy_state)
         .into_make_service_with_connect_info::<transport::ConnectAddr>();
 
@@ -340,7 +342,7 @@ async fn run(config_path: PathBuf, config: ReductionConfig) -> Result<()> {
                     config.listen.address,
                     quic_config,
                     shutdown_token.clone(),
-                    config.proxy.quic_channel_capacity.get() as usize,
+                    usize::try_from(config.proxy.quic_channel_capacity.get()).unwrap_or(usize::MAX),
                 )?;
 
             if let Some(raw_rx) = listener.take_raw_stream_receiver() {
