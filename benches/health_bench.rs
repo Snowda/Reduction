@@ -1,3 +1,8 @@
+// Benchmark harness code is exempt from the production lint gate the same way #[cfg(test)]
+// modules are (the gate lints only --lib --bins). unwrap/expect on synthetic fixtures is fine here.
+#![allow(clippy::unwrap_used)]
+#![allow(clippy::expect_used)]
+
 use arrayvec::ArrayString;
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 
