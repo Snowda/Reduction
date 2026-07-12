@@ -139,3 +139,12 @@ manual_find_map = "warn"
 # where shared state via Arc/RwLock is the core architecture (125+ Arc, 14 RwLock uses). The
 # framework's disallowed_types deny (prefer borrowing/actors) does not fit this domain.
 disallowed_types = "allow"
+
+[profile.coverage]
+inherits = "dev"
+opt-level = 0
+debug = false
+
+[profile.coverage.package."*"]
+opt-level = 0
+debug = false
