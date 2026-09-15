@@ -18,6 +18,7 @@ allow = [
     "Apache-2.0 WITH LLVM-exception",
     "BSD-2-Clause",
     "BSD-3-Clause",
+    "BSL-1.0",
     "ISC",
     "Unicode-3.0",
     "Unicode-DFS-2016",
@@ -26,13 +27,17 @@ allow = [
     "CC0-1.0",
     # Mozilla CA root-store data bundled by webpki-root-certs / ring (permissive data license).
     "CDLA-Permissive-2.0",
+    "0BSD",
+    "Unlicense",
+    "NCSA",
+    "MIT-0",
 ]
 confidence-threshold = 0.8
 # Don't apply license policy to our own (workspace / unpublished) crates.
 private = { ignore = true }
 
 [bans]
-# Report, but don't fail, on duplicate versions.
+# Duplicate versions of the same crate warn rather than fail the build.
 multiple-versions = "warn"
 # Wildcard version requirements (e.g. `tokio = "*"`) are forbidden — pin to a major.
 wildcards = "deny"
@@ -41,9 +46,10 @@ deny = [
     { name = "openssl" },
     { name = "openssl-sys" },
 ]
+allow-wildcard-paths = true
 
 [sources]
 # These projects pull internal crates over private git, so don't fail on unknown
 # git sources; still flag unexpected alternate registries.
 unknown-registry = "warn"
-unknown-git = "allow"
+unknown-git = "warn"
