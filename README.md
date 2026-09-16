@@ -9,7 +9,7 @@ Most reverse proxies are built for the browser era: HTTP semantics, cookie handl
 - **Single binary, single TOML file.** No YAML sprawl, no control plane, no sidecar.
 - **QUIC-native.** QUIC by default, TCP as fallback.
 - **NAT traversal built in.** Backends behind NATs register via reverse QUIC tunnels — no VPNs, no port forwarding.
-- **Zero-alloc hot paths.** Stack-allocated IDs, no heap churn on the request path.
+- **Stack-allocated IDs.** Peer and backend identifiers use fixed-capacity inline storage (`ArrayString`) instead of heap-allocated strings.
 - **Rust-to-Rust.** If your services are in Rust, Reduction speaks your language end to end.
 
 ### Non-goals
@@ -75,9 +75,9 @@ Clients (Rust services / AI agents)
    ▼         ▼
   ┌─────────────────┐
   │  Backend Pool   │
-  │  (rendezvous    │
-  │   hashing +     │
-  │   jitter)       │
+  │  (weighted      │
+  │   rendezvous    │
+  │   hashing)      │
   └────────┬────────┘
            │
      ┌─────┼─────┐
@@ -88,7 +88,7 @@ Clients (Rust services / AI agents)
 
 ### Load balancing
 
-**Rendezvous hashing** assigns clients to backends deterministically with stable affinity and minimal disruption when backends change. **IP-seeded jitter** prevents thundering-herd scenarios, and per-backend **backpressure** steers traffic away from overloaded backends.
+**Weighted rendezvous hashing** assigns clients to backends deterministically — stable affinity, minimal disruption when backends change, and selection in proportion to configured backend weights. Per-backend **backpressure** steers traffic away from overloaded backends.
 
 Backend health data factors into weight calculations with configurable latency thresholds and staleness TTL. If the control plane is unreachable, the proxy falls back to local-only decisions.
 
@@ -100,7 +100,7 @@ OpenTelemetry metrics (OTLP export) cover requests, latency, connections, queue 
 
 ### Prerequisites
 
-- **Rust 2024 edition** (1.85+)
+- **Rust 2024 edition** (1.96+)
 - TLS certificates (CA cert, server cert + key, client cert + key)
 
 ### Build
@@ -151,7 +151,7 @@ A minimal configuration:
 address = "0.0.0.0:8443"
 transport = "quic"        # or "tcp"
 
-[tls.server]
+[tls.server.manual]
 cert_path = "certs/server.crt"
 key_path = "certs/server.key"
 ca_cert_path = "certs/ca.crt"
@@ -234,11 +234,10 @@ cargo bench
 | Benchmark | Target |
 |---|---|
 | `router_bench` | Path-prefix matching throughput |
-| `balancer_bench` | Rendezvous hashing + jitter selection |
+| `balancer_bench` | Weighted rendezvous hashing selection |
 | `compression_bench` | Zstd compress/decompress at various levels |
 | `ratelimit_bench` | Per-IP token-bucket throughput |
 | `health_bench` | Health weight factor calculations |
-| `tls_cache_bench` | Certificate resolver cache performance |
 
 ## Configuration reference
 
