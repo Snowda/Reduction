@@ -271,23 +271,38 @@ async fn run_tunnel_listener_inner(
 	return Ok(());
 }
 
-// Every owned dependency for one tunnel connection task, bundled so the registration pipeline threads a
-// single value instead of eight positional arguments.
-#[allow(clippy::too_many_arguments, clippy::cognitive_complexity)]
+// The immutable per-session context for one control loop: everything the loop reads but never mutates,
+// bundled so the registration pipeline threads a single value instead of a long positional argument list.
+pub struct ControlLoopContext<'a> {
+	pub connection: &'a quinn::Connection,
+	pub registry: &'a Arc<TunnelRegistry>,
+	pub shutdown: &'a CancellationToken,
+	pub metrics: &'a ProxyMetrics,
+	pub backend_id: &'a str,
+	pub session_id: SessionId,
+	pub heartbeat_timeout: Duration,
+	pub is_control_peer: bool,
+	// F4: where a control peer's Health frames are applied. None = health transport off (Phase 1).
+	pub health_tx: Option<watch::Sender<HealthState>>,
+}
+
+#[allow(clippy::cognitive_complexity)]
 pub async fn run_control_loop(
 	control_stream: &mut QuicStream,
 	control_rx: &mut mpsc::Receiver<TunnelFrame>,
-	connection: &quinn::Connection,
-	registry: &Arc<TunnelRegistry>,
-	shutdown: &CancellationToken,
-	metrics: &ProxyMetrics,
-	session_id: SessionId,
-	backend_id: &str,
-	heartbeat_timeout: Duration,
-	heartbeat_timeout_secs: u64,
-	is_control_peer: bool,
-	health_tx: Option<watch::Sender<HealthState>>,
+	ctx: ControlLoopContext<'_>,
 ) {
+	let ControlLoopContext {
+		connection,
+		registry,
+		shutdown,
+		metrics,
+		backend_id,
+		session_id,
+		heartbeat_timeout,
+		is_control_peer,
+		health_tx,
+	} = ctx;
 	let mut last_heartbeat: TokioInstant = TokioInstant::now();
 
 	loop {
@@ -342,7 +357,7 @@ pub async fn run_control_loop(
 					}
 					Err(_) => {
 						metrics.tunnel_heartbeat_timeouts.add(1, &[]);
-						warn!(%session_id, timeout_secs = heartbeat_timeout_secs, "heartbeat timeout");
+						warn!(%session_id, timeout_secs = heartbeat_timeout.as_secs(), "heartbeat timeout");
 						break;
 					}
 				}

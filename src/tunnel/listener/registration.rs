@@ -1,5 +1,5 @@
 use super::{
-	ArrayString, ArrayVec, Arc, CONTROL_WRITE_TIMEOUT, CancellationToken, Duration, Instant, KeyValue,
+	ArrayString, ArrayVec, Arc, CONTROL_WRITE_TIMEOUT, CancellationToken, ControlLoopContext, Duration, Instant, KeyValue,
 	OwnedSemaphorePermit, PeerIdentity, ProxyMetrics, QuicStream, REJECT_REASON_ALLOWLIST, REJECT_REASON_BACKEND_CAP,
 	REJECT_REASON_CN_MISMATCH, REJECT_REASON_GLOBAL_CAP, REJECT_REASON_KEY, REJECT_REASON_REVOKED, REJECT_REASON_VERSION,
 	HealthState, ReductionError, Result, RevocationSet, SessionId, SocketAddr, TunnelConfig, TunnelFrame,
@@ -77,16 +77,17 @@ pub async fn handle_tunnel_connection(conn: TunnelConn) -> Result<()> {
 	run_control_loop(
 		&mut control_stream,
 		&mut control_rx,
-		&connection,
-		&registry,
-		&shutdown,
-		&metrics,
-		session_id,
-		&backend_id,
-		heartbeat_timeout,
-		config.heartbeat_timeout_secs,
-		is_control_peer,
-		health_tx,
+		ControlLoopContext {
+			connection: &connection,
+			registry: &registry,
+			shutdown: &shutdown,
+			metrics: &metrics,
+			backend_id: &backend_id,
+			session_id,
+			heartbeat_timeout,
+			is_control_peer,
+			health_tx,
+		},
 	)
 	.await;
 
