@@ -44,6 +44,17 @@ impl BackendScheme {
 	}
 }
 
+impl BackendConfig {
+	// Whether dialing this backend performs a TLS handshake to the upstream and so needs the [tls.client]
+	// identity: any QUIC backend (QUIC mandates TLS 1.3 + mTLS) or any https-scheme backend. A tcp + http
+	// backend is cleartext HTTP/1.1 and needs no client identity.
+	#[must_use]
+	#[inline]
+	pub const fn needs_client_tls(&self) -> bool {
+		return matches!(self.transport, TransportKind::Quic) || !self.scheme.is_plaintext();
+	}
+}
+
 // serde skip: a default `Https` scheme is omitted so existing config output is byte-unchanged.
 const fn is_https_scheme(scheme: &BackendScheme) -> bool {
 	return matches!(scheme, BackendScheme::Https);
