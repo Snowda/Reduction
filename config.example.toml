@@ -1,22 +1,63 @@
 [listen]
 address = "0.0.0.0:8443"
 transport = "quic"
+# Inbound client-certificate policy for the public listener (optional; default "required").
+#   required  – mandatory mTLS: a client presenting no cert is rejected at the TLS handshake AND at
+#               the application admission gate. The historical, secure default.
+#   optional  – a client cert is requested and (if presented) verified against tls.server CA, but a
+#               client presenting none is still admitted (anonymous).
+#   disabled  – public-browser mode: no client cert is requested and none is required, so anonymous
+#               browsers connect. tls.server's ca_cert_path is then unused for inbound verification.
+# Never inferred from ACME mode — an ACME server can still be mandatory-mTLS. See docs/configuration.md.
+# client_auth = "required"
 
-[tls.server]
+[tls.server.manual]
 cert_path = "certs/server.crt"
 key_path = "certs/server.key"
 ca_cert_path = "certs/ca.crt"
+# crl_path = "certs/revoked.crl.pem"  # optional CA-signed X.509 CRL enforced at the mTLS handshake
+                                      # (server only, hot-watched); rejects revoked client certs before
+                                      # any tunnel/request. See docs/configuration.md.
 
+# Public-browser / blog deployment (no mTLS material needed): use ACME for the server cert and omit both
+# [tls.client] and the ACME ca_cert_path. The whole minimal config is then:
+#   [listen]            address + transport = "tcp" + client_auth = "disabled"
+#   [tls.server.acme]   domains + acme_email + barrel_state   (NO ca_cert_path — unused under "disabled")
+#   [[backends]]        one backend, transport = "tcp", scheme = "http"
+#   [[routes]]          one route
+# Under ACME, ca_cert_path is the INBOUND client-cert CA and is required only for client_auth
+# "required"/"optional"; under "disabled" it is unused and must be omitted. See docs/configuration.md.
+#
+# Backend-facing mTLS identity, used to dial https/quic backends. OPTIONAL: required only when at least
+# one backend performs a TLS handshake upstream — any backend with transport = "quic" (always mTLS) or
+# scheme = "https". A pure plaintext-backend deployment (every backend transport = "tcp" + scheme = "http",
+# e.g. a public blog) dials no TLS upstream and may omit this whole section. Startup rejects a config that
+# omits it while a backend still needs it, naming the offending backend; an unused [tls.client] is warned.
 [tls.client]
 cert_path = "certs/client.crt"
 key_path = "certs/client.key"
 ca_cert_path = "certs/ca.crt"
 
+# Optional cleartext port-80 listener that permanently redirects (308) to the canonical HTTPS origin.
+# It never proxies content — it only sends a browser typing http:// to https://. Disabled by default.
+# [http_redirect]
+# enabled = true
+# listen = "0.0.0.0:80"          # cleartext bind (default 0.0.0.0:80); needs its own port, not [listen]'s
+# to_host = "conorforde.com"     # canonical HTTPS host to redirect to; path and query are preserved
+
+# Optional non-public liveness/readiness endpoint (plain HTTP): GET /livez (always 200 while the process
+# is up) and GET /readyz (200 once ready, 503 while starting or draining). Bind it to a private address —
+# it serves no proxy traffic. Disabled by default.
+# [health_endpoint]
+# enabled = true
+# listen = "127.0.0.1:9090"      # loopback/management bind; needs its own port
+
 # Global timeout defaults (all values in seconds, all optional)
 [timeouts]
 connect_secs = 5
 handshake_secs = 5
-request_secs = 30
+request_secs = 30              # bounds time-to-response-headers only
+response_idle_secs = 60        # max gap between response-body frames before a stalled stream is aborted
 
 # Proxy tuning (all optional, shown with defaults)
 [proxy]
@@ -30,13 +71,14 @@ quic_channel_capacity = 256          # bounded channel size for QUIC stream acce
 
 # Compression settings (all optional, shown with defaults)
 [compression]
+# enabled = true                     # zstd response transform (default true); set false for a public
+#                                    # cutover that must pass backend bodies through untransformed
 level = 3                            # zstd level (1-22)
 min_bytes = 256                      # skip compression below this size
 
 # Load balancer settings (all optional, shown with defaults)
 [balancer]
 queue_depth = 1000                   # max queued requests per backend
-jitter_factor = 0.05                 # weight jitter 0.0–1.0
 drain_timeout_secs = 30              # time to drain connections on backend removal
 max_backends = 64                    # max backends per pool (hard limit: 256)
 
@@ -63,8 +105,9 @@ max_delay_ms = 2000                  # backoff cap
 jitter_ms = 100                      # random jitter added to each delay
 
 # Response cache (all optional, shown with defaults)
-# Caches GET/HEAD responses keyed on method + path. Respects Cache-Control
-# directives: no-store and private skip caching, max-age sets TTL.
+# Caches GET/HEAD responses keyed on method + path + client identity (the connection's mTLS SPKI
+# fingerprint), so a response cached for one device is never served to another. Respects Cache-Control
+# directives: no-store and private skip caching, max-age sets TTL. See docs/configuration.md.
 [cache]
 # enabled = false                     # opt-in; no caching by default
 # max_entries = 1000                  # LRU capacity
@@ -75,10 +118,58 @@ jitter_ms = 100                      # random jitter added to each delay
 [health]
 staleness_ttl_secs = 300             # health data older than this is ignored
 
+# Metrics export (optional). Metrics are always collected in-process; this only controls OTLP export.
+[metrics]
+# otlp_endpoint = "http://localhost:4318"  # OTLP HTTP endpoint for metric export (distinct from tracing)
+
 # Distributed tracing (optional)
 [tracing]
 # otlp_endpoint = "http://localhost:4318"  # OTLP HTTP endpoint for trace export
 # sample_ratio = 1.0                       # 1.0 = sample all, 0.1 = 10%
+
+# Reverse tunnels: let NAT'd backends dial the proxy over QUIC+mTLS and register a backend_id.
+# Disabled by default; all fields optional (shown with defaults). See docs/configuration.md.
+[tunnel]
+# enabled = false
+# listen_address = "0.0.0.0:8444"          # QUIC listen address for backend registration
+# heartbeat_timeout_secs = 45              # drop a session after this long without a heartbeat
+# max_sessions_per_backend = 8             # hard cap on concurrent sessions for one backend_id
+# max_total_sessions = 512                 # global cap across all backends (accept backpressure); unset = unlimited
+# registration_timeout_secs = 10
+# control_channel_capacity = 16
+# allowed_backend_ids = ["edge-1", "edge-2"]  # optional kill-switch; empty = any CA-trusted, CN-bound device
+# revocation_path = "certs/revoked.toml"   # hot-watched denylist (SPKI or backend_id) — enumerate only the bad
+
+# Raw QUIC relay per-device authorization. Raw relays are denied by default: add one entry for every
+# backend that should accept a raw byte relay, listing the permitted device CNs or key SPKIs. The opaque
+# relay cannot forward identity to the backend, so this is where "who may reach this backend over a raw
+# stream" is decided. Entries are validated at startup. See docs/configuration.md.
+# [[raw_relay_authz]]
+# backend_id = "api-primary"                 # the routing-header backend id a raw client names
+# allowed_cns = ["device-1", "device-2"]     # device certificate CNs permitted to raw-relay here
+# allowed_spkis = []                          # OR device key SPKI sha256 hashes (64 hex chars each)
+
+# Datagram/stream ingress: a plaintext UDP (or TCP, Phase 3) listener on the site-internal network
+# that wraps received traffic in an envelope preserving the original peer address, batches it, and
+# ships it over one QUIC+mTLS raw stream to a backend that understands the envelope (transport =
+# quic). Reduction never inspects the payload beyond its length. Presence of any [[ingress]] enables
+# the mode. A non-private listen address requires an [access] allow list. See PLAN_INGRESS.md.
+# [[ingress]]
+# id = "site-dublin-udp"          # required (Phase 1)
+# protocol = "udp"                # "udp" (datagram batching) or "tcp" (one QUIC stream per connection)
+# listen = "10.20.0.1:5000"       # plaintext, site-internal only
+# workers = 0                     # 0 = num_cpus via SO_REUSEPORT (Linux); a single worker elsewhere
+# recv_buffer_bytes = 8388608     # SO_RCVBUF hint (best-effort; the OS may clamp)
+# max_datagram_bytes = 8192       # a larger datagram is a counted "oversize" drop, never truncated
+# backend_ids = ["ingest-a", "ingest-b"]   # must all be transport = quic backends
+# batch_max_datagrams = 512       # flush a batch at this many datagrams
+# batch_max_bytes = 61440         # flush at this many payload bytes (under the 64 KiB frame ceiling)
+# linger_ms = 20                  # flush a partial batch after this long
+# queue_depth_per_backend = 4096  # bounded batch queue per backend; overflow = counted drop, never growth
+#                                 # (batch_max_datagrams / batch_max_bytes / linger_ms hot-reload live;
+#                                 #  listen / backend_ids / queue_depth_per_backend / workers need a restart)
+# max_connections = 10000         # TCP ingress only: cap on concurrent relayed connections
+# idle_timeout_secs = 300         # TCP ingress only: tear down a connection after this long idle
 
 [[backends]]
 id = "api-primary"
@@ -86,6 +177,10 @@ host = "api.internal"
 address = "10.0.0.1:8080"
 weight = 3.0
 transport = "quic"
+# scheme = "https"                 # backend hop security (optional, default "https"):
+#                                  #   https – TLS (+ HTTP/2), verified against tls.client CA (the default)
+#                                  #   http  – cleartext HTTP/1.1, no TLS (tcp transport only; e.g. a
+#                                  #           static-site backend on a trusted private network)
 max_connections = 100              # optional, defaults to 256
 
 [[backends]]
