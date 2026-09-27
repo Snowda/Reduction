@@ -1,0 +1,102 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+    # Include the workflow directory so edits to CI itself are validated by CI.
+    paths: [ '**.rs', '**/Cargo.toml', '**/Cargo.lock', '.github/workflows/**' ]
+  pull_request:
+    branches: [ main ]
+    paths: [ '**.rs', '**/Cargo.toml', '**/Cargo.lock', '.github/workflows/**' ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Enforce the strict lint + format policy the repo declares (Cargo.toml [lints] + rustfmt.toml).
+  # rustfmt.toml enables nightly-only options (imports_granularity/group_imports), so the format
+  # check must run under nightly; clippy runs on stable with -D warnings promoting every lint to an
+  # error. Kept a separate job so a style regression fails fast and independently of the build.
+  lint:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v6
+    - name: Install nightly rustfmt
+      run: rustup toolchain install nightly --profile minimal --component rustfmt
+    - name: Ensure clippy is available
+      run: rustup component add clippy
+    - name: Format check
+      run: cargo +nightly fmt --all -- --check
+    - name: Cache Rust dependencies
+      uses: Swatinem/rust-cache@v2
+    - name: Clippy (all targets, all features)
+      run: cargo clippy --all-targets --all-features -- -D warnings
+    - name: Clippy (lean client)
+      run: cargo clippy --no-default-features -- -D warnings
+
+  # Build + test on every platform the project is developed and deployed on. Windows is included
+  # because the code is developed there; a Windows-only regression would otherwise ship unseen.
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+    - uses: actions/checkout@v6
+    - name: Cache Rust dependencies
+      uses: Swatinem/rust-cache@v2
+    - name: Build
+      run: cargo build --verbose
+    - name: Run tests
+      run: cargo test --verbose
+    # The acme module (src/tls/acme.rs) is feature-gated, so plain `cargo test` never compiles its
+    # unit tests. Run the library unit tests with the acme feature so that code is actually exercised.
+    # (The end-to-end acme_pebble_tests integration target needs Docker and runs in acme-integration.)
+    - name: Run acme unit tests
+      run: cargo test --features acme --lib --verbose
+    # retry_tests.rs is gated behind the integration_tests feature, so plain `cargo test` compiles
+    # it to zero tests. Run it explicitly so the end-to-end retry/cache/identity path is actually
+    # exercised in CI.
+    - name: Run retry integration tests
+      run: cargo test --features integration_tests --test retry_tests --verbose
+    # The lean client build (no proxy machinery) must keep compiling — fleet-device
+    # consumers depend on it with default-features = false.
+    - name: Check lean client build
+      run: cargo check --no-default-features
+    - name: Run lean client tests
+      run: cargo test --no-default-features
+
+  # Line/region coverage. Reported (not gated) so a coverage dip is visible in the job log without
+  # turning every PR red; add `--fail-under-lines 80` here to enforce the repo's 80%/file floor.
+  coverage:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v6
+    - name: Cache Rust dependencies
+      uses: Swatinem/rust-cache@v2
+    - name: Install cargo-llvm-cov
+      uses: taiki-e/install-action@cargo-llvm-cov
+    # Include the acme feature so the feature-gated module counts toward coverage rather than
+    # showing as dead uncovered lines.
+    - name: Coverage (library unit tests)
+      run: cargo llvm-cov --features acme --lib --summary-only
+
+  # End-to-end ACME provisioning against a Dockerized pebble ACME server. Isolated from `build`
+  # because it is slower and depends on the Docker daemon; the test is self-contained (it starts
+  # pebble + mock DNS via testcontainers), so the runner only needs Docker, which ubuntu-latest has.
+  acme-integration:
+    runs-on: ubuntu-latest
+    # Safety net: image pulls plus the ACME dance should finish well inside this; a hung validation
+    # trips the test's own 90s provisioning timeout first.
+    timeout-minutes: 20
+
+    steps:
+    - uses: actions/checkout@v6
+    - name: Cache Rust dependencies
+      uses: Swatinem/rust-cache@v2
+    - name: Run ACME pebble integration test
+      run: cargo test --features integration_tests,acme --test acme_pebble_tests --verbose -- --nocapture

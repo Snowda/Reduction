@@ -1,0 +1,12 @@
+# Keep the build context small and reproducible.
+# examples/, benches/, and tests/ are kept: Cargo.toml declares them as explicit
+# targets and cargo hard-errors on their absence even when building only the bin.
+target/
+.git/
+.gitignore
+*.md
+docs/
+certs/
+.release_gate.toml
+Containerfile
+.containerignore

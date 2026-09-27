@@ -1,680 +1,713 @@
+use std::collections::HashSet;
 use std::net::SocketAddr;
-use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
-use std::path::{Path, PathBuf};
 
 use arrayvec::ArrayString;
-use ipnet::IpNet;
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 use crate::error::{ReductionError, Result};
+use crate::ingress::protocol::MAX_ENVELOPE_FRAME;
+use crate::tls::identity::MAX_COMMON_NAME_LEN;
 
-// Const NonZero constructors. `MIN.saturating_add(value - 1)` builds the value without the
-// banned unwrap()/expect()/panic that `NonZeroX::new(value).unwrap()` would require: MIN is 1,
-// so saturating_add(value - 1) yields `value`. Inputs are compile-time literals >= 1; passing 0
-// underflows `value - 1` into a const-eval error, which correctly rejects a zero default.
-const fn nonzero_u32(value: u32) -> NonZeroU32 {
-    return NonZeroU32::MIN.saturating_add(value - 1);
-}
+// Config types live in submodules; re-exported so `crate::config::X` stays stable.
+mod backend;
+mod ingress;
+mod listener;
+mod sections;
+mod tls_config;
 
-const fn nonzero_u64(value: u64) -> NonZeroU64 {
-    return NonZeroU64::MIN.saturating_add(value - 1);
-}
+pub use listener::{
+	ClientAuthPolicy, DEFAULT_HEALTH_ENDPOINT_LISTEN, DEFAULT_HTTP_REDIRECT_LISTEN, HealthEndpointConfig,
+	HttpRedirectConfig, ListenConfig,
+};
+// Per-section config blocks and their default consts; glob re-export keeps every path stable.
+pub use sections::*;
 
-const fn nonzero_usize(value: usize) -> NonZeroUsize {
-    return NonZeroUsize::MIN.saturating_add(value - 1);
-}
+use ingress::is_private_listen_addr;
+pub use ingress::{
+	DEFAULT_BATCH_MAX_BYTES, DEFAULT_BATCH_MAX_DATAGRAMS, DEFAULT_INGRESS_WORKERS, DEFAULT_LINGER_MS,
+	DEFAULT_MAX_DATAGRAM_BYTES, DEFAULT_QUEUE_DEPTH_PER_BACKEND, DEFAULT_RECV_BUFFER_BYTES, IngressConfig,
+	IngressProtocol, MAX_UDP_DATAGRAM_BYTES,
+};
+pub use backend::{BackendConfig, BackendScheme, DEFAULT_MAX_CONNECTIONS, RouteConfig};
+#[cfg(feature = "acme")]
+pub use tls_config::{AcmeTlsConfig, BarrelStateConfig, DEFAULT_ACME_STATE_ENV};
+pub use tls_config::{ServerTlsConfig, TlsConfig, TlsIdentity};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReductionConfig {
-    pub listen: ListenConfig,
-    pub tls: TlsConfig,
-    pub backends: Vec<BackendConfig>,
-    pub routes: Vec<RouteConfig>,
-    #[serde(default)]
-    pub balancer: BalancerConfig,
-    #[serde(default)]
-    pub proxy: ProxyConfig,
-    #[serde(default)]
-    pub compression: CompressionConfig,
-    #[serde(default)]
-    pub health: HealthConfig,
-    #[serde(default)]
-    pub access: AccessControlConfig,
-    #[serde(default)]
-    pub ratelimit: RateLimitConfig,
-    #[serde(default)]
-    pub metrics: MetricsConfig,
-    #[serde(default)]
-    pub circuit_breaker: CircuitBreakerConfig,
-    #[serde(default)]
-    pub timeouts: TimeoutConfig,
-    #[serde(default)]
-    pub retry: RetryConfig,
-    #[serde(default)]
-    pub tracing: TracingConfig,
-    #[serde(default)]
-    pub tunnel: TunnelConfig,
-    #[serde(default)]
-    pub cache: CacheConfig,
+	pub listen: ListenConfig,
+	pub tls: TlsConfig,
+	pub backends: Vec<BackendConfig>,
+	pub routes: Vec<RouteConfig>,
+	#[serde(default)]
+	pub balancer: BalancerConfig,
+	#[serde(default)]
+	pub proxy: ProxyConfig,
+	#[serde(default)]
+	pub compression: CompressionConfig,
+	#[serde(default)]
+	pub health: HealthConfig,
+	#[serde(default)]
+	pub access: AccessControlConfig,
+	#[serde(default)]
+	pub ratelimit: RateLimitConfig,
+	#[serde(default)]
+	pub metrics: MetricsConfig,
+	#[serde(default)]
+	pub circuit_breaker: CircuitBreakerConfig,
+	#[serde(default)]
+	pub timeouts: TimeoutConfig,
+	#[serde(default)]
+	pub retry: RetryConfig,
+	#[serde(default)]
+	pub tracing: TracingConfig,
+	#[serde(default)]
+	pub tunnel: TunnelConfig,
+	#[serde(default)]
+	pub cache: CacheConfig,
+	// Per-backend raw-QUIC-relay allowlist; a backend without an entry is denied (empty = fail-closed).
+	#[serde(default)]
+	pub raw_relay_authz: Vec<RawRelayAuthzEntry>,
+	// Datagram/stream ingress listeners; any entry enables ingress mode. See PLAN_INGRESS.md.
+	#[serde(default)]
+	pub ingress: Vec<IngressConfig>,
+	// Optional cleartext port-80 listener that 308-redirects to the canonical HTTPS origin. Disabled by default.
+	#[serde(default)]
+	pub http_redirect: HttpRedirectConfig,
+	// Optional non-public liveness/readiness endpoint. Disabled by default.
+	#[serde(default)]
+	pub health_endpoint: HealthEndpointConfig,
 }
 
-// ── Balancer defaults ──
+impl ReductionConfig {
+	// Cross-field invariants that per-field serde validation cannot express, run on load and every reload
+	// (a reload failure keeps the previous config in force). One method per invariant.
+	pub fn validate(&self) -> Result<()> {
+		self.validate_no_duplicate_backend_ids()?;
+		self.validate_routes()?;
+		self.validate_retry_backoff()?;
+		self.validate_ingress()?;
+		self.validate_backend_schemes()?;
+		self.validate_client_identity()?;
+		self.validate_acme_inbound_ca()?;
+		self.validate_http_redirect()?;
+		self.validate_health_endpoint()?;
+		self.validate_acme_barrel_state()?;
+		return Ok(());
+	}
 
-pub const DEFAULT_QUEUE_DEPTH: u32 = 1000;
-pub const DEFAULT_JITTER_FACTOR: f64 = 0.05;
-pub const DEFAULT_DRAIN_TIMEOUT_SECS: u64 = 30;
-pub const DEFAULT_MAX_BACKENDS: u32 = 64;
-pub const HARD_MAX_BACKENDS: u32 = 256;
+	// True when any backend handshakes upstream (quic or https), so [tls.client] must be present.
+	#[must_use]
+	pub fn needs_client_tls(&self) -> bool {
+		return self.backends.iter().any(BackendConfig::needs_client_tls);
+	}
 
-fn default_queue_depth() -> u32 { return DEFAULT_QUEUE_DEPTH; }
-fn default_jitter_factor() -> f64 { return DEFAULT_JITTER_FACTOR; }
-fn default_drain_timeout_secs() -> u64 { return DEFAULT_DRAIN_TIMEOUT_SECS; }
-fn default_max_backends() -> u32 { return DEFAULT_MAX_BACKENDS; }
+	// [tls.client] must be present exactly when a backend needs it; a missing identity is rejected at load
+	// (naming the backend), an unused one is warned but allowed.
+	fn validate_client_identity(&self) -> Result<()> {
+		if self.tls.client.is_some() {
+			if !self.needs_client_tls() {
+				warn!(
+					"[tls.client] is present but no backend needs a TLS client identity (every backend is tcp + scheme = \"http\"): the client identity is unused and can be removed",
+				);
+			}
+			return Ok(());
+		}
+		for backend in &self.backends {
+			if backend.needs_client_tls() {
+				let reason: &str = if backend.transport == TransportKind::Quic {
+					"transport = \"quic\" (QUIC always uses mTLS)"
+				} else {
+					"scheme = \"https\" (TLS to the backend)"
+				};
+				return Err(ReductionError::Config(format!(
+					"backend '{}' requires a TLS client identity ({reason}) but [tls.client] is absent: add [tls.client], or set the backend to transport = \"tcp\" with scheme = \"http\"",
+					backend.id,
+				)));
+			}
+		}
+		return Ok(());
+	}
 
-#[derive(Debug, Clone, Serialize)]
-pub struct BalancerConfig {
-    pub queue_depth: u32,
-    pub jitter_factor: f64,
-    pub drain_timeout_secs: u64,
-    pub max_backends: u32,
+	// Under ACME the inbound client-cert CA is read only when the policy builds a verifier, so it must be
+	// present for `required`/`optional` and may be omitted only under `disabled`.
+	#[cfg(feature = "acme")]
+	fn validate_acme_inbound_ca(&self) -> Result<()> {
+		if let ServerTlsConfig::Acme(acme) = &self.tls.server
+			&& self.listen.client_auth.builds_verifier()
+			&& acme.ca_cert_path.is_none()
+		{
+			return Err(ReductionError::Config(
+				"tls.server.acme.ca_cert_path is required when listen.client_auth is \"required\" or \"optional\": it is the inbound client-cert CA; omit it only under client_auth = \"disabled\"".to_owned(),
+			));
+		}
+		return Ok(());
+	}
+
+	// No ACME feature: the manual server identity always carries its inbound CA, so there is nothing to check.
+	#[cfg(not(feature = "acme"))]
+	#[allow(clippy::unused_self)]
+	const fn validate_acme_inbound_ca(&self) -> Result<()> {
+		return Ok(());
+	}
+
+	// Barrel ACME custody needs a non-empty persist_command; an empty one would lose renewed state on
+	// restart, so reject it at load rather than at the first renewal.
+	#[cfg(feature = "acme")]
+	fn validate_acme_barrel_state(&self) -> Result<()> {
+		if let ServerTlsConfig::Acme(acme) = &self.tls.server
+			&& let Some(barrel) = &acme.barrel_state
+			&& barrel.persist_command.is_empty()
+		{
+			return Err(ReductionError::Config(
+				"tls.server.acme.barrel_state.persist_command must be non-empty: renewed ACME state could otherwise never be persisted".to_owned(),
+			));
+		}
+		return Ok(());
+	}
+
+	// No ACME feature: nothing to validate for the Barrel state store.
+	#[cfg(not(feature = "acme"))]
+	#[allow(clippy::unused_self)]
+	const fn validate_acme_barrel_state(&self) -> Result<()> {
+		return Ok(());
+	}
+
+	// The health endpoint needs its own socket; reject a port shared with the data plane or redirect
+	// listener at load rather than as a runtime bind error on whichever starts second.
+	fn validate_health_endpoint(&self) -> Result<()> {
+		if !self.health_endpoint.enabled {
+			return Ok(());
+		}
+		let listen: SocketAddr = self.health_endpoint.listen;
+		if listen == self.listen.address {
+			return Err(ReductionError::Config(format!(
+				"health_endpoint.listen '{listen}' collides with the main listen address: the health endpoint needs its own port",
+			)));
+		}
+		if self.http_redirect.enabled && listen == self.http_redirect.listen {
+			return Err(ReductionError::Config(format!(
+				"health_endpoint.listen '{listen}' collides with http_redirect.listen: the health endpoint needs its own port",
+			)));
+		}
+		return Ok(());
+	}
+
+	// The redirect target must be a bare authority (spliced into `https://{to_host}{path}`), so a missing
+	// or URL-shaped `to_host` is rejected at load, as is a port collision with the main listener.
+	fn validate_http_redirect(&self) -> Result<()> {
+		if !self.http_redirect.enabled {
+			return Ok(());
+		}
+		let host: &str = self.http_redirect.to_host.trim();
+		if host.is_empty() {
+			return Err(ReductionError::Config(
+				"http_redirect.enabled = true requires a non-empty to_host (the canonical HTTPS hostname to redirect to)".to_owned(),
+			));
+		}
+		if host.contains("://") || host.contains('/') {
+			return Err(ReductionError::Config(format!(
+				"http_redirect.to_host '{host}' must be a bare host (optionally host:port), not a URL or path",
+			)));
+		}
+		if self.http_redirect.listen == self.listen.address {
+			return Err(ReductionError::Config(format!(
+				"http_redirect.listen '{}' collides with the main listen address: the redirect listener needs its own port (typically 80)",
+				self.http_redirect.listen,
+			)));
+		}
+		return Ok(());
+	}
+
+	// `scheme = "http"` is meaningful only over TCP; QUIC mandates TLS 1.3, so it is a contradiction
+	// rejected at load rather than silently ignored.
+	fn validate_backend_schemes(&self) -> Result<()> {
+		for backend in &self.backends {
+			if backend.scheme.is_plaintext() && backend.transport != TransportKind::Tcp {
+				return Err(ReductionError::Config(format!(
+					"backend '{}' has scheme = \"http\" (cleartext) but transport = \"quic\": plain HTTP is only valid over TCP (QUIC always uses TLS)",
+					backend.id,
+				)));
+			}
+		}
+		return Ok(());
+	}
+
+	// Ingress invariants: every backend_id must be a quic backend, caps non-zero, batch budget within
+	// bounds, listen addresses unique, and a routable listen address gated by an `[access]` allowlist.
+	fn validate_ingress(&self) -> Result<()> {
+		let quic_backend_ids: HashSet<&str> = self
+			.backends
+			.iter()
+			.filter(|b| b.transport == TransportKind::Quic)
+			.map(|b| b.id.as_str())
+			.collect();
+		let mut seen_listen: HashSet<SocketAddr> = HashSet::with_capacity(self.ingress.len());
+		let has_allowlist: bool = !self.access.allow.is_empty();
+
+		for ingress in &self.ingress {
+			let id: &str = ingress.id.as_str();
+			if ingress.backend_ids.is_empty() {
+				return Err(ReductionError::Config(format!(
+					"ingress '{id}' has no backend_ids: an ingress must fan out to at least one backend",
+				)));
+			}
+			for backend_id in &ingress.backend_ids {
+				if !quic_backend_ids.contains(backend_id.as_str()) {
+					return Err(ReductionError::Config(format!(
+						"ingress '{id}' references backend_id '{backend_id}' which is not a transport = quic backend: ingress dials backends over QUIC+mTLS raw streams",
+					)));
+				}
+			}
+			self.validate_ingress_caps(ingress)?;
+			if !seen_listen.insert(ingress.listen) {
+				return Err(ReductionError::Config(format!(
+					"duplicate ingress listen address '{}': two listeners cannot bind the same port",
+					ingress.listen,
+				)));
+			}
+			if !is_private_listen_addr(ingress.listen.ip()) && !has_allowlist {
+				return Err(ReductionError::Config(format!(
+					"ingress '{id}' listens on non-private address '{}' without an [access] allow list: a routable ingress must be gated by a CIDR allowlist",
+					ingress.listen,
+				)));
+			}
+		}
+		return Ok(());
+	}
+
+	// Non-zero caps and the batch/frame size relationship for one ingress entry.
+	fn validate_ingress_caps(&self, ingress: &IngressConfig) -> Result<()> {
+		let id: &str = ingress.id.as_str();
+		if ingress.max_datagram_bytes == 0
+			|| ingress.batch_max_datagrams == 0
+			|| ingress.batch_max_bytes == 0
+			|| ingress.queue_depth_per_backend == 0
+			|| ingress.recv_buffer_bytes == 0
+		{
+			return Err(ReductionError::Config(format!(
+				"ingress '{id}' has a zero cap: max_datagram_bytes, batch_max_datagrams, batch_max_bytes, queue_depth_per_backend, and recv_buffer_bytes must all be non-zero",
+			)));
+		}
+		if ingress.max_datagram_bytes > MAX_UDP_DATAGRAM_BYTES {
+			return Err(ReductionError::Config(format!(
+				"ingress '{id}' max_datagram_bytes {} exceeds the largest possible UDP payload ({MAX_UDP_DATAGRAM_BYTES})",
+				ingress.max_datagram_bytes,
+			)));
+		}
+		if ingress.batch_max_bytes < ingress.max_datagram_bytes {
+			return Err(ReductionError::Config(format!(
+				"ingress '{id}' batch_max_bytes {} cannot fit one max_datagram_bytes payload ({}): a single datagram would never batch",
+				ingress.batch_max_bytes, ingress.max_datagram_bytes,
+			)));
+		}
+		let frame_ceiling: u32 = u32::try_from(MAX_ENVELOPE_FRAME).unwrap_or(u32::MAX);
+		if ingress.batch_max_bytes > frame_ceiling {
+			return Err(ReductionError::Config(format!(
+				"ingress '{id}' batch_max_bytes {} exceeds the envelope frame ceiling ({frame_ceiling})",
+				ingress.batch_max_bytes,
+			)));
+		}
+		return Ok(());
+	}
+
+	// Health, circuit-breaker, and balancer state are keyed by backend id, so a duplicate id would
+	// silently conflate that state — a topology error, not a merge.
+	fn validate_no_duplicate_backend_ids(&self) -> Result<()> {
+		let mut seen: HashSet<&str> = HashSet::with_capacity(self.backends.len());
+		for backend in &self.backends {
+			if !seen.insert(backend.id.as_str()) {
+				return Err(ReductionError::Config(format!(
+					"duplicate backend id '{}': each backend id must be unique (health, circuit-breaker, and balancer state are keyed by id)",
+					backend.id,
+				)));
+			}
+		}
+		return Ok(());
+	}
+
+	// Every route must name a routable, unambiguous pool; a route naming no backend pool would 502 at
+	// request time — the "starts fine, fails later" trap this rejects at load.
+	fn validate_routes(&self) -> Result<()> {
+		let pools: HashSet<&str> = self.backends.iter().map(|b| b.pool.as_str()).collect();
+		let mut seen_prefixes: HashSet<&str> = HashSet::with_capacity(self.routes.len());
+		for route in &self.routes {
+			let prefix: &str = route.path_prefix.as_str();
+			// Request paths always begin with '/', so a prefix that does not can never match.
+			if !prefix.starts_with('/') {
+				return Err(ReductionError::Config(format!(
+					"route path_prefix '{prefix}' must start with '/': request paths always begin with '/', so this route can never match",
+				)));
+			}
+			if !seen_prefixes.insert(prefix) {
+				return Err(ReductionError::Config(format!(
+					"duplicate route path_prefix '{prefix}': two routes with the same prefix make backend selection ambiguous",
+				)));
+			}
+			if !pools.contains(route.backend_id.as_str()) {
+				return Err(ReductionError::Config(format!(
+					"route path_prefix '{prefix}' references backend_id '{}' with no matching backend pool: define a backend whose pool (defaulting to its id) is '{}'",
+					route.backend_id, route.backend_id,
+				)));
+			}
+		}
+		return Ok(());
+	}
+
+	// Backoff is min(base * 2^attempt, max); a base above the cap flattens the exponential on attempt one.
+	fn validate_retry_backoff(&self) -> Result<()> {
+		if self.retry.base_delay_ms > self.retry.max_delay_ms {
+			return Err(ReductionError::Config(format!(
+				"retry.base_delay_ms ({}) must not exceed retry.max_delay_ms ({}): the exponential backoff would be clamped to the cap on the first attempt",
+				self.retry.base_delay_ms, self.retry.max_delay_ms,
+			)));
+		}
+		return Ok(());
+	}
 }
 
-impl<'de> Deserialize<'de> for BalancerConfig {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
-        #[derive(Deserialize)]
-        struct Wire {
-            #[serde(default = "default_queue_depth")]
-            queue_depth: u32,
-            #[serde(default = "default_jitter_factor")]
-            jitter_factor: f64,
-            #[serde(default = "default_drain_timeout_secs")]
-            drain_timeout_secs: u64,
-            #[serde(default = "default_max_backends")]
-            max_backends: u32,
-        }
-        let wire: Wire = Wire::deserialize(deserializer)?;
-        validate_jitter_factor(wire.jitter_factor).map_err(serde::de::Error::custom)?;
-        validate_max_backends(wire.max_backends).map_err(serde::de::Error::custom)?;
-        return Ok(BalancerConfig {
-            queue_depth: wire.queue_depth,
-            jitter_factor: wire.jitter_factor,
-            drain_timeout_secs: wire.drain_timeout_secs,
-            max_backends: wire.max_backends,
-        });
-    }
+// Per-backend allowlist entry gating which mTLS devices may raw-relay to a backend_id: no entry denies
+// every device, an entry admits only the listed CNs or key SPKIs. Indexed by proxy::RawRelayAuthz.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawRelayAuthzEntry {
+	pub backend_id: ArrayString<256>,
+	// Device certificate common names (device IDs) permitted to raw-relay to this backend.
+	#[serde(default)]
+	pub allowed_cns: Vec<ArrayString<MAX_COMMON_NAME_LEN>>,
+	// Device key SPKI SHA-256 hashes as hex (either case); validated to 64 hex chars at policy build.
+	#[serde(default)]
+	pub allowed_spkis: Vec<String>,
 }
 
-impl Default for BalancerConfig {
-    fn default() -> Self {
-        return Self {
-            queue_depth: DEFAULT_QUEUE_DEPTH,
-            jitter_factor: DEFAULT_JITTER_FACTOR,
-            drain_timeout_secs: DEFAULT_DRAIN_TIMEOUT_SECS,
-            max_backends: DEFAULT_MAX_BACKENDS,
-        };
-    }
-}
-
-fn validate_max_backends(max_backends: u32) -> std::result::Result<(), String> {
-    if max_backends == 0 {
-        return Err("max_backends must be at least 1".into());
-    }
-    if max_backends > HARD_MAX_BACKENDS {
-        return Err(format!("max_backends {max_backends} exceeds hard limit {HARD_MAX_BACKENDS}"));
-    }
-    return Ok(());
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RouteConfig {
-    pub path_prefix: ArrayString<64>,
-    pub backend_id: ArrayString<256>,
-    pub timeout_secs: Option<u64>,
-}
-
-// ── Timeout defaults ──
-
-pub const DEFAULT_CONNECT_TIMEOUT_SECS: NonZeroU64 = nonzero_u64(5);
-pub const DEFAULT_HANDSHAKE_TIMEOUT_SECS: NonZeroU64 = nonzero_u64(5);
-pub const DEFAULT_REQUEST_TIMEOUT_SECS: NonZeroU64 = nonzero_u64(30);
-
-fn default_connect_timeout_secs() -> NonZeroU64 { return DEFAULT_CONNECT_TIMEOUT_SECS; }
-fn default_handshake_timeout_secs() -> NonZeroU64 { return DEFAULT_HANDSHAKE_TIMEOUT_SECS; }
-fn default_request_timeout_secs() -> NonZeroU64 { return DEFAULT_REQUEST_TIMEOUT_SECS; }
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TimeoutConfig {
-    #[serde(default = "default_connect_timeout_secs")]
-    pub connect_secs: NonZeroU64,
-    #[serde(default = "default_handshake_timeout_secs")]
-    pub handshake_secs: NonZeroU64,
-    #[serde(default = "default_request_timeout_secs")]
-    pub request_secs: NonZeroU64,
-}
-
-impl Default for TimeoutConfig {
-    fn default() -> Self {
-        return Self {
-            connect_secs: DEFAULT_CONNECT_TIMEOUT_SECS,
-            handshake_secs: DEFAULT_HANDSHAKE_TIMEOUT_SECS,
-            request_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
-        };
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ListenConfig {
-    pub address: SocketAddr,
-    pub transport: TransportKind,
-}
-
+// `TransportKind` stays here because both `backend` and `listener` reference it via `super::TransportKind`.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum TransportKind {
-    Tcp,
-    Quic,
+	Tcp,
+	Quic,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TlsConfig {
-    pub server: ServerTlsConfig,
-    pub client: TlsIdentity,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum ServerTlsConfig {
-    Manual(TlsIdentity),
-    #[cfg(feature = "acme")]
-    Acme(AcmeTlsConfig),
-}
-
-impl ServerTlsConfig {
-    #[must_use]
-    pub fn ca_cert_path(&self) -> &Path {
-        return match self {
-            ServerTlsConfig::Manual(identity) => &identity.ca_cert_path,
-            #[cfg(feature = "acme")]
-            ServerTlsConfig::Acme(acme) => &acme.ca_cert_path,
-        };
-    }
-
-    #[must_use]
-    pub fn as_manual(&self) -> Option<&TlsIdentity> {
-        return match self {
-            ServerTlsConfig::Manual(identity) => Some(identity),
-            #[cfg(feature = "acme")]
-            ServerTlsConfig::Acme(_) => None,
-        };
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct TlsIdentity {
-    pub cert_path: PathBuf,
-    pub key_path: PathBuf,
-    pub ca_cert_path: PathBuf,
-}
-
-// ── ACME defaults ──
-
-#[cfg(feature = "acme")]
-pub const DEFAULT_ACME_CACHE_DIR: &str = "./acme_cache";
-
-#[cfg(feature = "acme")]
-fn default_acme_cache_dir() -> PathBuf { return PathBuf::from(DEFAULT_ACME_CACHE_DIR); }
-
-#[cfg(feature = "acme")]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AcmeTlsConfig {
-    pub domains: Vec<ArrayString<256>>,
-    pub acme_email: ArrayString<256>,
-    pub ca_cert_path: PathBuf,
-    #[serde(default = "default_acme_cache_dir")]
-    pub cache_dir: PathBuf,
-    #[serde(default)]
-    pub staging: bool,
-}
-
-// ── Backend defaults ──
-
-pub const DEFAULT_MAX_CONNECTIONS: u32 = 256;
-
-fn default_max_connections() -> u32 { return DEFAULT_MAX_CONNECTIONS; }
-
-#[derive(Debug, Clone)]
-pub struct BackendConfig {
-    pub id: ArrayString<256>,
-    pub pool: ArrayString<32>,
-    pub address: SocketAddr,
-    pub host: String,
-    pub weight: f64,
-    pub transport: TransportKind,
-    pub max_connections: u32,
-}
-
-fn validate_max_connections(max_connections: u32) -> std::result::Result<(), String> {
-    if max_connections == 0 {
-        return Err("max_connections must be at least 1".to_owned());
-    }
-    return Ok(());
-}
-
-fn validate_weight(weight: f64) -> std::result::Result<(), String> {
-    if weight.is_nan() || weight.is_infinite() {
-        return Err(format!("weight must be finite, got {weight}"));
-    }
-    if weight < 0.0 {
-        return Err(format!("weight must be non-negative, got {weight}"));
-    }
-    return Ok(());
-}
-
-fn validate_jitter_factor(jitter_factor: f64) -> std::result::Result<(), String> {
-    if jitter_factor.is_nan() || jitter_factor.is_infinite() {
-        return Err(format!("jitter_factor must be finite, got {jitter_factor}"));
-    }
-    if jitter_factor < 0.0 {
-        return Err(format!("jitter_factor must be non-negative, got {jitter_factor}"));
-    }
-    if jitter_factor >= 1.0 {
-        return Err(format!("jitter_factor must be less than 1.0, got {jitter_factor}"));
-    }
-    return Ok(());
-}
-
-impl BackendConfig {
-    pub fn new(id: &str, address: SocketAddr, weight: f64, transport: TransportKind) -> Result<Self> {
-        validate_weight(weight).map_err(ReductionError::Config)?;
-        let id: ArrayString<256> = ArrayString::from(id)
-            .map_err(|_| ReductionError::Config("backend id exceeds 256 characters".to_owned()))?;
-        let host: String = address.ip().to_string();
-        let pool: ArrayString<32> = ArrayString::from(id.as_str())
-            .map_err(|_| ReductionError::Config("backend id exceeds 32 characters for default pool name".to_owned()))?;
-        let max_connections: u32 = DEFAULT_MAX_CONNECTIONS;
-        return Ok(Self { id, pool, address, host, weight, transport, max_connections });
-    }
-
-    pub fn with_pool(mut self, pool: &str) -> Result<Self> {
-        self.pool = ArrayString::from(pool)
-            .map_err(|_| ReductionError::Config("pool name exceeds 32 characters".to_owned()))?;
-        return Ok(self);
-    }
-
-    #[must_use]
-    pub fn with_host(mut self, host: String) -> Self {
-        self.host = host;
-        return self;
-    }
-
-    pub fn with_max_connections(mut self, max_connections: u32) -> Result<Self> {
-        validate_max_connections(max_connections).map_err(ReductionError::Config)?;
-        self.max_connections = max_connections;
-        return Ok(self);
-    }
-}
-
-impl Serialize for BackendConfig {
-    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
-        #[derive(Serialize)]
-        struct Wire<'a> {
-            id: &'a str,
-            pool: &'a str,
-            host: &'a str,
-            address: String,
-            weight: f64,
-            transport: &'a TransportKind,
-            max_connections: u32,
-        }
-        let wire: Wire<'_> = Wire {
-            id: &self.id,
-            pool: &self.pool,
-            host: &self.host,
-            address: self.address.to_string(),
-            weight: self.weight,
-            transport: &self.transport,
-            max_connections: self.max_connections,
-        };
-        return wire.serialize(serializer);
-    }
-}
-
-impl<'de> Deserialize<'de> for BackendConfig {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
-        #[derive(Deserialize)]
-        struct Wire {
-            id: String,
-            pool: Option<String>,
-            host: Option<String>,
-            address: String,
-            weight: f64,
-            transport: TransportKind,
-            #[serde(default = "default_max_connections")]
-            max_connections: u32,
-        }
-        let wire: Wire = Wire::deserialize(deserializer)?;
-        let address: SocketAddr = wire.address.parse()
-            .map_err(|e| serde::de::Error::custom(format!("invalid backend address '{}': {e}", wire.address)))?;
-        validate_weight(wire.weight).map_err(serde::de::Error::custom)?;
-        validate_max_connections(wire.max_connections).map_err(serde::de::Error::custom)?;
-        let id: ArrayString<256> = ArrayString::from(&wire.id)
-            .map_err(|_| serde::de::Error::custom(format!("backend id '{}' exceeds 256 characters", wire.id)))?;
-        let pool: ArrayString<32> = match wire.pool {
-            Some(p) => ArrayString::from(&p)
-                .map_err(|_| serde::de::Error::custom(format!("pool name '{}' exceeds 32 characters", p)))?,
-            None => ArrayString::from(id.as_str())
-                .map_err(|_| serde::de::Error::custom(format!("backend id '{}' exceeds 32 characters for default pool name", wire.id)))?,
-        };
-        let host: String = wire.host.unwrap_or_else(|| address.ip().to_string());
-        return Ok(BackendConfig {
-            id,
-            pool,
-            address,
-            host,
-            weight: wire.weight,
-            transport: wire.transport,
-            max_connections: wire.max_connections,
-        });
-    }
-}
-
-// ── Rate limit defaults ──
-
-pub const DEFAULT_REQUESTS_PER_SECOND: u32 = u32::MAX;
-
-fn default_requests_per_second() -> u32 { return DEFAULT_REQUESTS_PER_SECOND; }
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RateLimitConfig {
-    #[serde(default = "default_requests_per_second")]
-    pub requests_per_second: u32,
-}
-
-impl Default for RateLimitConfig {
-    fn default() -> Self {
-        return Self {
-            requests_per_second: DEFAULT_REQUESTS_PER_SECOND,
-        };
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct AccessControlConfig {
-    #[serde(default)]
-    pub allow: Vec<IpNet>,
-    #[serde(default)]
-    pub deny: Vec<IpNet>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct MetricsConfig {
-    pub otlp_endpoint: Option<String>,
-}
-
-// ── Tracing defaults ──
-
-pub const DEFAULT_TRACE_SAMPLE_RATIO: f64 = 1.0;
-
-fn default_trace_sample_ratio() -> f64 { return DEFAULT_TRACE_SAMPLE_RATIO; }
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TracingConfig {
-    pub otlp_endpoint: Option<String>,
-    #[serde(default = "default_trace_sample_ratio")]
-    pub sample_ratio: f64,
-}
-
-impl Default for TracingConfig {
-    fn default() -> Self {
-        return Self {
-            otlp_endpoint: None,
-            sample_ratio: DEFAULT_TRACE_SAMPLE_RATIO,
-        };
-    }
-}
-
-// ── Proxy defaults ──
-
-pub const DEFAULT_MAX_RESPONSE_BODY_BYTES: u32 = 10 * 1024 * 1024;
-pub const DEFAULT_H2_CONNECTIONS_PER_BACKEND: NonZeroU32 = nonzero_u32(4);
-pub const DEFAULT_MAX_IDLE_QUIC_PER_HOST: u32 = 16;
-pub const DEFAULT_H2_STREAM_WINDOW: u32 = 2 * 1024 * 1024;
-pub const DEFAULT_H2_CONN_WINDOW: u32 = 4 * 1024 * 1024;
-pub const DEFAULT_INLINE_COMPRESS_THRESHOLD: u32 = 8192;
-pub const DEFAULT_QUIC_CHANNEL_CAPACITY: NonZeroU32 = nonzero_u32(256);
-
-fn default_max_response_body_bytes() -> u32 { return DEFAULT_MAX_RESPONSE_BODY_BYTES; }
-fn default_h2_connections_per_backend() -> NonZeroU32 { return DEFAULT_H2_CONNECTIONS_PER_BACKEND; }
-fn default_max_idle_quic_per_host() -> u32 { return DEFAULT_MAX_IDLE_QUIC_PER_HOST; }
-fn default_h2_stream_window() -> u32 { return DEFAULT_H2_STREAM_WINDOW; }
-fn default_h2_conn_window() -> u32 { return DEFAULT_H2_CONN_WINDOW; }
-fn default_inline_compress_threshold() -> u32 { return DEFAULT_INLINE_COMPRESS_THRESHOLD; }
-fn default_quic_channel_capacity() -> NonZeroU32 { return DEFAULT_QUIC_CHANNEL_CAPACITY; }
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProxyConfig {
-    #[serde(default = "default_max_response_body_bytes")]
-    pub max_response_body_bytes: u32,
-    #[serde(default = "default_h2_connections_per_backend")]
-    pub h2_connections_per_backend: NonZeroU32,
-    #[serde(default = "default_max_idle_quic_per_host")]
-    pub max_idle_quic_per_host: u32,
-    #[serde(default = "default_h2_stream_window")]
-    pub h2_stream_window: u32,
-    #[serde(default = "default_h2_conn_window")]
-    pub h2_conn_window: u32,
-    #[serde(default = "default_inline_compress_threshold")]
-    pub inline_compress_threshold: u32,
-    #[serde(default = "default_quic_channel_capacity")]
-    pub quic_channel_capacity: NonZeroU32,
-}
-
-impl Default for ProxyConfig {
-    fn default() -> Self {
-        return Self {
-            max_response_body_bytes: DEFAULT_MAX_RESPONSE_BODY_BYTES,
-            h2_connections_per_backend: DEFAULT_H2_CONNECTIONS_PER_BACKEND,
-            max_idle_quic_per_host: DEFAULT_MAX_IDLE_QUIC_PER_HOST,
-            h2_stream_window: DEFAULT_H2_STREAM_WINDOW,
-            h2_conn_window: DEFAULT_H2_CONN_WINDOW,
-            inline_compress_threshold: DEFAULT_INLINE_COMPRESS_THRESHOLD,
-            quic_channel_capacity: DEFAULT_QUIC_CHANNEL_CAPACITY,
-        };
-    }
-}
-
-// ── Compression defaults ──
-
-pub const DEFAULT_COMPRESSION_LEVEL: i32 = 3;
-pub const DEFAULT_MIN_COMPRESS_BYTES: u32 = 256;
-
-fn default_compression_level() -> i32 { return DEFAULT_COMPRESSION_LEVEL; }
-fn default_min_compress_bytes() -> u32 { return DEFAULT_MIN_COMPRESS_BYTES; }
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CompressionConfig {
-    #[serde(default = "default_compression_level")]
-    pub level: i32,
-    #[serde(default = "default_min_compress_bytes")]
-    pub min_bytes: u32,
-}
-
-impl Default for CompressionConfig {
-    fn default() -> Self {
-        return Self {
-            level: DEFAULT_COMPRESSION_LEVEL,
-            min_bytes: DEFAULT_MIN_COMPRESS_BYTES,
-        };
-    }
-}
-
-// ── Health defaults ──
-
-pub const DEFAULT_STALENESS_TTL_SECS: u64 = 300;
-pub const DEFAULT_LATENCY_THRESHOLD_MS: u32 = 500;
-
-fn default_staleness_ttl_secs() -> u64 { return DEFAULT_STALENESS_TTL_SECS; }
-fn default_latency_threshold_ms() -> u32 { return DEFAULT_LATENCY_THRESHOLD_MS; }
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HealthConfig {
-    #[serde(default = "default_staleness_ttl_secs")]
-    pub staleness_ttl_secs: u64,
-    #[serde(default = "default_latency_threshold_ms")]
-    pub latency_threshold_ms: u32,
-}
-
-impl Default for HealthConfig {
-    fn default() -> Self {
-        return Self {
-            staleness_ttl_secs: DEFAULT_STALENESS_TTL_SECS,
-            latency_threshold_ms: DEFAULT_LATENCY_THRESHOLD_MS,
-        };
-    }
-}
-
-// ── Circuit breaker defaults ──
-
-pub const DEFAULT_FAILURE_THRESHOLD: NonZeroU32 = nonzero_u32(5);
-pub const DEFAULT_RECOVERY_TIMEOUT_SECS: u64 = 60;
-pub const DEFAULT_HALF_OPEN_MAX_REQUESTS: NonZeroU32 = nonzero_u32(2);
-
-fn default_failure_threshold() -> NonZeroU32 { return DEFAULT_FAILURE_THRESHOLD; }
-fn default_recovery_timeout_secs() -> u64 { return DEFAULT_RECOVERY_TIMEOUT_SECS; }
-fn default_half_open_max_requests() -> NonZeroU32 { return DEFAULT_HALF_OPEN_MAX_REQUESTS; }
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CircuitBreakerConfig {
-    #[serde(default = "default_failure_threshold")]
-    pub failure_threshold: NonZeroU32,
-    #[serde(default = "default_recovery_timeout_secs")]
-    pub recovery_timeout_secs: u64,
-    #[serde(default = "default_half_open_max_requests")]
-    pub half_open_max_requests: NonZeroU32,
-}
-
-impl Default for CircuitBreakerConfig {
-    fn default() -> Self {
-        return Self {
-            failure_threshold: DEFAULT_FAILURE_THRESHOLD,
-            recovery_timeout_secs: DEFAULT_RECOVERY_TIMEOUT_SECS,
-            half_open_max_requests: DEFAULT_HALF_OPEN_MAX_REQUESTS,
-        };
-    }
-}
-
-// ── Retry defaults ──
-
-pub const DEFAULT_MAX_RETRIES: u32 = 2;
-pub const DEFAULT_RETRY_BASE_DELAY_MS: u64 = 200;
-pub const DEFAULT_RETRY_MAX_DELAY_MS: u64 = 2000;
-pub const DEFAULT_RETRY_JITTER_MS: u64 = 100;
-
-fn default_max_retries() -> u32 { return DEFAULT_MAX_RETRIES; }
-fn default_retry_base_delay_ms() -> u64 { return DEFAULT_RETRY_BASE_DELAY_MS; }
-fn default_retry_max_delay_ms() -> u64 { return DEFAULT_RETRY_MAX_DELAY_MS; }
-fn default_retry_jitter_ms() -> u64 { return DEFAULT_RETRY_JITTER_MS; }
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RetryConfig {
-    #[serde(default = "default_max_retries")]
-    pub max_retries: u32,
-    #[serde(default = "default_retry_base_delay_ms")]
-    pub base_delay_ms: u64,
-    #[serde(default = "default_retry_max_delay_ms")]
-    pub max_delay_ms: u64,
-    #[serde(default = "default_retry_jitter_ms")]
-    pub jitter_ms: u64,
-}
-
-impl Default for RetryConfig {
-    fn default() -> Self {
-        return Self {
-            max_retries: DEFAULT_MAX_RETRIES,
-            base_delay_ms: DEFAULT_RETRY_BASE_DELAY_MS,
-            max_delay_ms: DEFAULT_RETRY_MAX_DELAY_MS,
-            jitter_ms: DEFAULT_RETRY_JITTER_MS,
-        };
-    }
-}
-
-// ── Tunnel defaults ──
-
-pub const DEFAULT_HEARTBEAT_INTERVAL_SECS: u64 = 15;
-pub const DEFAULT_HEARTBEAT_TIMEOUT_SECS: u64 = 45;
-pub const DEFAULT_MAX_SESSIONS_PER_BACKEND: NonZeroU32 = nonzero_u32(8);
-pub const DEFAULT_REGISTRATION_TIMEOUT_SECS: u64 = 10;
-pub const DEFAULT_CONTROL_CHANNEL_CAPACITY: NonZeroU32 = nonzero_u32(16);
-
-fn default_heartbeat_interval_secs() -> u64 { return DEFAULT_HEARTBEAT_INTERVAL_SECS; }
-fn default_heartbeat_timeout_secs() -> u64 { return DEFAULT_HEARTBEAT_TIMEOUT_SECS; }
-fn default_max_sessions_per_backend() -> NonZeroU32 { return DEFAULT_MAX_SESSIONS_PER_BACKEND; }
-fn default_registration_timeout_secs() -> u64 { return DEFAULT_REGISTRATION_TIMEOUT_SECS; }
-fn default_control_channel_capacity() -> NonZeroU32 { return DEFAULT_CONTROL_CHANNEL_CAPACITY; }
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TunnelConfig {
-    #[serde(default)]
-    pub enabled: bool,
-    pub listen_address: Option<SocketAddr>,
-    #[serde(default = "default_heartbeat_interval_secs")]
-    pub heartbeat_interval_secs: u64,
-    #[serde(default = "default_heartbeat_timeout_secs")]
-    pub heartbeat_timeout_secs: u64,
-    #[serde(default)]
-    pub allowed_backend_ids: Vec<ArrayString<256>>,
-    #[serde(default = "default_max_sessions_per_backend")]
-    pub max_sessions_per_backend: NonZeroU32,
-    #[serde(default = "default_registration_timeout_secs")]
-    pub registration_timeout_secs: u64,
-    #[serde(default = "default_control_channel_capacity")]
-    pub control_channel_capacity: NonZeroU32,
-}
-
-impl Default for TunnelConfig {
-    fn default() -> Self {
-        return Self {
-            enabled: false,
-            listen_address: None,
-            heartbeat_interval_secs: DEFAULT_HEARTBEAT_INTERVAL_SECS,
-            heartbeat_timeout_secs: DEFAULT_HEARTBEAT_TIMEOUT_SECS,
-            allowed_backend_ids: Vec::new(),
-            max_sessions_per_backend: DEFAULT_MAX_SESSIONS_PER_BACKEND,
-            registration_timeout_secs: DEFAULT_REGISTRATION_TIMEOUT_SECS,
-            control_channel_capacity: DEFAULT_CONTROL_CHANNEL_CAPACITY,
-        };
-    }
-}
-
-// ── Cache defaults ──
-
-pub const DEFAULT_CACHE_MAX_ENTRIES: NonZeroUsize = nonzero_usize(1000);
-pub const DEFAULT_CACHE_MAX_ENTRY_BYTES: NonZeroUsize = nonzero_usize(1024 * 1024);
-pub const DEFAULT_CACHE_DEFAULT_TTL_SECS: NonZeroU64 = nonzero_u64(60);
-
-fn default_cache_max_entries() -> NonZeroUsize { return DEFAULT_CACHE_MAX_ENTRIES; }
-fn default_cache_max_entry_bytes() -> NonZeroUsize { return DEFAULT_CACHE_MAX_ENTRY_BYTES; }
-fn default_cache_default_ttl_secs() -> NonZeroU64 { return DEFAULT_CACHE_DEFAULT_TTL_SECS; }
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CacheConfig {
-    #[serde(default)]
-    pub enabled: bool,
-    #[serde(default = "default_cache_max_entries")]
-    pub max_entries: NonZeroUsize,
-    #[serde(default = "default_cache_max_entry_bytes")]
-    pub max_entry_bytes: NonZeroUsize,
-    #[serde(default = "default_cache_default_ttl_secs")]
-    pub default_ttl_secs: NonZeroU64,
-}
-
-impl Default for CacheConfig {
-    fn default() -> Self {
-        return Self {
-            enabled: false,
-            max_entries: DEFAULT_CACHE_MAX_ENTRIES,
-            max_entry_bytes: DEFAULT_CACHE_MAX_ENTRY_BYTES,
-            default_ttl_secs: DEFAULT_CACHE_DEFAULT_TTL_SECS,
-        };
-    }
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	// ── backend scheme validation ──
+
+	#[test]
+	fn validate_rejects_http_scheme_on_quic_backend() {
+		// minimal_toml()'s backend is transport = quic; forcing its scheme to cleartext http is a
+		// contradiction (QUIC always uses TLS) and must be rejected by validate.
+		let mut config: ReductionConfig = toml::from_str(minimal_toml()).unwrap();
+		config.backends[0].scheme = BackendScheme::Http;
+		let err: String = config.validate().unwrap_err().to_string();
+		assert!(err.contains("cleartext") && err.contains("TCP"), "got: {err}");
+	}
+
+	#[test]
+	fn validate_accepts_http_scheme_on_tcp_backend() {
+		let mut config: ReductionConfig = toml::from_str(minimal_toml()).unwrap();
+		config.backends[0].transport = TransportKind::Tcp;
+		config.backends[0].scheme = BackendScheme::Http;
+		assert!(config.validate().is_ok(), "cleartext http over tcp is a valid backend hop");
+	}
+
+	// ── http_redirect validation ──
+
+	#[test]
+	fn http_redirect_defaults_to_disabled() {
+		let config: ReductionConfig = toml::from_str(minimal_toml()).unwrap();
+		assert!(!config.http_redirect.enabled);
+		assert!(config.validate().is_ok(), "a disabled redirect needs no to_host");
+	}
+
+	#[test]
+	fn validate_rejects_enabled_redirect_without_to_host() {
+		let mut config: ReductionConfig = toml::from_str(minimal_toml()).unwrap();
+		config.http_redirect.enabled = true;
+		config.http_redirect.listen = "0.0.0.0:80".parse().unwrap();
+		let err: String = config.validate().unwrap_err().to_string();
+		assert!(err.contains("to_host"), "got: {err}");
+	}
+
+	#[test]
+	fn validate_rejects_to_host_that_is_a_url() {
+		let mut config: ReductionConfig = toml::from_str(minimal_toml()).unwrap();
+		config.http_redirect.enabled = true;
+		config.http_redirect.listen = "0.0.0.0:80".parse().unwrap();
+		config.http_redirect.to_host = "https://conorforde.com/".to_owned();
+		let err: String = config.validate().unwrap_err().to_string();
+		assert!(err.contains("bare host"), "got: {err}");
+	}
+
+	#[test]
+	fn validate_rejects_redirect_listen_colliding_with_main_listener() {
+		let mut config: ReductionConfig = toml::from_str(minimal_toml()).unwrap();
+		config.http_redirect.enabled = true;
+		config.http_redirect.to_host = "conorforde.com".to_owned();
+		// minimal_toml() listens on 127.0.0.1:8443; collide the redirect with it.
+		config.http_redirect.listen = config.listen.address;
+		let err: String = config.validate().unwrap_err().to_string();
+		assert!(err.contains("collides"), "got: {err}");
+	}
+
+	#[test]
+	fn validate_accepts_well_formed_redirect() {
+		let mut config: ReductionConfig = toml::from_str(minimal_toml()).unwrap();
+		config.http_redirect.enabled = true;
+		config.http_redirect.listen = "0.0.0.0:80".parse().unwrap();
+		config.http_redirect.to_host = "conorforde.com".to_owned();
+		assert!(config.validate().is_ok());
+	}
+
+	// ── health_endpoint validation ──
+
+	#[test]
+	fn health_endpoint_defaults_to_disabled() {
+		let config: ReductionConfig = toml::from_str(minimal_toml()).unwrap();
+		assert!(!config.health_endpoint.enabled);
+		assert!(config.validate().is_ok());
+	}
+
+	#[test]
+	fn validate_rejects_health_endpoint_colliding_with_main_listener() {
+		let mut config: ReductionConfig = toml::from_str(minimal_toml()).unwrap();
+		config.health_endpoint.enabled = true;
+		config.health_endpoint.listen = config.listen.address;
+		let err: String = config.validate().unwrap_err().to_string();
+		assert!(err.contains("collides"), "got: {err}");
+	}
+
+	#[test]
+	fn validate_accepts_health_endpoint_on_its_own_port() {
+		let mut config: ReductionConfig = toml::from_str(minimal_toml()).unwrap();
+		config.health_endpoint.enabled = true;
+		config.health_endpoint.listen = "127.0.0.1:9090".parse().unwrap();
+		assert!(config.validate().is_ok());
+	}
+
+	// ── RawRelayAuthzEntry ──
+
+	#[test]
+	fn raw_relay_authz_absent_defaults_to_empty() {
+		let config: ReductionConfig = toml::from_str(&minimal_toml_for_raw_authz("")).unwrap();
+		assert!(
+			config.raw_relay_authz.is_empty(),
+			"no [[raw_relay_authz]] parses as an empty, fail-closed policy set"
+		);
+	}
+
+	#[test]
+	fn raw_relay_authz_entry_parses_cns_and_spkis() {
+		let entry: RawRelayAuthzEntry = toml::from_str(
+			"backend_id = \"svc\"\nallowed_cns = [\"device-1\", \"device-2\"]\nallowed_spkis = [\"aabb\"]",
+		)
+		.unwrap();
+		assert_eq!(entry.backend_id.as_str(), "svc");
+		assert_eq!(entry.allowed_cns.len(), 2);
+		assert_eq!(entry.allowed_cns[0].as_str(), "device-1");
+		assert_eq!(entry.allowed_spkis, vec!["aabb".to_owned()]);
+	}
+
+	#[test]
+	fn raw_relay_authz_entry_defaults_lists_to_empty() {
+		let entry: RawRelayAuthzEntry = toml::from_str("backend_id = \"svc\"").unwrap();
+		assert!(entry.allowed_cns.is_empty());
+		assert!(entry.allowed_spkis.is_empty());
+	}
+
+	// A full config carrying one raw_relay_authz entry threads through to the parsed struct.
+	#[test]
+	fn raw_relay_authz_entry_round_trips_through_full_config() {
+		let toml_str: String = format!(
+			"{}\n[[raw_relay_authz]]\nbackend_id = \"svc\"\nallowed_cns = [\"device-9\"]\n",
+			minimal_toml(),
+		);
+		let config: ReductionConfig = toml::from_str(&toml_str).unwrap();
+		assert_eq!(config.raw_relay_authz.len(), 1);
+		assert_eq!(config.raw_relay_authz[0].backend_id.as_str(), "svc");
+		assert_eq!(config.raw_relay_authz[0].allowed_cns[0].as_str(), "device-9");
+	}
+
+	// A minimal valid ReductionConfig with `extra` TOML appended, so a section can be parsed in the
+	// context of the whole config rather than in isolation.
+	fn minimal_toml_for_raw_authz(extra: &str) -> String {
+		return format!("{}\n{extra}", minimal_toml());
+	}
+
+	// ── client-identity requirement ──
+
+	// A manual-server config with NO [tls.client] and one tcp backend of the given scheme. Used to
+	// exercise the client-identity requirement independent of the ACME feature.
+	fn manual_no_client_toml(transport: &str, scheme_line: &str) -> String {
+		return format!(
+			r#"
+[listen]
+address = "127.0.0.1:8443"
+transport = "tcp"
+client_auth = "disabled"
+
+[tls.server.manual]
+cert_path = "certs/server.crt"
+key_path = "certs/server.key"
+ca_cert_path = "certs/ca.crt"
+
+[[backends]]
+id = "web"
+address = "10.0.0.1:8080"
+weight = 1.0
+transport = "{transport}"
+{scheme_line}
+
+[[routes]]
+path_prefix = "/"
+backend_id = "web"
+"#
+		);
+	}
+
+	#[test]
+	fn validate_rejects_https_backend_without_client_identity() {
+		let config: ReductionConfig = toml::from_str(&manual_no_client_toml("tcp", "scheme = \"https\"")).unwrap();
+		assert!(config.tls.client.is_none());
+		assert!(config.needs_client_tls());
+		let err: String = config.validate().unwrap_err().to_string();
+		assert!(err.contains("web") && err.contains("https"), "must name the backend and reason: {err}");
+	}
+
+	#[test]
+	fn validate_rejects_quic_backend_without_client_identity() {
+		// No scheme line ⇒ default https; quic always needs mTLS regardless.
+		let config: ReductionConfig = toml::from_str(&manual_no_client_toml("quic", "")).unwrap();
+		assert!(config.needs_client_tls());
+		let err: String = config.validate().unwrap_err().to_string();
+		assert!(err.contains("web") && err.contains("quic"), "must name the backend and reason: {err}");
+	}
+
+	#[test]
+	fn validate_accepts_plaintext_backend_without_client_identity() {
+		let config: ReductionConfig = toml::from_str(&manual_no_client_toml("tcp", "scheme = \"http\"")).unwrap();
+		assert!(config.tls.client.is_none());
+		assert!(!config.needs_client_tls(), "a cleartext-http tcp backend needs no client identity");
+		assert!(config.validate().is_ok(), "a plaintext-backend config may omit [tls.client]");
+	}
+
+	// Diff check: the same config differing ONLY in backend scheme flips whether a client identity is
+	// loaded — the http variant drops the load path the https variant requires.
+	#[test]
+	fn needs_client_tls_flips_with_backend_scheme() {
+		let https: ReductionConfig = toml::from_str(&manual_no_client_toml("tcp", "scheme = \"https\"")).unwrap();
+		let http: ReductionConfig = toml::from_str(&manual_no_client_toml("tcp", "scheme = \"http\"")).unwrap();
+		assert!(https.needs_client_tls());
+		assert!(!http.needs_client_tls());
+		assert!(https.validate().is_err(), "https backend requires a client identity");
+		assert!(http.validate().is_ok(), "http backend drops the client-identity requirement");
+	}
+
+	// Existing mTLS config (quic backend + [tls.client] present) is unchanged: still parses, still needs
+	// the client identity, still validates.
+	#[test]
+	fn validate_accepts_existing_mtls_config() {
+		let config: ReductionConfig = toml::from_str(minimal_toml()).unwrap();
+		assert!(config.tls.client.is_some());
+		assert!(config.needs_client_tls());
+		assert!(config.validate().is_ok());
+	}
+
+	// Present-but-unused [tls.client] is allowed (warned, not rejected): a plaintext-backend config that
+	// still carries the client identity must validate.
+	#[test]
+	fn validate_accepts_unused_client_identity() {
+		let toml_str: String = format!(
+			"{}\n[tls.client]\ncert_path = \"certs/client.crt\"\nkey_path = \"certs/client.key\"\nca_cert_path = \"certs/ca.crt\"\n",
+			manual_no_client_toml("tcp", "scheme = \"http\""),
+		);
+		let config: ReductionConfig = toml::from_str(&toml_str).unwrap();
+		assert!(config.tls.client.is_some());
+		assert!(!config.needs_client_tls());
+		assert!(config.validate().is_ok(), "an unused client identity is allowed, not an error");
+	}
+
+	// ── ACME inbound-CA requirement ──
+
+	// The minimal public-blog config: tcp listener, client_auth=disabled, ACME server with NO ca_cert_path,
+	// a single cleartext-http backend, one route, and no [tls.client].
+	#[cfg(feature = "acme")]
+	fn public_blog_toml() -> &'static str {
+		return r#"
+[listen]
+address = "0.0.0.0:443"
+transport = "tcp"
+client_auth = "disabled"
+
+[tls.server.acme]
+domains = ["blog.example.com"]
+acme_email = "ops@example.com"
+
+[[backends]]
+id = "blog"
+address = "127.0.0.1:8080"
+weight = 1.0
+transport = "tcp"
+scheme = "http"
+
+[[routes]]
+path_prefix = "/"
+backend_id = "blog"
+"#;
+	}
+
+	#[cfg(feature = "acme")]
+	#[test]
+	fn validate_accepts_public_blog_without_client_or_acme_ca() {
+		let config: ReductionConfig = toml::from_str(public_blog_toml()).unwrap();
+		assert!(config.tls.client.is_none(), "public blog needs no [tls.client]");
+		assert!(!config.needs_client_tls(), "no backend performs a TLS handshake upstream");
+		match &config.tls.server {
+			ServerTlsConfig::Acme(acme) => assert!(acme.ca_cert_path.is_none(), "no inbound CA under disabled"),
+			ServerTlsConfig::Manual(_) => panic!("expected acme server"),
+		}
+		assert!(config.validate().is_ok(), "the minimal public config must validate");
+	}
+
+	#[cfg(feature = "acme")]
+	#[test]
+	fn validate_rejects_acme_without_ca_under_required() {
+		// Same public config but mandatory mTLS: the inbound client-cert CA is then required.
+		let toml_str: String = public_blog_toml().replace("client_auth = \"disabled\"", "client_auth = \"required\"");
+		let config: ReductionConfig = toml::from_str(&toml_str).unwrap();
+		let err: String = config.validate().unwrap_err().to_string();
+		assert!(err.contains("ca_cert_path"), "must name the missing field: {err}");
+	}
+
+
+	fn minimal_toml() -> &'static str {
+		return r#"
+[listen]
+address = "127.0.0.1:8443"
+transport = "quic"
+
+[tls.server.manual]
+cert_path = "certs/server.crt"
+key_path = "certs/server.key"
+ca_cert_path = "certs/ca.crt"
+
+[tls.client]
+cert_path = "certs/client.crt"
+key_path = "certs/client.key"
+ca_cert_path = "certs/ca.crt"
+
+[[backends]]
+id = "svc"
+address = "10.0.0.1:8080"
+weight = 1.0
+transport = "quic"
+
+[[routes]]
+path_prefix = "/"
+backend_id = "svc"
+"#;
+	}
 }

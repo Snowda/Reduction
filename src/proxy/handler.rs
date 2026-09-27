@@ -1,24 +1,22 @@
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher, DefaultHasher};
 use std::net::IpAddr;
 use std::slice::from_ref;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use arrayvec::ArrayString;
+use arrayvec::{ArrayString, ArrayVec};
 use axum::body::Body;
 use axum::extract::{ConnectInfo, State};
-use axum::http::header::{ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_LENGTH, HOST};
-use axum::http::{HeaderValue, Request, Response, StatusCode};
+use axum::http::header::{ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_LENGTH, COOKIE, HOST, RANGE, VARY};
+use axum::http::request::Parts;
+use axum::http::{HeaderMap, HeaderValue, Request, Response, StatusCode};
 use bytes::Bytes;
 use dashmap::DashMap;
-use http_body_util::{BodyExt, Limited};
+use http_body_util::{BodyExt, LengthLimitError, Limited};
+use hyper::Method;
 use hyper::body::Incoming;
-use opentelemetry::global;
-use opentelemetry::propagation::{Extractor, Injector};
-use opentelemetry::KeyValue;
-use tokio::sync::watch;
-use tokio::sync::{OwnedSemaphorePermit, SemaphorePermit};
+use opentelemetry::{KeyValue, StringValue, global};
+use tokio::sync::{OwnedSemaphorePermit, watch};
 use tokio::time::timeout;
 use tokio_rustls::TlsConnector;
 use tokio_util::sync::CancellationToken;
@@ -26,1127 +24,819 @@ use tracing::{error, info, warn};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::acl::AccessControl;
-use crate::cache::ResponseCache;
+use crate::balancer::{BackendPool, MAX_BACKENDS, RequestQueue};
+use crate::cache::{CacheKeyRef, ResponseCache};
 use crate::cache_control::CacheDirectives;
-use crate::balancer::{BackendPool, RequestQueue};
 use crate::circuit::{CircuitBreakers, CircuitState, HalfOpenGuard};
-use crate::compression;
-use crate::config::{BackendConfig, CacheConfig, CompressionConfig, DEFAULT_MAX_CONNECTIONS, ProxyConfig, RetryConfig, TimeoutConfig};
-use crate::proxy::compress_body::CompressedBody;
+#[cfg(any(test, feature = "integration_tests"))]
+use crate::config::CircuitBreakerConfig;
+use crate::config::{
+	BackendConfig, CacheConfig, ClientAuthPolicy, CompressionConfig, ProxyConfig, RetryConfig, TimeoutConfig,
+};
 use crate::error::{ReductionError, Result};
 use crate::health::HealthState;
-use crate::metrics::ProxyMetrics;
-use crate::proxy::pool::{ConnPool, HttpSender, PooledBody};
+use crate::metrics::{ActiveConnectionGuard, ProxyMetrics};
+use crate::proxy::compress_body::CompressedBody;
+use crate::proxy::guarded_body::GuardedBody;
+use crate::proxy::pool::{ConnPool, HttpSender};
 use crate::proxy::router::{RouteMatch, Router};
 use crate::ratelimit::RateLimit;
+use crate::tls::{PeerIdentity, SPKI_HEX_LEN};
 use crate::transport::ConnectAddr;
+use crate::tunnel::revocation::RevocationSet;
+use crate::{compression, retry};
+
+// Header rewriting (identity/forwarded injection, hop-by-hop stripping) lives in a submodule.
+mod headers;
+// The per-attempt retry loop (select → gate → forward → interpret) lives in a submodule.
+mod attempt;
+// Request-body preparation for replay (decompress, buffer, cap checks) lives in a submodule.
+mod body;
+
+// Caching/compression and retry-policy decision helpers live in a submodule.
+mod policy;
+// Response-cache lookup and per-request cache negotiation live in a submodule.
+mod cache;
+// Shared proxy state (hot-swappable ReloadableState, the per-request ProxyState) lives in a submodule.
+mod state;
+// Backend selection, metric-label interning, and route resolution live in a submodule.
+mod selection;
+
+use attempt::{AttemptOutcome, ReplayBody, RequestCtx, RetryState, run_attempt};
+use cache::{CacheDecision, CacheNegotiation, negotiate_cache};
+use body::{PreparedBody, compress_response, prepare_replay_body};
+use headers::{HeaderExtractor, HeaderInjector, apply_forwarded_headers, apply_identity_headers, strip_hop_by_hop_headers};
+use policy::{
+	backoff_delay, is_cacheable_status, is_retryable_status, maybe_compress, response_is_encoded,
+	response_permits_shared_caching, retries_permitted, vary_permits_caching,
+};
+use selection::{
+	ResolvedRoute, backend_label, completion_backend_label, mark_failed, resolve_backend_pool, select_backend_excluding,
+};
+pub use state::{ProxyState, ReloadableState};
+#[cfg(any(test, feature = "integration_tests"))]
+pub use state::TestProxyStateParams;
 
 // Retry-After value (seconds) advertised to clients while the proxy is draining for shutdown.
 const SHUTDOWN_RETRY_AFTER_SECS: &str = "5";
 
+// mTLS peer identity headers injected per request (backends authorize the device); trustworthy only on a private path, client values stripped.
+const HEADER_CLIENT_ID: &str = "x-reduction-client-id";
+const HEADER_CLIENT_SPKI: &str = "x-reduction-client-spki";
+
+// Client-IP forwarding headers, set (not appended) from the proven peer address; client chains are stripped (mTLS edge).
+const HEADER_X_FORWARDED_FOR: &str = "x-forwarded-for";
+const HEADER_X_REAL_IP: &str = "x-real-ip";
+
+
+// Client opt-in to retry a non-idempotent request: a non-empty value asserts the backend deduplicates replays (Idempotency-Key).
+const HEADER_IDEMPOTENCY_KEY: &str = "idempotency-key";
+
+// Metric attribute on requests_rejected distinguishing why a request was refused before forwarding.
+const REJECT_REASON_KEY: &str = "reason";
+const REJECT_REASON_REVOKED: &str = "revoked";
+const REJECT_REASON_NO_IDENTITY: &str = "no_identity";
+
 // HTTP status codes treated as transient, so the request is safe to retry against another backend.
+// Seconds-to-milliseconds conversion factor for latency metrics.
+const SECS_TO_MILLIS: f64 = 1000.0;
 const STATUS_TOO_MANY_REQUESTS: u16 = 429;
 const STATUS_BAD_GATEWAY: u16 = 502;
 const STATUS_SERVICE_UNAVAILABLE: u16 = 503;
 
-#[derive(Clone)]
-pub struct ReloadableState {
-    pub router: Router,
-    pub backend_pools: HashMap<ArrayString<256>, BackendPool>,
-}
-
-pub struct ProxyState {
-    pub reloadable: watch::Receiver<ReloadableState>,
-    pub tls_connector: TlsConnector,
-    pub client_tls_config: Arc<rustls::ClientConfig>,
-    pub health_rx: watch::Receiver<HealthState>,
-    pub conn_pool: ConnPool,
-    pub acl: AccessControl,
-    pub rate_limiter: RateLimit,
-    pub queues: DashMap<ArrayString<256>, Arc<RequestQueue>>,
-    pub default_queue_depth: u32,
-    pub metrics: ProxyMetrics,
-    pub circuit_breakers: CircuitBreakers,
-    pub shutdown: CancellationToken,
-    pub timeouts: TimeoutConfig,
-    pub proxy_config: ProxyConfig,
-    pub compression_config: CompressionConfig,
-    pub retry_config: RetryConfig,
-    pub cache_config: CacheConfig,
-    pub response_cache: ResponseCache,
-}
-
-// Synchronous so the watch::Ref never crosses an await point.
-fn select_backend(
-    pool: &BackendPool,
-    client_ip: IpAddr,
-    health_rx: &watch::Receiver<HealthState>,
-    conn_pool: &ConnPool,
-) -> Result<BackendConfig> {
-    let health: watch::Ref<'_, HealthState> = health_rx.borrow();
-    let pressure_fn = |id: &str| -> f64 {
-        let max: u32 = pool.backends.iter()
-            .find(|b| b.id.as_str() == id)
-            .map(|b| b.max_connections)
-            .unwrap_or(DEFAULT_MAX_CONNECTIONS);
-        conn_pool.connection_pressure(id, max)
-    };
-    match pool.select_with_pressure(client_ip, &health, &pressure_fn) {
-        Some(backend) => return Ok(backend.clone()),
-        None => return Err(ReductionError::BackendUnavailable),
-    }
-}
-
-struct ResolvedRoute {
-    backend_id: ArrayString<256>,
-    pool: BackendPool,
-    timeout_secs: Option<u64>,
-}
-
-// Resolve route and backend pool from reloadable state before any await point.
-fn resolve_backend_pool(
-    reloadable: &watch::Receiver<ReloadableState>,
-    path: &str,
-) -> std::result::Result<ResolvedRoute, Response<Body>> {
-    let state: watch::Ref<'_, ReloadableState> = reloadable.borrow();
-
-    let route_match: RouteMatch<'_> = match state.router.match_route(path) {
-        Some(m) => m,
-        None => {
-            return Err(error_response(StatusCode::NOT_FOUND, "no route matched"));
-        }
-    };
-
-    let pool: &BackendPool = match state.backend_pools.get(route_match.backend_id.as_str()) {
-        Some(p) => p,
-        None => {
-            error!(backend_id = route_match.backend_id.as_str(), "route matched but no backend pool found");
-            return Err(error_response(StatusCode::BAD_GATEWAY, "backend pool not found"));
-        }
-    };
-
-    return Ok(ResolvedRoute {
-        backend_id: *route_match.backend_id,
-        pool: pool.clone(),
-        timeout_secs: route_match.timeout_secs,
-    });
-}
-
-// Adapts axum HeaderMap for OTel trace context extraction from inbound requests.
-struct HeaderExtractor<'a>(&'a axum::http::HeaderMap);
-
-impl Extractor for HeaderExtractor<'_> {
-    fn get(&self, key: &str) -> Option<&str> {
-        return self.0.get(key).and_then(|v| v.to_str().ok());
-    }
-
-    fn keys(&self) -> Vec<&str> {
-        return self.0.keys().map(|k| k.as_str()).collect();
-    }
-}
-
-// Adapts axum HeaderMap for OTel trace context injection into outbound requests.
-struct HeaderInjector<'a>(&'a mut axum::http::HeaderMap);
-
-impl Injector for HeaderInjector<'_> {
-    fn set(&mut self, key: &str, value: String) {
-        if let Ok(name) = axum::http::header::HeaderName::from_bytes(key.as_bytes())
-            && let Ok(val) = HeaderValue::from_str(&value)
-        {
-            self.0.insert(name, val);
-        }
-    }
-}
-
 #[cold]
 fn error_response(status: StatusCode, message: &str) -> Response<Body> {
-    // Build without the fallible `Response::builder` so a status code can never produce a panic.
-    let mut response: Response<Body> = Response::new(Body::from(String::from(message)));
-    *response.status_mut() = status;
-    return response;
+	// Build without the fallible `Response::builder` so a status code can never produce a panic.
+	let mut response: Response<Body> = Response::new(Body::from(String::from(message)));
+	*response.status_mut() = status;
+	return response;
 }
 
+// Pre-routing admission gates (ACL, per-IP rate limit, parseable mTLS identity, revocation): returns the
+// rejection response or None. Gated before routing/cache so a denied/unnameable/revoked peer reaches neither
+// a backend nor a cache entry (a None identity can't be named, so it's rejected, not forwarded anonymously).
+fn reject_before_routing(
+	state: &Arc<ProxyState>,
+	client_ip: IpAddr,
+	client_identity: Option<&PeerIdentity>,
+) -> Option<Response<Body>> {
+	if state.reloadable.borrow().acl.check(client_ip).is_err() {
+		return Some(error_response(StatusCode::FORBIDDEN, "access denied"));
+	}
+	if state.rate_limiter.check(client_ip).is_err() {
+		state.metrics.rate_limit_rejections.add(1, &[]);
+		return Some(error_response(StatusCode::TOO_MANY_REQUESTS, "rate limited"));
+	}
+	// A nameless peer is refused only under mandatory mTLS. In public-browser mode (client_auth =
+	// disabled/optional) an anonymous browser is admitted and forwarded with no identity headers — the
+	// TLS layer already declined to request or require a client cert, so this gate must match it.
+	if client_identity.is_none() && !state.client_auth.allows_anonymous() {
+		state
+			.metrics
+			.requests_rejected
+			.add(1, &[KeyValue::new(REJECT_REASON_KEY, REJECT_REASON_NO_IDENTITY)]);
+		return Some(error_response(StatusCode::FORBIDDEN, "client identity required"));
+	}
+	if let Some(identity) = client_identity
+		&& state.revocation.borrow().is_revoked(identity)
+	{
+		state
+			.metrics
+			.requests_rejected
+			.add(1, &[KeyValue::new(REJECT_REASON_KEY, REJECT_REASON_REVOKED)]);
+		return Some(error_response(StatusCode::FORBIDDEN, "revoked"));
+	}
+	return None;
+}
+
+
+// The request entry point: admit, serve from cache, route+queue, prepare the replay body, drive the retry
+// loop. Per-attempt guards are created here or handed back by `run_attempt` and moved into the streaming body.
 #[tracing::instrument(skip_all, fields(
     http.method = %req.method(),
     http.target = %req.uri().path(),
     http.status_code = tracing::field::Empty,
     proxy.backend = tracing::field::Empty,
 ))]
-pub async fn proxy_handler(
-    State(state): State<Arc<ProxyState>>,
-    req: Request<Body>,
-) -> Response<Body> {
-    // Extract W3C trace context from inbound request headers.
-    // Joins the caller's trace if traceparent is present, otherwise starts a new root trace.
-    let parent_cx = global::get_text_map_propagator(|propagator| {
-        propagator.extract(&HeaderExtractor(req.headers()))
-    });
-    let _ = tracing::Span::current().set_parent(parent_cx);
+pub async fn proxy_handler(State(state): State<Arc<ProxyState>>, req: Request<Body>) -> Response<Body> {
+	let (start, client_ip, client_identity): (Instant, IpAddr, Option<PeerIdentity>) = match admit_client(&state, &req) {
+		ClientAdmission::Reject(response) => return response,
+		ClientAdmission::Proceed { start, client_ip, client_identity } => (start, client_ip, client_identity),
+	};
 
-    let start: Instant = Instant::now();
+	// Active-connection gauge held for the whole request: drops (−1) when the handler returns on a buffered path,
+	// or moves into the response body's guard bundle to drop at true end-of-body. Metrics-owned so the drain loop tracks it.
+	let active_conn: ActiveConnectionGuard = state.metrics.connection_guard();
 
-    let client_ip: IpAddr = req
-        .extensions()
-        .get::<ConnectInfo<ConnectAddr>>()
-        .map(|ci| ci.0.ip())
-        .unwrap_or_else(|| IpAddr::from([127, 0, 0, 1]));
+	if let Some(response) = reject_before_routing(&state, client_ip, client_identity.as_ref()) {
+		return response;
+	}
 
-    if state.shutdown.is_cancelled() {
-        let mut response: Response<Body> = error_response(StatusCode::SERVICE_UNAVAILABLE, "server is shutting down");
-        response.headers_mut().insert("Retry-After", HeaderValue::from_static(SHUTDOWN_RETRY_AFTER_SECS));
-        return response;
-    }
+	let CacheNegotiation {
+		is_cacheable_method,
+		accepts_zstd,
+		request_is_zstd,
+		request_has_cookie,
+		cache_identity_hex,
+	} = match negotiate_cache(&state, &req, client_identity.as_ref()) {
+		CacheDecision::Hit(response) => return response,
+		CacheDecision::Miss(negotiation) => negotiation,
+	};
+	// The SPKI hex lives in its stack ArrayString for the whole request; the cache key borrows &str.
+	let cache_identity: &str = cache_identity_hex.as_deref().unwrap_or("");
 
-    state.metrics.track_connection(1);
+	let RouteInfo {
+		backend_id,
+		pool,
+		request_timeout,
+		response_idle_timeout,
+		queue_permit,
+		queue_guard,
+	} = match route_and_admit(&state, req.uri().path(), start) {
+		Ok(info) => info,
+		Err(response) => return *response,
+	};
 
-    if state.acl.check(client_ip).is_err() {
-        state.metrics.track_connection(-1);
-        return error_response(StatusCode::FORBIDDEN, "access denied");
-    }
+	// Selection, connection permit, and circuit gating are per-attempt (inside the retry loop below) so a
+	// retry re-selects a different healthy member instead of hammering the one that just failed.
 
-    if state.rate_limiter.check(client_ip).is_err() {
-        state.metrics.rate_limit_rejections.add(1, &[]);
-        state.metrics.track_connection(-1);
-        return error_response(StatusCode::TOO_MANY_REQUESTS, "rate limited");
-    }
+	let (mut replay, max_attempts): (ReplayBody, u32) =
+		match prepare_replay_body(req, &state, request_is_zstd, &backend_id, start).await {
+			PreparedBody::Ready(replay, max_attempts) => (replay, max_attempts),
+			PreparedBody::Respond(response) => return response,
+		};
 
-    let is_cacheable_method: bool =
-        req.method() == hyper::Method::GET || req.method() == hyper::Method::HEAD;
+	let deadline: Instant = start + request_timeout;
+	let connect_budget: Duration = Duration::from_secs(state.timeouts.connect_secs.get());
 
-    if state.cache_config.enabled && is_cacheable_method {
-        if let Some(cached) = state.response_cache.get(req.method().as_str(), req.uri().path_and_query().map(|pq| pq.as_str()).unwrap_or(req.uri().path())) {
-            state.metrics.cache_hits.add(1, &[]);
-            state.metrics.track_connection(-1);
-            return cached;
-        }
-        state.metrics.cache_misses.add(1, &[]);
-    }
+	let ctx: RequestCtx<'_> = RequestCtx {
+		state: &state,
+		pool: &pool,
+		client_ip,
+		client_identity,
+		backend_id,
+		cache_identity,
+		start,
+		max_attempts,
+		is_cacheable_method,
+		request_has_cookie,
+		accepts_zstd,
+	};
+	let mut retry: RetryState = RetryState {
+		failed_backends: ArrayVec::new(),
+		last_response: None,
+		last_error_msg: None,
+	};
 
-    // Capture compression negotiation headers before consuming the request
-    let accepts_zstd: bool = req
-        .headers()
-        .get(ACCEPT_ENCODING)
-        .and_then(|v| v.to_str().ok())
-        .map(|v| v.contains("zstd"))
-        .unwrap_or(false);
+	for attempt in 0..max_attempts {
+		let now: Instant = Instant::now();
+		let remaining: Duration = match deadline.checked_duration_since(now) {
+			Some(d) if d > connect_budget => d,
+			_ => {
+				warn!(attempt, "retry budget exhausted");
+				break;
+			}
+		};
+		match run_attempt(&ctx, attempt, remaining, &mut replay, &mut retry).await {
+			AttemptOutcome::Continue => continue,
+			AttemptOutcome::Break => break,
+			AttemptOutcome::Return(response) => return response,
+			AttemptOutcome::Stream { response, conn, half_open } => {
+				// Winning attempt: move every accounting guard into the streaming body so they are held until the body finishes.
+				let guards: ResponseGuards = ResponseGuards {
+					active_conn,
+					queue_depth: queue_guard,
+					queue_permit,
+					conn: Some(conn),
+					half_open,
+				};
+				return guard_streaming_body(response, guards, response_idle_timeout);
+			}
+		}
+	}
 
-    let request_is_zstd: bool = req
-        .headers()
-        .get(CONTENT_ENCODING)
-        .and_then(|v| v.to_str().ok())
-        .map(|v| v == "zstd")
-        .unwrap_or(false);
-
-    let resolved: ResolvedRoute = match resolve_backend_pool(&state.reloadable, req.uri().path()) {
-        Ok(result) => result,
-        Err(response) => {
-            record_completion(&state, start, StatusCode::NOT_FOUND, "");
-            return response;
-        }
-    };
-    let backend_id: ArrayString<256> = resolved.backend_id;
-    let pool: BackendPool = resolved.pool;
-    let request_timeout: Duration = Duration::from_secs(
-        resolved.timeout_secs.unwrap_or(state.timeouts.request_secs.get()),
-    );
-
-    let backend_str: String = backend_id.as_str().into();
-    let backend_attr: [KeyValue; 1] = [KeyValue::new("backend", backend_str.clone())];
-
-    let queue_depth: u32 = state.default_queue_depth;
-    let queue: Arc<RequestQueue> = state
-        .queues
-        .entry(backend_id)
-        .or_insert_with(|| Arc::new(RequestQueue::new(queue_depth)))
-        .clone();
-
-    state.metrics.queue_depth.add(1, &backend_attr);
-    let _permit: SemaphorePermit<'_> = match queue.try_acquire() {
-        Ok(guard) => guard,
-        Err(e) => {
-            state.metrics.queue_depth.add(-1, &backend_attr);
-            error!(backend = backend_id.as_str(), error = %e, "queue full");
-            record_completion(&state, start, StatusCode::SERVICE_UNAVAILABLE, backend_id.as_str());
-            return error_response(StatusCode::SERVICE_UNAVAILABLE, &format!("{e}"));
-        }
-    };
-
-    let backend: BackendConfig = match select_backend(&pool, client_ip, &state.health_rx, &state.conn_pool) {
-        Ok(b) => {
-            state.metrics.backend_selections.add(1, &[KeyValue::new("backend", String::from(b.id.as_str()))]);
-            b
-        }
-        Err(e) => {
-            state.metrics.queue_depth.add(-1, &backend_attr);
-            error!(backend = backend_id.as_str(), error = %e, "dispatch failed");
-            record_completion(&state, start, StatusCode::BAD_GATEWAY, backend_id.as_str());
-            return error_response(StatusCode::BAD_GATEWAY, &format!("{e}"));
-        }
-    };
-
-    let _conn_guard: ConnPermitGuard = match state.conn_pool.try_acquire_conn_permit(&backend) {
-        Ok(permit) => {
-            state.metrics.backend_active_connections.add(1, &[KeyValue::new("backend", backend_str.clone())]);
-            ConnPermitGuard {
-                counter: state.metrics.backend_active_connections.clone(),
-                backend_kv: KeyValue::new("backend", backend_str.clone()),
-                _permit: permit,
-            }
-        }
-        Err(_) => {
-            state.metrics.backend_conn_limit_rejected.add(1, &[KeyValue::new("backend", backend_str.clone())]);
-            state.metrics.queue_depth.add(-1, &backend_attr);
-            warn!(backend = backend.id.as_str(), max = backend.max_connections, "connection limit reached");
-            record_completion(&state, start, StatusCode::SERVICE_UNAVAILABLE, backend_id.as_str());
-            return error_response(StatusCode::SERVICE_UNAVAILABLE, "backend connection limit reached");
-        }
-    };
-
-    let _half_open_guard: Option<HalfOpenGuard>;
-    match state.circuit_breakers.check(backend.id.as_str()) {
-        (CircuitState::Open, _) => {
-            state.metrics.circuit_open_total.add(1, &[KeyValue::new("backend", backend_str.clone())]);
-            state.metrics.queue_depth.add(-1, &backend_attr);
-            warn!(backend = backend.id.as_str(), "circuit breaker open, rejecting request");
-            record_completion(&state, start, StatusCode::SERVICE_UNAVAILABLE, backend_id.as_str());
-            return error_response(StatusCode::SERVICE_UNAVAILABLE, "circuit open");
-        }
-        (CircuitState::HalfOpen, guard) => {
-            _half_open_guard = guard;
-            state.metrics.circuit_half_open_probes.add(1, &[KeyValue::new("backend", backend_str.clone())]);
-        }
-        (CircuitState::Closed, _) => {
-            _half_open_guard = None;
-        }
-    }
-
-    // Decompress zstd-encoded request body before forwarding to backend
-    let req: Request<Body> = if request_is_zstd {
-        match decompress_request(req, state.proxy_config.max_response_body_bytes, state.proxy_config.inline_compress_threshold).await {
-            Ok(r) => r,
-            Err(response) => {
-                state.metrics.queue_depth.add(-1, &backend_attr);
-                record_completion(&state, start, StatusCode::BAD_REQUEST, backend_id.as_str());
-                return response;
-            }
-        }
-    } else {
-        req
-    };
-
-    info!(backend = backend.id.as_str(), path = %req.uri().path(), "forwarding request");
-
-    let should_cache: bool = state.cache_config.enabled && is_cacheable_method;
-    let req_method: String = if should_cache { req.method().as_str().into() } else { String::new() };
-    let req_path: String = if should_cache { req.uri().path_and_query().map(|pq| pq.as_str()).unwrap_or(req.uri().path()).into() } else { String::new() };
-
-    let max_attempts: u32 = state.retry_config.max_retries + 1;
-
-    // Only buffer the request body when retries are enabled — otherwise stream directly.
-    let (parts, body) = req.into_parts();
-    let (body_bytes, mut streaming_body): (Option<Bytes>, Option<Body>) = if max_attempts > 1 {
-        match body.collect().await {
-            Ok(collected) => (Some(collected.to_bytes()), None),
-            Err(e) => {
-                state.metrics.queue_depth.add(-1, &backend_attr);
-                warn!(error = %e, "failed to buffer request body");
-                record_completion(&state, start, StatusCode::BAD_REQUEST, backend_id.as_str());
-                return error_response(StatusCode::BAD_REQUEST, "failed to read request body");
-            }
-        }
-    } else {
-        (None, Some(body))
-    };
-
-    let deadline: Instant = start + request_timeout;
-    let connect_budget: Duration = Duration::from_secs(state.timeouts.connect_secs.get());
-
-    let mut last_response: Option<Response<Body>> = None;
-    let mut last_error_msg: Option<String> = None;
-
-    for attempt in 0..max_attempts {
-        let now: Instant = Instant::now();
-        let remaining: Duration = match deadline.checked_duration_since(now) {
-            Some(d) if d > connect_budget => d,
-            _ => {
-                warn!(backend = backend.id.as_str(), attempt, "retry budget exhausted");
-                break;
-            }
-        };
-
-        if attempt > 0
-            && let (CircuitState::Open, _) = state.circuit_breakers.check(backend.id.as_str())
-        {
-            warn!(backend = backend.id.as_str(), attempt, "circuit opened during retry");
-            break;
-        }
-
-        let retry_req: Request<Body> = match &body_bytes {
-            Some(bytes) => Request::from_parts(parts.clone(), Body::from(bytes.clone())),
-            None => match streaming_body.take() {
-                Some(body) => Request::from_parts(parts.clone(), body),
-                None => {
-                    // A streaming body can only be sent once; without a buffered copy we cannot retry.
-                    warn!(backend = backend.id.as_str(), attempt, "streaming body already consumed; cannot retry");
-                    break;
-                }
-            },
-        };
-
-        match forward_request(retry_req, &backend, &state, remaining).await {
-            Ok(response) => {
-                let status: StatusCode = response.status();
-                if is_retryable_status(status) {
-                    state.circuit_breakers.record_failure(backend.id.as_str());
-                    state.metrics.retry_attempts.add(1, &[
-                        KeyValue::new("backend", backend_str.clone()),
-                        KeyValue::new("attempt", i64::from(attempt + 1)),
-                        KeyValue::new("outcome", "retryable_status"),
-                    ]);
-                    if attempt + 1 < max_attempts {
-                        warn!(backend = backend.id.as_str(), attempt, status = status.as_u16(), "retryable status, will retry");
-                        tokio::time::sleep(backoff_delay(attempt, &state.retry_config)).await;
-                        last_response = Some(response);
-                        continue;
-                    }
-                    // Final attempt — fall through and return this response
-                }
-
-                if status.is_server_error() {
-                    state.circuit_breakers.record_failure(backend.id.as_str());
-                } else {
-                    state.circuit_breakers.record_success(backend.id.as_str());
-                }
-
-                state.metrics.queue_depth.add(-1, &backend_attr);
-
-                let cache_directives: CacheDirectives = CacheDirectives::from_response(&response);
-
-                let should_cache: bool = state.cache_config.enabled
-                    && is_cacheable_method
-                    && status.is_success();
-
-                if should_cache {
-                    let (parts, body) = response.into_parts();
-                    let body_bytes: Bytes = match body.collect().await {
-                        Ok(collected) => collected.to_bytes(),
-                        Err(e) => {
-                            warn!(error = %e, "failed to buffer response for caching");
-                            record_completion(&state, start, status, backend_id.as_str());
-                            return error_response(StatusCode::BAD_GATEWAY, "failed to read response");
-                        }
-                    };
-
-                    state.response_cache.put(
-                        req_method.as_str(),
-                        &req_path,
-                        status,
-                        &parts.headers,
-                        body_bytes.to_vec(),
-                        &cache_directives,
-                    );
-
-                    let response: Response<Body> = Response::from_parts(parts, Body::from(body_bytes));
-
-                    if accepts_zstd
-                        && !response_is_encoded(&response)
-                        && status != StatusCode::PARTIAL_CONTENT
-                        && !cache_directives.no_transform
-                    {
-                        record_completion(&state, start, status, backend_id.as_str());
-                        return compress_response(response, state.compression_config.min_bytes, state.compression_config.level);
-                    }
-
-                    record_completion(&state, start, status, backend_id.as_str());
-                    return response;
-                }
-
-                if accepts_zstd
-                    && !response_is_encoded(&response)
-                    && status != StatusCode::PARTIAL_CONTENT
-                    && !cache_directives.no_transform
-                {
-                    record_completion(&state, start, status, backend_id.as_str());
-                    return compress_response(response, state.compression_config.min_bytes, state.compression_config.level);
-                }
-
-                record_completion(&state, start, status, backend_id.as_str());
-                return response;
-            }
-            Err(e) => {
-                state.circuit_breakers.record_failure(backend.id.as_str());
-                state.metrics.retry_attempts.add(1, &[
-                    KeyValue::new("backend", backend_str.clone()),
-                    KeyValue::new("attempt", i64::from(attempt + 1)),
-                    KeyValue::new("outcome", "error"),
-                ]);
-                if attempt + 1 < max_attempts {
-                    warn!(backend = backend.id.as_str(), attempt, error = %e, "forward failed, will retry");
-                    tokio::time::sleep(backoff_delay(attempt, &state.retry_config)).await;
-                    last_error_msg = Some(format!("{e}"));
-                    continue;
-                }
-                error!(backend = backend.id.as_str(), error = %e, "failed to forward request after all attempts");
-                state.metrics.queue_depth.add(-1, &backend_attr);
-                record_completion(&state, start, StatusCode::BAD_GATEWAY, backend_id.as_str());
-                return error_response(StatusCode::BAD_GATEWAY, "backend error");
-            }
-        }
-    }
-
-    // Exhausted retries via budget/circuit — return last response or 502
-    state.metrics.queue_depth.add(-1, &backend_attr);
-    if let Some(response) = last_response {
-        let status: StatusCode = response.status();
-        record_completion(&state, start, status, backend_id.as_str());
-        return response;
-    }
-    let msg: String = last_error_msg.unwrap_or_else(|| "backend error".into());
-    error!(backend = backend.id.as_str(), error = %msg, "all retry attempts exhausted");
-    record_completion(&state, start, StatusCode::BAD_GATEWAY, backend_id.as_str());
-    return error_response(StatusCode::BAD_GATEWAY, "backend error");
+	// Exhausted retries (budget, open circuits, or no untried backend) — return the last retryable response if
+	// captured, else 502. Its per-attempt permit/probe already released; the still-live outer guards move into the body.
+	if let Some(response) = retry.last_response {
+		let status: StatusCode = response.status();
+		record_completion(&state, start, status, backend_id.as_str());
+		let guards: ResponseGuards = ResponseGuards {
+			active_conn,
+			queue_depth: queue_guard,
+			queue_permit,
+			conn: None,
+			half_open: None,
+		};
+		return guard_streaming_body(response, guards, response_idle_timeout);
+	}
+	let msg: String = retry.last_error_msg.unwrap_or_else(|| "backend error".into());
+	error!(backend = backend_id.as_str(), error = %msg, "all retry attempts exhausted");
+	record_completion(&state, start, StatusCode::BAD_GATEWAY, backend_id.as_str());
+	return error_response(StatusCode::BAD_GATEWAY, "backend error");
 }
 
+// Immutable per-request context threaded through the retry loop, built once so each helper takes one borrow instead of a dozen args.
+enum ClientAdmission {
+	Reject(Response<Body>),
+	Proceed {
+		start: Instant,
+		client_ip: IpAddr,
+		client_identity: Option<PeerIdentity>,
+	},
+}
+
+// Join the caller's W3C trace, capture the request-entry timestamp and the connection's proven client
+// identity, and reject immediately with a 503 (Retry-After) when the proxy is draining for shutdown.
+fn admit_client(state: &Arc<ProxyState>, req: &Request<Body>) -> ClientAdmission {
+	// Join the caller's trace if traceparent is present, otherwise start a new root trace.
+	let parent_cx = global::get_text_map_propagator(|propagator| propagator.extract(&HeaderExtractor(req.headers())));
+	let _ = tracing::Span::current().set_parent(parent_cx);
+
+	let start: Instant = Instant::now();
+
+	let connect_addr: Option<ConnectAddr> = req.extensions().get::<ConnectInfo<ConnectAddr>>().map(|ci| ci.0);
+	let client_ip: IpAddr = connect_addr
+		.map(|ca| ca.0.ip())
+		.unwrap_or_else(|| IpAddr::from([127, 0, 0, 1]));
+	// Handshake-proven mTLS identity for this connection; propagated to the backend as headers.
+	let client_identity: Option<PeerIdentity> = connect_addr.and_then(|ca| ca.1);
+
+	if state.shutdown.is_cancelled() {
+		let mut response: Response<Body> = error_response(StatusCode::SERVICE_UNAVAILABLE, "server is shutting down");
+		response
+			.headers_mut()
+			.insert("Retry-After", HeaderValue::from_static(SHUTDOWN_RETRY_AFTER_SECS));
+		return ClientAdmission::Reject(response);
+	}
+
+	return ClientAdmission::Proceed { start, client_ip, client_identity };
+}
+
+
+// The resolved route plus the request-level admission guards. Returned by `route_and_admit` so the
+// prologue's routing and queue-admission branches live in one place instead of inline in the handler.
+struct RouteInfo {
+	backend_id: ArrayString<256>,
+	pool: BackendPool,
+	request_timeout: Duration,
+	response_idle_timeout: Duration,
+	queue_permit: OwnedSemaphorePermit,
+	queue_guard: QueueDepthGuard,
+}
+
+// Resolve the path to a backend pool and take its queue-admission permit. `Err` is a ready early response
+// (404/503), boxed so the common Ok path stays small; both error paths record completion first.
+fn route_and_admit(state: &Arc<ProxyState>, path: &str, start: Instant) -> std::result::Result<RouteInfo, Box<Response<Body>>> {
+	let resolved: ResolvedRoute = match resolve_backend_pool(&state.reloadable, path) {
+		Ok(result) => result,
+		Err(response) => {
+			record_completion(state, start, StatusCode::NOT_FOUND, "");
+			return Err(Box::new(response));
+		}
+	};
+	let backend_id: ArrayString<256> = resolved.backend_id;
+	let pool: BackendPool = resolved.pool;
+	let request_timeout: Duration =
+		Duration::from_secs(resolved.timeout_secs.unwrap_or(state.timeouts.request_secs.get()));
+	// Idle timeout for the streaming response body: the request_timeout above only bounds time-to-
+	// headers, so this is what keeps a stalled body from holding the guards indefinitely.
+	let response_idle_timeout: Duration = Duration::from_secs(state.timeouts.response_idle_secs.get());
+
+	// Interned label for the resolved route/pool id; consumed by the queue-depth guard below.
+	let route_label: KeyValue = backend_label(&state.labels, &backend_id);
+
+	let queue_depth: u32 = state.default_queue_depth;
+	let queue: Arc<RequestQueue> = state
+		.queues
+		.entry(backend_id)
+		.or_insert_with(|| Arc::new(RequestQueue::new(queue_depth)))
+		.clone();
+
+	// Owned permit so it can be moved into the response body and released at true end-of-body, not at
+	// handler return; a streaming body that outlived a borrowed permit would defeat the connection cap.
+	let queue_permit: OwnedSemaphorePermit = match queue.try_acquire_owned() {
+		Ok(guard) => guard,
+		Err(e) => {
+			error!(backend = backend_id.as_str(), error = %e, "queue full");
+			record_completion(state, start, StatusCode::SERVICE_UNAVAILABLE, backend_id.as_str());
+			return Err(Box::new(error_response(StatusCode::SERVICE_UNAVAILABLE, &format!("{e}"))));
+		}
+	};
+	// Gauge is now live for the whole request; the guard drops it when the response body ends (or on an
+	// early-return exit path).
+	let queue_guard: QueueDepthGuard = QueueDepthGuard::new(state.metrics.queue_depth.clone(), route_label);
+
+	return Ok(RouteInfo {
+		backend_id,
+		pool,
+		request_timeout,
+		response_idle_timeout,
+		queue_permit,
+		queue_guard,
+	});
+}
+
+// Either the replay body + retry-attempt count, or a ready-to-return early response. An enum rather
+// than `Result<_, Response>` because a `Response<Body>` Err variant is large (`result_large_err`).
 struct ConnPermitGuard {
-    counter: opentelemetry::metrics::UpDownCounter<i64>,
-    backend_kv: KeyValue,
-    _permit: OwnedSemaphorePermit,
+	counter: opentelemetry::metrics::UpDownCounter<i64>,
+	backend_kv: KeyValue,
+	_permit: OwnedSemaphorePermit,
 }
 
 impl Drop for ConnPermitGuard {
-    fn drop(&mut self) {
-        self.counter.add(-1, from_ref(&self.backend_kv));
-    }
+	fn drop(&mut self) {
+		self.counter.add(-1, from_ref(&self.backend_kv));
+	}
+}
+
+// RAII guard for the queue-depth gauge: +1 on construction, −1 on drop, so no early-return path can leak the gauge.
+struct QueueDepthGuard {
+	counter: opentelemetry::metrics::UpDownCounter<i64>,
+	backend_kv: KeyValue,
+}
+
+impl QueueDepthGuard {
+	fn new(counter: opentelemetry::metrics::UpDownCounter<i64>, backend_kv: KeyValue) -> Self {
+		counter.add(1, from_ref(&backend_kv));
+		return Self { counter, backend_kv };
+	}
+}
+
+impl Drop for QueueDepthGuard {
+	fn drop(&mut self) {
+		self.counter.add(-1, from_ref(&self.backend_kv));
+	}
+}
+
+// Per-request accounting (conn gauge, queue gauge+slot, connection permit, half-open probe) bundled so a
+// streaming body owns them and releases each at true end-of-body. Fields exist only to be dropped (RAII).
+#[allow(dead_code)]
+struct ResponseGuards {
+	active_conn: ActiveConnectionGuard,
+	queue_depth: QueueDepthGuard,
+	queue_permit: OwnedSemaphorePermit,
+	conn: Option<ConnPermitGuard>,
+	half_open: Option<HalfOpenGuard>,
+}
+
+// Wrap a streaming response body so it owns `guards` (released only at body end) and aborts if the backend
+// stalls past `idle_timeout` between frames. Applied after compression so the guards cover the whole pipeline.
+fn guard_streaming_body(response: Response<Body>, guards: ResponseGuards, idle_timeout: Duration) -> Response<Body> {
+	let (parts, body) = response.into_parts();
+	let guarded: GuardedBody<Body, ResponseGuards> = GuardedBody::new(body, guards, idle_timeout);
+	return Response::from_parts(parts, Body::new(guarded));
 }
 
 fn record_completion(state: &ProxyState, start: Instant, status: StatusCode, backend_str: &str) {
-    let duration_ms: f64 = start.elapsed().as_secs_f64() * 1000.0;
-    let attrs: [KeyValue; 2] = [
-        KeyValue::new("status", i64::from(status.as_u16())),
-        KeyValue::new("backend", String::from(backend_str)),
-    ];
-    state.metrics.requests_total.add(1, &attrs);
-    state.metrics.request_duration_ms.record(duration_ms, &attrs);
-    state.metrics.track_connection(-1);
+	let duration_ms: f64 = start.elapsed().as_secs_f64() * SECS_TO_MILLIS;
+	let attrs: [KeyValue; 2] = [
+		KeyValue::new("status", i64::from(status.as_u16())),
+		completion_backend_label(&state.labels, backend_str),
+	];
+	state.metrics.requests_total.add(1, &attrs);
+	state.metrics.request_duration_ms.record(duration_ms, &attrs);
+	// Active-connection gauge is decremented by ActiveConnGuard on handler return, not here.
 
-    // Populate deferred span fields for OTel trace export
-    let span = tracing::Span::current();
-    span.record("http.status_code", status.as_u16());
-    span.record("proxy.backend", backend_str);
+	// Populate deferred span fields for OTel trace export
+	let span = tracing::Span::current();
+	span.record("http.status_code", status.as_u16());
+	span.record("proxy.backend", backend_str);
 }
 
-#[inline]
-fn response_is_encoded(response: &Response<Body>) -> bool {
-    return response
-        .headers()
-        .contains_key(CONTENT_ENCODING);
-}
-
-#[inline]
-fn is_retryable_status(status: StatusCode) -> bool {
-    return matches!(
-        status.as_u16(),
-        STATUS_BAD_GATEWAY | STATUS_SERVICE_UNAVAILABLE | STATUS_TOO_MANY_REQUESTS
-    );
-}
-
-// Compute exponential backoff with pseudo-random jitter.
-// delay = min(base_delay * 2^attempt, max_delay) + hash_jitter(0..jitter_ms)
-fn backoff_delay(attempt: u32, config: &RetryConfig) -> Duration {
-    let exp_delay_ms: u64 = config
-        .base_delay_ms
-        .saturating_mul(1u64.checked_shl(attempt).unwrap_or(u64::MAX))
-        .min(config.max_delay_ms);
-
-    let jitter_ms: u64 = if config.jitter_ms > 0 {
-        // Deterministic-enough jitter from hashing the attempt + current time nanos
-        let mut hasher: DefaultHasher = DefaultHasher::new();
-        attempt.hash(&mut hasher);
-        Instant::now().elapsed().as_nanos().hash(&mut hasher);
-        let hash: u64 = hasher.finish();
-        hash % config.jitter_ms
-    } else {
-        0
-    };
-
-    return Duration::from_millis(exp_delay_ms.saturating_add(jitter_ms));
-}
-
-#[tracing::instrument(skip_all)]
-async fn decompress_request(req: Request<Body>, max_body: u32, inline_threshold: u32) -> std::result::Result<Request<Body>, Response<Body>> {
-    let (mut parts, body) = req.into_parts();
-
-    let body_bytes: Bytes = body
-        .collect()
-        .await
-        .map(|c| c.to_bytes())
-        .map_err(|e| {
-            warn!(error = %e, "failed to read request body for decompression");
-            error_response(StatusCode::BAD_REQUEST, "failed to read request body")
-        })?;
-
-    let max_body_usize: usize = usize::try_from(max_body).unwrap_or(usize::MAX);
-    let decompressed: Vec<u8> = if body_bytes.len() <= usize::try_from(inline_threshold).unwrap_or(usize::MAX) {
-        compression::decompress_bounded(&body_bytes, max_body_usize)
-            .map_err(|e| {
-                warn!(error = %e, "request decompression failed");
-                error_response(StatusCode::BAD_REQUEST, "invalid zstd body")
-            })?
-    } else {
-        tokio::task::spawn_blocking(move || {
-            compression::decompress_bounded(&body_bytes, max_body_usize)
-        })
-        .await
-        .map_err(|e| {
-            error!(error = %e, "decompression task panicked");
-            error_response(StatusCode::INTERNAL_SERVER_ERROR, "decompression failed")
-        })?
-        .map_err(|e| {
-            warn!(error = %e, "request decompression failed");
-            error_response(StatusCode::BAD_REQUEST, "invalid zstd body")
-        })?
-    };
-
-    parts.headers.remove(CONTENT_ENCODING);
-    parts.headers.insert(
-        CONTENT_LENGTH,
-        HeaderValue::from(decompressed.len()),
-    );
-
-    return Ok(Request::from_parts(parts, Body::from(decompressed)));
-}
-
-fn compress_response(response: Response<Body>, min_bytes: u32, compression_level: i32) -> Response<Body> {
-    let (mut parts, body) = response.into_parts();
-
-    if let Some(len) = parts.headers.get(CONTENT_LENGTH).and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<u32>().ok())
-        && len < min_bytes
-    {
-        return Response::from_parts(parts, body);
-    }
-
-    parts.headers.insert(
-        CONTENT_ENCODING,
-        HeaderValue::from_static("zstd"),
-    );
-    parts.headers.remove(CONTENT_LENGTH);
-
-    let compressed: CompressedBody<Body> = match CompressedBody::with_level(body, compression_level) {
-        Ok(c) => c,
-        Err(_) => {
-            return Response::from_parts(parts, Body::empty());
-        }
-    };
-    return Response::from_parts(parts, Body::new(compressed));
-}
-
-
+// Execute one outbound attempt against `backend`: acquire a pooled connection, rewrite headers (host,
+// forwarded, identity, trace injection), send, and cap the response body at the configured limit.
 #[tracing::instrument(skip_all, fields(backend = backend.id.as_str()))]
 async fn forward_request(
-    req: Request<Body>,
-    backend: &BackendConfig,
-    state: &Arc<ProxyState>,
-    request_timeout: Duration,
+	req: Request<Body>,
+	backend: &BackendConfig,
+	state: &Arc<ProxyState>,
+	request_timeout: Duration,
+	identity: Option<&PeerIdentity>,
+	client_ip: IpAddr,
 ) -> Result<Response<Body>> {
-    let connect_timeout: Duration = Duration::from_secs(state.timeouts.connect_secs.get());
-    let handshake_timeout: Duration = Duration::from_secs(state.timeouts.handshake_secs.get());
-    let mut sender: HttpSender =
-        state.conn_pool.acquire(backend, &state.tls_connector, &state.client_tls_config, connect_timeout, handshake_timeout).await?;
+	let connect_timeout: Duration = Duration::from_secs(state.timeouts.connect_secs.get());
+	let handshake_timeout: Duration = Duration::from_secs(state.timeouts.handshake_secs.get());
+	let mut sender: HttpSender = state
+		.conn_pool
+		.acquire(
+			backend,
+			&state.tls_connector,
+			&state.client_tls_config,
+			connect_timeout,
+			handshake_timeout,
+		)
+		.await?;
 
-    let (mut parts, body) = req.into_parts();
-    parts.headers.insert(
-        HOST,
-        HeaderValue::from_str(&backend.host)
-            .map_err(|e| ReductionError::Forward(format!("invalid host header: {e}")))?,
-    );
-    parts.headers.remove("x-forwarded-for");
-    parts.headers.remove("x-forwarded-proto");
-    parts.headers.remove("x-forwarded-host");
-    parts.headers.remove("forwarded");
-    parts.headers.remove("x-real-ip");
+	let (mut parts, body) = req.into_parts();
+	strip_hop_by_hop_headers(&mut parts.headers);
+	parts.headers.insert(
+		HOST,
+		HeaderValue::from_str(&backend.host)
+			.map_err(|e| ReductionError::Forward(format!("invalid host header: {e}")))?,
+	);
+	apply_forwarded_headers(&mut parts.headers, client_ip)?;
+	apply_identity_headers(&mut parts.headers, identity)?;
 
-    // Inject current trace context into outbound headers so the
-    // backend can continue the distributed trace.
-    global::get_text_map_propagator(|propagator| {
-        let cx = tracing::Span::current().context();
-        propagator.inject_context(&cx, &mut HeaderInjector(&mut parts.headers));
-    });
+	// Inject current trace context into outbound headers so the
+	// backend can continue the distributed trace.
+	global::get_text_map_propagator(|propagator| {
+		let cx = tracing::Span::current().context();
+		propagator.inject_context(&cx, &mut HeaderInjector(&mut parts.headers));
+	});
 
-    let backend_req: Request<Body> = Request::from_parts(parts, body);
+	let backend_req: Request<Body> = Request::from_parts(parts, body);
 
-    let response: Response<Incoming> = timeout(request_timeout, sender.send_request(backend_req))
-        .await
-        .map_err(|_| ReductionError::Forward("send request: timed out".into()))?
-        .map_err(|e| ReductionError::Forward(format!("send request: {e}")))?;
+	let response: Response<Incoming> = timeout(request_timeout, sender.send_request(backend_req))
+		.await
+		.map_err(|_| ReductionError::Forward("send request: timed out".into()))?
+		.map_err(|e| ReductionError::Forward(format!("send request: {e}")))?;
 
-    let (parts, incoming_body) = response.into_parts();
-    let limited_body: Limited<Incoming> =
-        Limited::new(incoming_body, usize::try_from(state.proxy_config.max_response_body_bytes).unwrap_or(usize::MAX));
-    let pooled_body: PooledBody<Limited<Incoming>> =
-        PooledBody::new(limited_body, sender);
+	// The spawned connection driver owns the stream, so the per-request `sender` can drop here without truncating the in-flight body.
+	let (mut parts, incoming_body) = response.into_parts();
+	strip_hop_by_hop_headers(&mut parts.headers);
+	let limited_body: Limited<Incoming> = Limited::new(
+		incoming_body,
+		usize::try_from(state.proxy_config.max_response_body_bytes).unwrap_or(usize::MAX),
+	);
 
-    return Ok(Response::from_parts(parts, Body::new(pooled_body)));
+	return Ok(Response::from_parts(parts, Body::new(limited_body)));
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::config::{RouteConfig, TimeoutConfig, TransportKind};
-    use crate::proxy::router::Router;
+	use super::*;
+	use crate::config::{RouteConfig, TimeoutConfig, TransportKind};
+	use crate::proxy::router::Router;
 
-    #[test]
-    fn test_error_response_status_and_body() {
-        let resp = error_response(StatusCode::BAD_GATEWAY, "backend error");
-        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
-    }
+	#[test]
+	fn test_error_response_status_and_body() {
+		let resp = error_response(StatusCode::BAD_GATEWAY, "backend error");
+		assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+	}
 
-    #[test]
-    fn test_error_response_not_found() {
-        let resp = error_response(StatusCode::NOT_FOUND, "missing");
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-    }
+	#[test]
+	fn test_error_response_not_found() {
+		let resp = error_response(StatusCode::NOT_FOUND, "missing");
+		assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+	}
 
-    #[test]
-    fn test_error_response_too_many_requests() {
-        let resp = error_response(StatusCode::TOO_MANY_REQUESTS, "rate limited");
-        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
-    }
+	#[test]
+	fn test_error_response_too_many_requests() {
+		let resp = error_response(StatusCode::TOO_MANY_REQUESTS, "rate limited");
+		assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+	}
 
-    #[test]
-    fn test_error_response_service_unavailable() {
-        let resp = error_response(StatusCode::SERVICE_UNAVAILABLE, "queue full");
-        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
-    }
+	#[test]
+	fn test_error_response_service_unavailable() {
+		let resp = error_response(StatusCode::SERVICE_UNAVAILABLE, "queue full");
+		assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+	}
 
-    #[test]
-    fn test_response_is_encoded_false() {
-        let resp = Response::builder()
-            .body(Body::empty())
-            .unwrap();
-        assert!(!response_is_encoded(&resp));
-    }
+	#[test]
+	fn test_is_retryable_status_404_not_retryable() {
+		assert!(!is_retryable_status(StatusCode::NOT_FOUND));
+	}
 
-    #[test]
-    fn test_response_is_encoded_true() {
-        let resp = Response::builder()
-            .header(CONTENT_ENCODING, "zstd")
-            .body(Body::empty())
-            .unwrap();
-        assert!(response_is_encoded(&resp));
-    }
+	#[test]
+	fn test_is_retryable_status_500_not_retryable() {
+		// 500 is a definite server error, not transient — we only retry 502/503/429
+		assert!(!is_retryable_status(StatusCode::INTERNAL_SERVER_ERROR));
+	}
 
-    #[test]
-    fn test_response_is_encoded_gzip() {
-        let resp = Response::builder()
-            .header(CONTENT_ENCODING, "gzip")
-            .body(Body::empty())
-            .unwrap();
-        assert!(response_is_encoded(&resp));
-    }
+	// --- request-pipeline helpers ----------------------------------------------------------------
 
-    fn make_reloadable_state(routes: &[(&str, &str)], backends: Vec<BackendConfig>) -> watch::Receiver<ReloadableState> {
-        let route_configs: Vec<RouteConfig> = routes
-            .iter()
-            .map(|(prefix, id)| RouteConfig {
-                path_prefix: ArrayString::from(prefix).unwrap(),
-                backend_id: ArrayString::from(id).unwrap(),
-                timeout_secs: None,
-            })
-            .collect();
+	fn install_crypto() {
+		let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+	}
 
-        let router = Router::new(&route_configs);
-        let mut grouped: HashMap<ArrayString<256>, Vec<BackendConfig>> = HashMap::new();
-        for b in backends {
-            let key: ArrayString<256> = ArrayString::from(b.pool.as_str()).unwrap();
-            grouped.entry(key).or_default().push(b);
-        }
-        let backend_pools: HashMap<ArrayString<256>, BackendPool> = grouped
-            .into_iter()
-            .map(|(id, bs)| (id, BackendPool::new(bs, 0.0).unwrap()))
-            .collect();
+	fn client_config() -> Arc<rustls::ClientConfig> {
+		return Arc::new(
+			rustls::ClientConfig::builder()
+				.with_root_certificates(rustls::RootCertStore::empty())
+				.with_no_client_auth(),
+		);
+	}
 
-        let state = ReloadableState { router, backend_pools };
-        let (_tx, rx) = watch::channel(state);
-        return rx;
-    }
+	fn build_state(reloadable: ReloadableState, revocation: RevocationSet) -> Arc<ProxyState> {
+		install_crypto();
+		return ProxyState::for_test(TestProxyStateParams::new(
+			reloadable,
+			revocation,
+			client_config(),
+			TimeoutConfig::default(),
+		));
+	}
 
-    #[test]
-    fn test_resolve_backend_pool_success() {
-        let backend = BackendConfig::new(
-            "api".into(), "127.0.0.1:8080".parse().unwrap(), 1.0, TransportKind::Tcp,
-        ).unwrap();
-        let rx = make_reloadable_state(&[("/api", "api")], vec![backend]);
-        let result = resolve_backend_pool(&rx, "/api/test");
-        assert!(result.is_ok());
-        let resolved = result.unwrap();
-        assert_eq!(resolved.backend_id.as_str(), "api");
-        assert_eq!(resolved.pool.backends.len(), 1);
-        assert_eq!(resolved.timeout_secs, None);
-    }
+	fn build_state_with_policy(
+		reloadable: ReloadableState,
+		revocation: RevocationSet,
+		client_auth: ClientAuthPolicy,
+	) -> Arc<ProxyState> {
+		install_crypto();
+		return ProxyState::for_test(TestProxyStateParams {
+			client_auth,
+			..TestProxyStateParams::new(reloadable, revocation, client_config(), TimeoutConfig::default())
+		});
+	}
 
-    #[test]
-    fn test_resolve_backend_pool_no_route() {
-        let backend = BackendConfig::new(
-            "api".into(), "127.0.0.1:8080".parse().unwrap(), 1.0, TransportKind::Tcp,
-        ).unwrap();
-        let rx = make_reloadable_state(&[("/api", "api")], vec![backend]);
-        let result = resolve_backend_pool(&rx, "/health");
-        let resp = match result {
-            Err(r) => r,
-            Ok(_) => panic!("expected error response"),
-        };
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-    }
+	fn permissive_reloadable() -> ReloadableState {
+		return ReloadableState {
+			router: Router::new(&[]),
+			backend_pools: HashMap::new(),
+			acl: AccessControl::new(vec![], vec![]),
+		};
+	}
 
-    #[test]
-    fn test_resolve_backend_pool_route_but_no_pool() {
-        let route_configs = vec![RouteConfig {
-            path_prefix: ArrayString::from("/api").unwrap(),
-            backend_id: ArrayString::from("missing-pool").unwrap(),
-            timeout_secs: None,
-        }];
-        let router = Router::new(&route_configs);
-        let state = ReloadableState {
-            router,
-            backend_pools: HashMap::new(),
-        };
-        let (_tx, rx) = watch::channel(state);
-        let result = resolve_backend_pool(&rx, "/api/test");
-        let resp = match result {
-            Err(r) => r,
-            Ok(_) => panic!("expected error response"),
-        };
-        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
-    }
+	fn deny_reloadable(cidr: &str) -> ReloadableState {
+		return ReloadableState {
+			router: Router::new(&[]),
+			backend_pools: HashMap::new(),
+			acl: AccessControl::new(vec![], vec![cidr.parse().unwrap()]),
+		};
+	}
 
-    #[test]
-    fn test_select_backend_success() {
-        let backend = BackendConfig::new(
-            "api".into(), "127.0.0.1:8080".parse().unwrap(), 1.0, TransportKind::Tcp,
-        ).unwrap();
-        let pool = BackendPool::new(vec![backend], 0.0).unwrap();
-        let health = HealthState::new();
-        let (_tx, health_rx) = watch::channel(health);
-        let ip: IpAddr = "10.0.0.1".parse().unwrap();
-        let conn_pool = ConnPool::new();
+	fn routed_reloadable() -> ReloadableState {
+		let backend: BackendConfig =
+			BackendConfig::new("api", "127.0.0.1:8080".parse().unwrap(), 1.0, TransportKind::Tcp).unwrap();
+		let route: RouteConfig = RouteConfig {
+			path_prefix: ArrayString::from("/api").unwrap(),
+			backend_id: ArrayString::from("api").unwrap(),
+			timeout_secs: None,
+		};
+		let mut pools: HashMap<ArrayString<256>, BackendPool> = HashMap::new();
+		pools.insert(ArrayString::from("api").unwrap(), BackendPool::new(vec![backend]).unwrap());
+		return ReloadableState {
+			router: Router::new(&[route]),
+			backend_pools: pools,
+			acl: AccessControl::new(vec![], vec![]),
+		};
+	}
 
-        let result = select_backend(&pool, ip, &health_rx, &conn_pool);
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap().id.as_str(), "api");
-    }
+	// A PeerIdentity from its public fields; `byte` fills the SPKI so spki_hex() is deterministic and distinct.
+	fn identity_with_spki(byte: u8) -> PeerIdentity {
+		return PeerIdentity {
+			common_name: ArrayString::from("dev").unwrap(),
+			spki_sha256: [byte; 32],
+		};
+	}
 
-    #[test]
-    fn test_select_backend_empty_pool() {
-        let pool = BackendPool::new(vec![], 0.0).unwrap();
-        let health = HealthState::new();
-        let (_tx, health_rx) = watch::channel(health);
-        let ip: IpAddr = "10.0.0.1".parse().unwrap();
-        let conn_pool = ConnPool::new();
+	// --- reject_before_routing -------------------------------------------------------------------
 
-        let result = select_backend(&pool, ip, &health_rx, &conn_pool);
-        assert!(result.is_err());
-    }
+	#[test]
+	fn reject_before_routing_denies_acl_blocked_ip() {
+		let state: Arc<ProxyState> = build_state(deny_reloadable("10.0.0.0/8"), RevocationSet::default());
+		let ip: IpAddr = "10.0.0.1".parse().unwrap();
+		let id: PeerIdentity = identity_with_spki(1);
 
-    #[tokio::test]
-    async fn test_decompress_request_valid() {
-        let original = b"hello world from the client";
-        let compressed: Vec<u8> = compression::compress(original).unwrap();
+		let rejection: Option<Response<Body>> = reject_before_routing(&state, ip, Some(&id));
 
-        let req = Request::builder()
-            .header(CONTENT_ENCODING, "zstd")
-            .body(Body::from(compressed))
-            .unwrap();
+		match rejection {
+			Some(response) => assert_eq!(response.status(), StatusCode::FORBIDDEN),
+			None => panic!("an ACL-blocked IP must be rejected"),
+		}
+	}
 
-        let result = decompress_request(req, 10 * 1024 * 1024, 8192).await;
-        assert!(result.is_ok());
-        let decompressed_req = result.unwrap();
-        assert!(!decompressed_req.headers().contains_key(CONTENT_ENCODING));
+	#[test]
+	fn reject_before_routing_rejects_missing_identity() {
+		let state: Arc<ProxyState> = build_state(permissive_reloadable(), RevocationSet::default());
+		let ip: IpAddr = "10.0.0.1".parse().unwrap();
 
-        let body_bytes = decompressed_req
-            .into_body()
-            .collect()
-            .await
-            .unwrap()
-            .to_bytes();
-        assert_eq!(&body_bytes[..], original);
-    }
+		let rejection: Option<Response<Body>> = reject_before_routing(&state, ip, None);
 
-    #[tokio::test]
-    async fn test_decompress_request_invalid_zstd() {
-        let req = Request::builder()
-            .header(CONTENT_ENCODING, "zstd")
-            .body(Body::from(vec![0xFF, 0xFE, 0xFD]))
-            .unwrap();
+		match rejection {
+			Some(response) => assert_eq!(response.status(), StatusCode::FORBIDDEN, "an unnameable peer is refused"),
+			None => panic!("a request with no identity must be rejected"),
+		}
+	}
 
-        let result = decompress_request(req, 10 * 1024 * 1024, 8192).await;
-        assert!(result.is_err());
-        let resp = result.unwrap_err();
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-    }
+	#[test]
+	fn reject_before_routing_admits_anonymous_under_disabled_policy() {
+		// Public-browser mode: a request with no mTLS identity must be admitted (None returned), the
+		// application-layer inverse of the TLS layer no longer requesting a client cert. Contrast with
+		// reject_before_routing_rejects_missing_identity, which uses the default Required policy.
+		let state: Arc<ProxyState> =
+			build_state_with_policy(permissive_reloadable(), RevocationSet::default(), ClientAuthPolicy::Disabled);
+		let ip: IpAddr = "10.0.0.1".parse().unwrap();
 
-    #[tokio::test]
-    async fn test_compress_response_round_trip() {
-        let original: Vec<u8> = "response body data for compression "
-            .repeat(10)
-            .into_bytes();
-        let resp = Response::builder()
-            .body(Body::from(original.clone()))
-            .unwrap();
+		let rejection: Option<Response<Body>> = reject_before_routing(&state, ip, None);
+		assert!(rejection.is_none(), "an anonymous request must be admitted under the disabled policy");
+	}
 
-        let compressed_resp = compress_response(resp, 256, 3);
-        assert_eq!(
-            compressed_resp.headers().get(CONTENT_ENCODING).unwrap(),
-            "zstd"
-        );
-        assert!(!compressed_resp.headers().contains_key(CONTENT_LENGTH));
+	#[test]
+	fn reject_before_routing_admits_anonymous_under_optional_policy() {
+		let state: Arc<ProxyState> =
+			build_state_with_policy(permissive_reloadable(), RevocationSet::default(), ClientAuthPolicy::Optional);
+		let ip: IpAddr = "10.0.0.1".parse().unwrap();
 
-        let body_bytes = compressed_resp
-            .into_body()
-            .collect()
-            .await
-            .unwrap()
-            .to_bytes();
-        let decompressed: Vec<u8> = compression::decompress(&body_bytes).unwrap();
-        assert_eq!(decompressed, original);
-    }
+		let rejection: Option<Response<Body>> = reject_before_routing(&state, ip, None);
+		assert!(rejection.is_none(), "an anonymous request must be admitted under the optional policy");
+	}
 
-    #[tokio::test]
-    async fn test_compress_response_small_body_skipped() {
-        let original = b"tiny";
-        let resp = Response::builder()
-            .header(CONTENT_LENGTH, original.len())
-            .body(Body::from(original.to_vec()))
-            .unwrap();
+	#[test]
+	fn reject_before_routing_still_revokes_named_peer_under_disabled_policy() {
+		// Even in public-browser mode a PRESENTED-and-revoked identity is still refused: disabling
+		// mandatory auth relaxes the nameless-peer gate only, not revocation of an authenticated one.
+		let id: PeerIdentity = identity_with_spki(9);
+		let toml: String = format!("[[revoked]]\nspki = \"{}\"\nreason = \"clone\"\n", id.spki_hex());
+		let revocation: RevocationSet = RevocationSet::parse(&toml).unwrap();
+		let state: Arc<ProxyState> =
+			build_state_with_policy(permissive_reloadable(), revocation, ClientAuthPolicy::Disabled);
+		let ip: IpAddr = "10.0.0.1".parse().unwrap();
 
-        let result = compress_response(resp, 256, 3);
-        assert!(!result.headers().contains_key(CONTENT_ENCODING));
-        let body_bytes = result.into_body().collect().await.unwrap().to_bytes();
-        assert_eq!(&body_bytes[..], original);
-    }
+		let rejection: Option<Response<Body>> = reject_before_routing(&state, ip, Some(&id));
+		match rejection {
+			Some(response) => assert_eq!(response.status(), StatusCode::FORBIDDEN, "a revoked named peer is still refused"),
+			None => panic!("a revoked identity must be rejected even under the disabled policy"),
+		}
+	}
 
-    #[test]
-    fn test_reloadable_state_is_clone() {
-        let state = ReloadableState {
-            router: Router::new(&[]),
-            backend_pools: HashMap::new(),
-        };
-        let _cloned = state.clone();
-    }
+	#[test]
+	fn reject_before_routing_rejects_revoked_identity() {
+		let id: PeerIdentity = identity_with_spki(2);
+		let toml: String = format!("[[revoked]]\nspki = \"{}\"\nreason = \"clone\"\n", id.spki_hex());
+		let revocation: RevocationSet = RevocationSet::parse(&toml).unwrap();
+		let state: Arc<ProxyState> = build_state(permissive_reloadable(), revocation);
+		let ip: IpAddr = "10.0.0.1".parse().unwrap();
 
-    #[test]
-    fn test_proxy_config_defaults() {
-        let cfg: ProxyConfig = ProxyConfig::default();
-        assert_eq!(cfg.max_response_body_bytes, 10 * 1024 * 1024);
-        assert_eq!(cfg.h2_connections_per_backend.get(), 4);
-        assert_eq!(cfg.max_idle_quic_per_host, 16);
-        assert_eq!(cfg.h2_stream_window, 2 * 1024 * 1024);
-        assert_eq!(cfg.h2_conn_window, 4 * 1024 * 1024);
-        assert_eq!(cfg.inline_compress_threshold, 8192);
-        assert_eq!(cfg.quic_channel_capacity.get(), 256);
-    }
+		let rejection: Option<Response<Body>> = reject_before_routing(&state, ip, Some(&id));
 
-    #[test]
-    fn test_compression_config_defaults() {
-        let cfg: CompressionConfig = CompressionConfig::default();
-        assert_eq!(cfg.level, 3);
-        assert_eq!(cfg.min_bytes, 256);
-    }
+		match rejection {
+			Some(response) => assert_eq!(response.status(), StatusCode::FORBIDDEN),
+			None => panic!("a revoked identity must be rejected"),
+		}
+	}
 
-    #[test]
-    fn test_timeout_config_defaults() {
-        let cfg: TimeoutConfig = TimeoutConfig::default();
-        assert_eq!(cfg.connect_secs.get(), 5);
-        assert_eq!(cfg.handshake_secs.get(), 5);
-        assert_eq!(cfg.request_secs.get(), 30);
-    }
+	#[test]
+	fn reject_before_routing_admits_allowed_named_unrevoked_peer() {
+		let state: Arc<ProxyState> = build_state(permissive_reloadable(), RevocationSet::default());
+		let ip: IpAddr = "10.0.0.1".parse().unwrap();
+		let id: PeerIdentity = identity_with_spki(3);
 
-    #[tokio::test]
-    async fn test_compress_response_skipped_for_partial_content() {
-        let original = b"partial range data here";
-        let resp = Response::builder()
-            .status(StatusCode::PARTIAL_CONTENT)
-            .header("Content-Range", "bytes 0-22/100")
-            .body(Body::from(original.to_vec()))
-            .unwrap();
+		assert!(reject_before_routing(&state, ip, Some(&id)).is_none(), "a clean peer passes admission");
+	}
 
-        // Simulate the proxy_handler logic: skip compression for 206
-        let status = resp.status();
-        let should_compress = !response_is_encoded(&resp) && status != StatusCode::PARTIAL_CONTENT;
-        assert!(!should_compress);
-    }
+	// --- admit_client ----------------------------------------------------------------------------
 
-    #[tokio::test]
-    async fn test_compress_response_applied_for_200() {
-        let original: Vec<u8> = "response body data for compression "
-            .repeat(10)
-            .into_bytes();
-        let resp = Response::builder()
-            .status(StatusCode::OK)
-            .body(Body::from(original.clone()))
-            .unwrap();
+	#[test]
+	fn admit_client_rejects_while_shutting_down() {
+		let state: Arc<ProxyState> = build_state(permissive_reloadable(), RevocationSet::default());
+		state.shutdown.cancel();
+		let req: Request<Body> = Request::builder().uri("/x").body(Body::empty()).unwrap();
 
-        let status = resp.status();
-        let should_compress = !response_is_encoded(&resp) && status != StatusCode::PARTIAL_CONTENT;
-        assert!(should_compress);
-    }
+		match admit_client(&state, &req) {
+			ClientAdmission::Reject(response) => {
+				assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+				assert!(response.headers().contains_key("Retry-After"), "a draining server sets Retry-After");
+			}
+			ClientAdmission::Proceed { .. } => panic!("a shutting-down server must reject"),
+		}
+	}
 
-    #[test]
-    fn test_no_transform_skips_compression() {
-        let original: Vec<u8> = "response body data for compression "
-            .repeat(10)
-            .into_bytes();
-        let resp = Response::builder()
-            .status(StatusCode::OK)
-            .header("cache-control", "no-transform")
-            .body(Body::from(original))
-            .unwrap();
+	#[test]
+	fn admit_client_extracts_ip_and_identity_from_connect_info() {
+		let state: Arc<ProxyState> = build_state(permissive_reloadable(), RevocationSet::default());
+		let mut req: Request<Body> = Request::builder().uri("/x").body(Body::empty()).unwrap();
+		req.extensions_mut()
+			.insert(ConnectInfo(ConnectAddr("198.51.100.7:40000".parse().unwrap(), Some(identity_with_spki(4)))));
 
-        let status = resp.status();
-        let directives = CacheDirectives::from_response(&resp);
-        let should_compress = !response_is_encoded(&resp)
-            && status != StatusCode::PARTIAL_CONTENT
-            && !directives.no_transform;
-        assert!(!should_compress);
-    }
+		match admit_client(&state, &req) {
+			ClientAdmission::Proceed { client_ip, client_identity, .. } => {
+				assert_eq!(client_ip, "198.51.100.7".parse::<IpAddr>().unwrap());
+				assert!(client_identity.is_some(), "the handshake identity is carried through");
+			}
+			ClientAdmission::Reject(_) => panic!("a normal request must proceed"),
+		}
+	}
 
-    #[test]
-    fn test_no_transform_absent_allows_compression() {
-        let original: Vec<u8> = "response body data for compression "
-            .repeat(10)
-            .into_bytes();
-        let resp = Response::builder()
-            .status(StatusCode::OK)
-            .header("cache-control", "max-age=3600")
-            .body(Body::from(original))
-            .unwrap();
+	#[test]
+	fn admit_client_defaults_ip_when_connect_info_absent() {
+		let state: Arc<ProxyState> = build_state(permissive_reloadable(), RevocationSet::default());
+		let req: Request<Body> = Request::builder().uri("/x").body(Body::empty()).unwrap();
 
-        let status = resp.status();
-        let directives = CacheDirectives::from_response(&resp);
-        let should_compress = !response_is_encoded(&resp)
-            && status != StatusCode::PARTIAL_CONTENT
-            && !directives.no_transform;
-        assert!(should_compress);
-    }
+		match admit_client(&state, &req) {
+			ClientAdmission::Proceed { client_ip, client_identity, .. } => {
+				assert_eq!(client_ip, IpAddr::from([127, 0, 0, 1]), "a missing ConnectInfo falls back to loopback");
+				assert!(client_identity.is_none());
+			}
+			ClientAdmission::Reject(_) => panic!("no ConnectInfo is not itself a rejection here"),
+		}
+	}
 
-    #[test]
-    fn test_range_headers_not_stripped() {
-        use axum::http::HeaderMap;
+	// --- route_and_admit -------------------------------------------------------------------------
 
-        let mut headers = HeaderMap::new();
-        headers.insert("range", HeaderValue::from_static("bytes=0-99"));
-        headers.insert("if-range", HeaderValue::from_static("\"etag123\""));
-        headers.insert("accept-ranges", HeaderValue::from_static("bytes"));
-        headers.insert("content-range", HeaderValue::from_static("bytes 0-99/200"));
+	#[test]
+	fn route_and_admit_errors_404_for_unrouted_path() {
+		let state: Arc<ProxyState> = build_state(permissive_reloadable(), RevocationSet::default());
 
-        // forward_request only strips these headers — verify range headers are not among them
-        let stripped = ["x-forwarded-for", "x-forwarded-proto", "x-forwarded-host", "forwarded", "x-real-ip"];
-        for name in ["range", "if-range", "accept-ranges", "content-range"] {
-            assert!(!stripped.contains(&name), "{name} should not be stripped");
-            assert!(headers.contains_key(name), "{name} must survive forwarding");
-        }
-    }
+		let result = route_and_admit(&state, "/nowhere", Instant::now());
 
-    #[test]
-    fn test_is_retryable_status_502() {
-        assert!(is_retryable_status(StatusCode::BAD_GATEWAY));
-    }
+		match result {
+			Err(response) => assert_eq!(response.status(), StatusCode::NOT_FOUND),
+			Ok(_) => panic!("an unrouted path must 404"),
+		}
+	}
 
-    #[test]
-    fn test_is_retryable_status_503() {
-        assert!(is_retryable_status(StatusCode::SERVICE_UNAVAILABLE));
-    }
+	#[test]
+	fn route_and_admit_resolves_route_and_takes_queue_permit() {
+		let state: Arc<ProxyState> = build_state(routed_reloadable(), RevocationSet::default());
 
-    #[test]
-    fn test_is_retryable_status_429() {
-        assert!(is_retryable_status(StatusCode::TOO_MANY_REQUESTS));
-    }
+		let result = route_and_admit(&state, "/api/thing", Instant::now());
 
-    #[test]
-    fn test_is_retryable_status_200_not_retryable() {
-        assert!(!is_retryable_status(StatusCode::OK));
-    }
+		match result {
+			Ok(info) => {
+				assert_eq!(info.backend_id.as_str(), "api");
+				assert_eq!(info.pool.backends.len(), 1);
+			}
+			Err(_) => panic!("a routed path must resolve"),
+		}
+	}
 
-    #[test]
-    fn test_is_retryable_status_400_not_retryable() {
-        assert!(!is_retryable_status(StatusCode::BAD_REQUEST));
-    }
+	#[test]
+	fn route_and_admit_errors_503_when_queue_full() {
+		let state: Arc<ProxyState> = build_state(routed_reloadable(), RevocationSet::default());
+		// Pre-install a depth-1 queue for the route and hold its only permit, so admission finds it full.
+		let queue: Arc<RequestQueue> = Arc::new(RequestQueue::new(1));
+		state.queues.insert(ArrayString::from("api").unwrap(), queue.clone());
+		let _held: OwnedSemaphorePermit = queue.try_acquire_owned().unwrap();
 
-    #[test]
-    fn test_is_retryable_status_404_not_retryable() {
-        assert!(!is_retryable_status(StatusCode::NOT_FOUND));
-    }
+		let result = route_and_admit(&state, "/api/thing", Instant::now());
 
-    #[test]
-    fn test_is_retryable_status_500_not_retryable() {
-        // 500 is a definite server error, not transient — we only retry 502/503/429
-        assert!(!is_retryable_status(StatusCode::INTERNAL_SERVER_ERROR));
-    }
+		match result {
+			Err(response) => assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE),
+			Ok(_) => panic!("a full queue must reject with 503"),
+		}
+	}
 
-    #[test]
-    fn test_retry_config_defaults() {
-        let cfg: RetryConfig = RetryConfig::default();
-        assert_eq!(cfg.max_retries, 2);
-        assert_eq!(cfg.base_delay_ms, 200);
-        assert_eq!(cfg.max_delay_ms, 2000);
-        assert_eq!(cfg.jitter_ms, 100);
-    }
+	// --- record_completion & guard_streaming_body ------------------------------------------------
 
-    #[test]
-    fn test_backoff_delay_exponential_growth() {
-        let config: RetryConfig = RetryConfig {
-            max_retries: 3,
-            base_delay_ms: 100,
-            max_delay_ms: 5000,
-            jitter_ms: 0,
-        };
-        let d0: Duration = backoff_delay(0, &config);
-        let d1: Duration = backoff_delay(1, &config);
-        let d2: Duration = backoff_delay(2, &config);
+	#[test]
+	fn record_completion_runs_for_named_and_empty_backend() {
+		let state: Arc<ProxyState> = build_state(permissive_reloadable(), RevocationSet::default());
+		// Both label paths (interned id and the empty "" reject path) must record without panicking.
+		record_completion(&state, Instant::now(), StatusCode::OK, "api");
+		record_completion(&state, Instant::now(), StatusCode::BAD_GATEWAY, "");
+	}
 
-        // With zero jitter, delays should be exactly 100, 200, 400
-        assert_eq!(d0, Duration::from_millis(100));
-        assert_eq!(d1, Duration::from_millis(200));
-        assert_eq!(d2, Duration::from_millis(400));
-    }
+	#[tokio::test]
+	async fn guard_streaming_body_preserves_response_and_body() {
+		let state: Arc<ProxyState> = build_state(permissive_reloadable(), RevocationSet::default());
+		let queue: RequestQueue = RequestQueue::new(1);
+		let permit: OwnedSemaphorePermit = queue.try_acquire_owned().unwrap();
+		let label: KeyValue = backend_label(&state.labels, &ArrayString::from("api").unwrap());
+		let guards: ResponseGuards = ResponseGuards {
+			active_conn: state.metrics.connection_guard(),
+			queue_depth: QueueDepthGuard::new(state.metrics.queue_depth.clone(), label),
+			queue_permit: permit,
+			conn: None,
+			half_open: None,
+		};
+		let response: Response<Body> = Response::builder().status(StatusCode::OK).body(Body::from("streamed")).unwrap();
 
-    #[test]
-    fn test_backoff_delay_capped_at_max() {
-        let config: RetryConfig = RetryConfig {
-            max_retries: 10,
-            base_delay_ms: 1000,
-            max_delay_ms: 2000,
-            jitter_ms: 0,
-        };
-        // attempt=5 would be 1000 * 32 = 32000 uncapped, but should be capped at 2000
-        let d: Duration = backoff_delay(5, &config);
-        assert_eq!(d, Duration::from_millis(2000));
-    }
+		let guarded: Response<Body> = guard_streaming_body(response, guards, Duration::from_secs(30));
 
-    #[test]
-    fn test_backoff_delay_jitter_bounded() {
-        let config: RetryConfig = RetryConfig {
-            max_retries: 3,
-            base_delay_ms: 100,
-            max_delay_ms: 5000,
-            jitter_ms: 50,
-        };
-        // Run multiple times — jitter should always be in [0, 50) so total in [100, 150)
-        for _ in 0..20 {
-            let d: Duration = backoff_delay(0, &config);
-            assert!(d >= Duration::from_millis(100), "delay {d:?} below base");
-            assert!(d < Duration::from_millis(150), "delay {d:?} exceeds base + jitter");
-        }
-    }
-
-    #[test]
-    fn test_backoff_delay_zero_jitter() {
-        let config: RetryConfig = RetryConfig {
-            max_retries: 1,
-            base_delay_ms: 200,
-            max_delay_ms: 2000,
-            jitter_ms: 0,
-        };
-        let d: Duration = backoff_delay(0, &config);
-        assert_eq!(d, Duration::from_millis(200));
-    }
+		assert_eq!(guarded.status(), StatusCode::OK);
+		let bytes: Bytes = guarded.into_body().collect().await.unwrap().to_bytes();
+		assert_eq!(&bytes[..], b"streamed", "the guarded body streams through unchanged");
+	}
 }
