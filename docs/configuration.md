@@ -62,13 +62,21 @@ Routes:
 - `GET /livez` — always `200 alive` while the process is up (so "process dead" — connection refused — is distinguishable from "not ready").
 - `GET /readyz` — `200 ready` once startup is complete (under ACME, the initial certificate is provisioned); `503` while starting, and `503 draining` once graceful shutdown begins, so a load balancer withdraws traffic during the drain window.
 
-## `[tls.server.manual]` / `[tls.client]` (required)
+## `[tls.server.manual]` (server identity) / `[tls.client]` (backend identity)
 
 The server TLS mode is chosen by an explicit sub-table: `[tls.server.manual]` for static certificate
 files (below), or `[tls.server.acme]` for Let's Encrypt / ACME provisioning (see `docs/letsencrypt.md`).
-`[tls.server.manual]` and `[tls.client]` share the same fields. The server identity is presented to
-incoming clients; the client identity is used when connecting to backends. Both are validated against the
-CA certificate.
+The server always needs its own identity (a `[tls.server.*]` table is mandatory). `[tls.server.manual]`
+and `[tls.client]` share the same fields. The server identity is presented to incoming clients; the
+client identity is used when connecting to backends.
+
+**`[tls.client]` is optional.** It is required only when at least one backend performs a TLS handshake
+upstream — any backend with `transport = "quic"` (QUIC always uses mTLS) or `scheme = "https"`. A pure
+plaintext-backend deployment (every backend `transport = "tcp"` + `scheme = "http"`, e.g. a public blog
+in front of a cleartext static-site server) dials no TLS upstream and may omit `[tls.client]` entirely.
+Startup **rejects** a config that omits it while a backend still needs it, naming the offending backend;
+a present-but-unused `[tls.client]` is allowed but **warns** (drop it to keep a public host free of unused
+mTLS material).
 
 | Field | Description |
 |---|---|
@@ -111,7 +119,8 @@ resets every NAT'd fleet device.
 - **Client side — `[tls.client] ca_cert_path`** verifies the **backend/upstream server** certs Reduction
   dials. It hot-reloads the same way: the verifier's roots swap in place and the shared client TLS config
   is reused by the connection pool, so a backend-CA rotation takes effect on the next backend handshake
-  with no restart.
+  with no restart. This applies only when `[tls.client]` is present (a backend needs TLS); a
+  plaintext-backend deployment loads no client identity and has no client-side trust to reload.
 
 Both sides share the same semantics:
 
@@ -130,8 +139,12 @@ Both sides share the same semantics:
   does not apply to the client side.
 - **ACME.** Under `[tls.server.acme]`, only Reduction's own server certificate is ACME-provisioned;
   inbound client-cert verification still trusts `ca_cert_path` and hot-reloads exactly as on the manual
-  path (no handshake CRL, since ACME config carries none). The client-side (`[tls.client]`) reload is
-  likewise always active regardless of the server's TLS mode.
+  path (no handshake CRL, since ACME config carries none). Under ACME, **`ca_cert_path` is optional**: it
+  is the inbound client-cert CA, required only when `listen.client_auth` is `"required"` or `"optional"`
+  (the policies that build an inbound verifier) — startup rejects an ACME config that omits it under those
+  policies. Under `client_auth = "disabled"` (public-browser mode) no verifier is built and the CA is
+  never read, so it should be omitted (a present one is simply unused). The client-side (`[tls.client]`)
+  reload is active whenever a client identity is loaded, regardless of the server's TLS mode.
 
 ## Client identity headers
 
