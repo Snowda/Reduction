@@ -1,6 +1,6 @@
 [package]
 name = "reduction"
-version = "0.1.2"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.96.0"
 description = "Low Bandwidth Reverse Proxy"
@@ -9,51 +9,138 @@ license = "MIT"
 publish = false
 
 [features]
-default = []
-acme = ["dep:instant-acme", "dep:x509-parser"]
+default = ["proxy"]
+# Server-side machinery: reverse-proxy pipeline, listeners, tunnel listener/registry, caching,
+# rate limiting, health, metrics, cert fs-watcher. Lean clients (fleet devices dialing tunnels
+# with a device cert) build with default-features = false and get QuicStream, tunnel::protocol,
+# the mTLS client config, and PeerIdentity without the proxy dependency tree.
+proxy = [
+    "dep:axum",
+    "dep:bytes",
+    "dep:dashmap",
+    "dep:governor",
+    "dep:http-body",
+    "dep:http-body-util",
+    "dep:hyper",
+    "dep:hyper-util",
+    "dep:lru",
+    "dep:notify",
+    "dep:opentelemetry",
+    "dep:opentelemetry-otlp",
+    "dep:opentelemetry_sdk",
+    "dep:parking_lot",
+    "dep:pin-project-lite",
+    "dep:rand",
+    "dep:serde_json",
+    "dep:socket2",
+    "dep:tokio-util",
+    "dep:tracing-opentelemetry",
+    "dep:tracing-subscriber",
+    "dep:zstd",
+]
+acme = ["proxy", "dep:instant-acme"]
+# Gates integration tests under tests/ that need external infrastructure (e.g. a pebble ACME server).
+integration_tests = ["proxy"]
+# Profiling-only: switches profile_loadtest's inner allocator to dhat for per-call-stack heap
+# attribution. Off by default so dhat + backtrace never enter normal, test, or CI builds.
+dhat-heap = ["dep:dhat"]
 
 [dependencies]
 arrayvec = { version = "0.7.8", features = ["serde"] }
-axum = { version = "0.8.9", features = ["http2"] }
+axum = { version = "0.8.9", features = ["http2"], optional = true }
 bitcode = { version = "0.6.9", features = ["arrayvec"] }
-dashmap = "6.2.1"
-governor = "0.10.4"
-bytes = "1.11.1"
+dashmap = { version = "6.2.1", optional = true }
+governor = { version = "0.10.4", optional = true }
+bytes = { version = "1.12.1", optional = true }
 instant-acme = { version = "0.8.5", optional = true }
-serde_json = "1.0.150"
-ipnet = { version = "2.12.0", features = ["serde"] }
-http-body = "1.0.1"
-http-body-util = "0.1.3"
-lru = "0.18.0"
-pin-project-lite = "0.2.17"
-hyper = { version = "1.10.1", features = ["client", "http1", "http2"] }
-hyper-util = { version = "0.1.20", features = ["tokio", "http2"] }
-notify = "8.2.0"
-parking_lot = "0.12.5"
-opentelemetry = { version = "0.32.0", features = ["trace"] }
-opentelemetry-otlp = { version = "0.32.0", features = ["trace"] }
-opentelemetry_sdk = { version = "0.32.1", features = ["trace", "rt-tokio"] }
-quinn = "0.11.11"
+serde_json = { version = "1.0.151", optional = true }
+ipnet = { version = "2.12.1", features = ["serde"] }
+http-body = { version = "1.1.0", optional = true }
+http-body-util = { version = "0.1.5", optional = true }
+lru = { version = "0.18.2", optional = true }
+pin-project-lite = { version = "0.2.17", optional = true }
+# Retry backoff jitter — decorrelates concurrent retriers to avoid a thundering herd.
+rand = { version = "0.9", optional = true }
+hyper = { version = "1.11.0", features = ["client", "http1", "http2"], optional = true }
+hyper-util = { version = "0.1.20", features = ["tokio", "http2"], optional = true }
+notify = { version = "8.2.0", optional = true }
+parking_lot = { version = "0.12.5", optional = true }
+opentelemetry = { version = "0.32.0", features = ["trace"], optional = true }
+opentelemetry-otlp = { version = "0.32.0", features = ["trace"], optional = true }
+opentelemetry_sdk = { version = "0.32.1", features = ["trace", "rt-tokio"], optional = true }
+quinn = { version = "0.11.11", default-features = false, features = ["platform-verifier", "runtime-tokio", "rustls-aws-lc-rs", "bloom"] }
 # x509-parser feature enables rcgen::Issuer::from_ca_cert_der, used by test/example PKI helpers
 # to sign leaf certs from an in-memory CA. Reuses the x509-parser 0.18 already in the tree.
-rcgen = { version = "0.14.8", features = ["x509-parser"] }
-rustls = "0.23.40"
-serde = { version = "1.0.228", features = ["derive"] }
+rcgen = { version = "0.14.9", default-features = false, features = ["aws_lc_rs", "pem", "x509-parser"] }
+# SHA-256 over leaf SPKI DER and SystemRandom for PeerIdentity — reuses aws-lc-rs (ring is
+# unmaintained), the provider now linked transitively by rustls/quinn, avoiding a second hash dep.
+aws-lc-rs = "1"
+# Optional heap profiler for profile_loadtest, gated by the dhat-heap feature (see [features]).
+dhat = { version = "0.3", optional = true }
+rustls = "0.23.43"
+serde = { version = "1.0.229", features = ["derive"] }
+# UDP socket options for the ingress listener: SO_RCVBUF sizing and per-worker SO_REUSEPORT
+# (Linux/BSD) so multiple recv workers can flow-hash-share one port. Already in the tree via quinn.
+socket2 = { version = "0.6.5", features = ["all"], optional = true }
 tempfile = "3.27.0"
-thiserror = "2.0.18"
-tokio = { version = "1.52.3", features = ["rt-multi-thread", "net", "io-util", "macros", "signal", "fs", "sync"] }
-tokio-util = "0.7.18"
+thiserror = "2.0.20"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "net", "io-util", "macros", "signal", "fs", "sync", "process"] }
+tokio-util = { version = "0.7.19", optional = true }
 tokio-rustls = "0.26.4"
-toml = "1.1.2"
+toml = "1.1.4"
 tracing = "0.1.44"
-tracing-opentelemetry = "0.33.0"
-tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
-x509-parser = { version = "0.18.1", optional = true }
-zstd = "0.13.3"
+tracing-opentelemetry = { version = "0.33.0", optional = true }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"], optional = true }
+# PeerIdentity leaf-cert parsing (subject CN + SPKI). Core to mTLS identity propagation, always linked.
+x509-parser = "0.18.1"
+zstd = { version = "0.13.3", optional = true }
+
+# The binary is the proxy — a lean-client (no-default-features) build produces the library only.
+[[bin]]
+name = "reduction"
+path = "src/main.rs"
+required-features = ["proxy"]
+
+[[example]]
+name = "acl_demo"
+required-features = ["proxy"]
+
+[[example]]
+name = "demo"
+required-features = ["proxy"]
+
+[[example]]
+name = "letsencrypt_demo"
+required-features = ["proxy"]
+
+[[example]]
+name = "mcp_demo"
+required-features = ["proxy"]
+
+[[example]]
+name = "profile_loadtest"
+required-features = ["proxy"]
+
+[[example]]
+name = "tunnel_demo"
+required-features = ["proxy"]
 
 [dev-dependencies]
 criterion = { version = "0.8.2", features = ["html_reports"] }
+# test-util enables tokio::test(start_paused): the relay idle-timeout tests drive virtual time so
+# "active transfer outlives the timeout" is deterministic instead of wall-clock flaky.
+tokio = { version = "1.53.1", features = ["test-util"] }
 tracing-chrome = "0.7.2"
+# Integration tests drive the real TcpListener via its axum::serve::Listener impl.
+axum = { version = "0.8.9", features = ["http2"] }
+# The acme integration test brings up a local pebble ACME server + mock DNS in Docker.
+testcontainers = "0.28.0"
+# Retry integration tests stand up real TLS h2 backend servers; the proxy's own hyper is
+# client-only, so enable the server feature (unified) plus the h2 body/runtime helpers for tests.
+hyper = { version = "1.11.0", features = ["server", "http2"] }
+hyper-util = { version = "0.1.20", features = ["tokio", "http2"] }
+http-body-util = "0.1.5"
+bytes = "1.12.1"
 
 [profile.release]
 debug = true
@@ -66,26 +153,27 @@ opt-level = 0
 [[bench]]
 name = "router_bench"
 harness = false
+required-features = ["proxy"]
 
 [[bench]]
 name = "balancer_bench"
 harness = false
+required-features = ["proxy"]
 
 [[bench]]
 name = "compression_bench"
 harness = false
+required-features = ["proxy"]
 
 [[bench]]
 name = "ratelimit_bench"
 harness = false
+required-features = ["proxy"]
 
 [[bench]]
 name = "health_bench"
 harness = false
-
-[[bench]]
-name = "tls_cache_bench"
-harness = false
+required-features = ["proxy"]
 
 [lints.rust]
 # deny (not forbid) so a dependency's macro-generated #[allow(unsafe_code)] can compile;
@@ -94,7 +182,7 @@ unsafe_code = "deny"
 
 [lints.clippy]
 # float_arithmetic is intentionally relaxed: this is a load balancer / reverse proxy whose core
-# domain math is inherently floating-point — weighted rendezvous/jitter balancing, health load &
+# domain math is inherently floating-point — weighted rendezvous balancing, health load &
 # latency factors, connection-pressure ratios, OTLP sample ratios, and metric durations. This
 # mirrors how the Athene project relaxed float_arithmetic for its graphics/stats domain. Direct
 # float equality is still a real bug, so float_cmp / float_cmp_const remain deny.
@@ -118,7 +206,7 @@ as_conversions = "warn"
 
 # Ownership / borrowing
 clone_on_copy = "warn"
-redundant_clone = "warn"
+redundant_clone = "deny"
 needless_pass_by_value = "warn"
 ptr_arg = "warn"
 
@@ -131,9 +219,28 @@ needless_return = "allow"       # conflicts with project explicit-return style
 must_use_candidate = "warn"
 str_to_string = "deny"
 
+# No stdout/stderr printing or leftover dbg! in lib/bin code — logging goes through tracing macros
+print_stdout = "deny"
+print_stderr = "deny"
+dbg_macro = "deny"
+unreachable = "deny"
+
 # Iterator preference
 manual_filter_map = "warn"
 manual_find_map = "warn"
+
+# Complexity
+cognitive_complexity = "warn"
+too_many_lines = "warn"
+too_many_arguments = "warn"
+type_complexity = "warn"
+excessive_nesting = "warn"
+
+# API / correctness hygiene
+missing_const_for_fn = "warn"
+too_long_first_doc_paragraph = "warn"
+future_not_send = "warn"
+use_self = "deny"
 
 # Disallowed types are intentionally NOT enforced here: this is a concurrent reverse proxy
 # where shared state via Arc/RwLock is the core architecture (125+ Arc, 14 RwLock uses). The
