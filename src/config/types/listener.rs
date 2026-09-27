@@ -9,24 +9,16 @@ use super::TransportKind;
 pub struct ListenConfig {
 	pub address: SocketAddr,
 	pub transport: TransportKind,
-	// Inbound client-certificate policy for the public listener. Defaults to `required` (mandatory
-	// mTLS, the historical behavior). `disabled` accepts anonymous browsers and requests no client
-	// cert; `optional` requests one but does not require it. Never inferred from ACME mode — an ACME
-	// server can still be mandatory-mTLS, and a manual-cert server can still be public.
+	// Inbound client-cert policy for the public listener; defaults to `required` (mandatory mTLS).
+	// Never inferred from ACME mode — an ACME server can still be mandatory-mTLS.
 	#[serde(default)]
 	pub client_auth: ClientAuthPolicy,
 }
 
-// ── HTTP→HTTPS redirect defaults ──
-
-// Default cleartext bind for the port-80 redirect listener. Parsed in the Default impl (SocketAddr is
-// not const-constructible from a string literal).
 pub const DEFAULT_HTTP_REDIRECT_LISTEN: &str = "0.0.0.0:80";
 
-// Minimal cleartext HTTP listener that answers every request with a permanent redirect (308) to the
-// canonical HTTPS origin. It NEVER proxies content — it exists only so a browser typing `http://` lands
-// on `https://`. Disabled by default; `to_host` is the canonical HTTPS hostname to redirect to (path and
-// query are preserved). Kept separate from `[listen]` because it is a distinct cleartext socket.
+// Cleartext port-80 listener that 308-redirects every request to the canonical HTTPS origin; never
+// proxies content. Separate cleartext socket from `[listen]`; disabled by default.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct HttpRedirectConfig {
@@ -40,7 +32,6 @@ impl Default for HttpRedirectConfig {
 	fn default() -> Self {
 		return Self {
 			enabled: false,
-			// Infallible: the literal is a valid SocketAddr; fall back to an unspecified :80 if ever not.
 			listen: DEFAULT_HTTP_REDIRECT_LISTEN
 				.parse()
 				.unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 80))),
@@ -49,15 +40,11 @@ impl Default for HttpRedirectConfig {
 	}
 }
 
-// ── health endpoint defaults ──
-
-// Default bind for the non-public readiness/liveness endpoint. Loopback so it is not world-reachable
-// by default; an orchestrator on the same host (or a sidecar) probes it. Parsed in the Default impl.
+// Loopback default so the readiness/liveness endpoint is not world-reachable; parsed in the Default impl.
 pub const DEFAULT_HEALTH_ENDPOINT_LISTEN: &str = "127.0.0.1:9090";
 
-// A small cleartext HTTP endpoint, separate from the public data plane, exposing liveness (`/livez`) and
-// readiness (`/readyz`) for an orchestrator/load balancer. Disabled by default; bind it to a private
-// address (loopback or a management interface), never the public internet — it serves no proxy traffic.
+// Cleartext liveness (`/livez`) / readiness (`/readyz`) endpoint, separate from the public data plane.
+// Disabled by default; bind it to a private address, never the public internet.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct HealthEndpointConfig {
@@ -76,10 +63,8 @@ impl Default for HealthEndpointConfig {
 	}
 }
 
-// Inbound mTLS client-certificate policy for the public listener. `Required` is the secure default
-// (a browser with no client cert is rejected at the TLS handshake AND at the application admission
-// gate); `Optional` requests a cert but admits anonymous peers; `Disabled` requests no cert at all
-// (public-browser mode) so an anonymous browser can connect. Only `Required` refuses a nameless peer.
+// Inbound mTLS client-cert policy for the public listener. `Required` (secure default) refuses a nameless
+// peer; `Optional` requests but admits anonymous peers; `Disabled` requests no cert (public-browser mode).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum ClientAuthPolicy {
@@ -90,24 +75,21 @@ pub enum ClientAuthPolicy {
 }
 
 impl ClientAuthPolicy {
-	// Whether a connection presenting no mTLS identity is admitted past the pre-routing gate. True for
-	// every policy except `Required`, which is the only one that refuses a nameless peer.
+	// Whether a connection presenting no mTLS identity is admitted past the pre-routing gate.
 	#[must_use]
 	#[inline]
 	pub const fn allows_anonymous(self) -> bool {
 		return !matches!(self, Self::Required);
 	}
 
-	// Whether the server should still build an inbound client-cert verifier. `Disabled` builds none
-	// (no CertificateRequest is sent); `Required`/`Optional` both verify a presented cert against the CA.
+	// Whether the server builds an inbound client-cert verifier (`Disabled` builds none).
 	#[must_use]
 	#[inline]
 	pub const fn builds_verifier(self) -> bool {
 		return !matches!(self, Self::Disabled);
 	}
 
-	// Whether a presented client cert is mandatory at the TLS handshake. Only `Required`; `Optional`
-	// requests but tolerates absence (allow_unauthenticated), `Disabled` never requests one.
+	// Whether a presented client cert is mandatory at the TLS handshake (only `Required`).
 	#[must_use]
 	#[inline]
 	pub const fn is_mandatory(self) -> bool {
@@ -121,8 +103,7 @@ mod tests {
 
 	#[test]
 	fn client_auth_policy_defaults_to_required() {
-		// A [listen] block with no client_auth key must default to mandatory mTLS (the secure default),
-		// so an existing config is byte-for-byte unchanged in behavior.
+		// No client_auth key must default to mandatory mTLS (secure default), unchanged behavior.
 		let listen: ListenConfig = toml::from_str("address = \"127.0.0.1:8443\"\ntransport = \"tcp\"").unwrap();
 		assert_eq!(listen.client_auth, ClientAuthPolicy::Required);
 		assert_eq!(ClientAuthPolicy::default(), ClientAuthPolicy::Required);
@@ -150,7 +131,6 @@ mod tests {
 
 	#[test]
 	fn client_auth_policy_predicates() {
-		// Only Required refuses a nameless peer; only Disabled builds no verifier; only Required is mandatory.
 		assert!(!ClientAuthPolicy::Required.allows_anonymous());
 		assert!(ClientAuthPolicy::Optional.allows_anonymous());
 		assert!(ClientAuthPolicy::Disabled.allows_anonymous());

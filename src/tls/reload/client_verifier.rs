@@ -32,16 +32,14 @@ fn build_client_verifier(
 	allow_unauthenticated: bool,
 ) -> Result<Arc<dyn ClientCertVerifier>> {
 	let builder = WebPkiClientVerifier::builder(Arc::new(roots));
-	// With CRLs, enforce nextUpdate so a stale CRL is rejected rather than silently trusted past its
-	// validity. With none, build a plain verifier (no revocation) — matching build_server_config.
+	// With CRLs, enforce nextUpdate so a stale CRL is rejected rather than trusted past its validity.
 	let builder = if crls.is_empty() {
 		builder
 	} else {
 		builder.with_crls(crls).enforce_revocation_expiration()
 	};
-	// Optional-mTLS: still request and verify a client cert against the CA, but admit a peer that
-	// presents none (client_auth_mandatory() → false). Required-mTLS omits this, so a nameless peer is
-	// refused at the handshake. Disabled builds no verifier at all (see build_server_config_for_policy).
+	// Optional-mTLS: verify a presented cert but admit a peer that presents none. Required-mTLS omits this
+	// (a nameless peer is refused at the handshake); Disabled builds no verifier at all.
 	let builder = if allow_unauthenticated {
 		builder.allow_unauthenticated()
 	} else {
@@ -66,16 +64,14 @@ fn load_trust(
 	return build_client_verifier(roots, crls, allow_unauthenticated);
 }
 
-// mTLS client-cert verifier whose trust anchors AND CRLs are both hot-swappable without rebuilding the
-// server config: the `Arc<dyn ClientCertVerifier>` stays the same object, only its inner verifier is swapped
-// (live listeners pick up new roots/CRLs on the next handshake). `dyn` is rustls's own API shape.
+// mTLS client-cert verifier whose trust anchors and CRLs are hot-swappable without rebuilding the server
+// config: only the inner verifier is swapped, so live listeners pick up new roots/CRLs on the next handshake.
 pub struct ReloadingClientVerifier {
 	inner: RwLock<Arc<dyn ClientCertVerifier>>,
 	ca_cert_path: PathBuf,
 	// None = no handshake-level revocation (roots still hot-reload).
 	crl_path: Option<PathBuf>,
-	// Optional-mTLS flag: true admits a peer that presents no cert. Stored so reload() rebuilds the
-	// inner verifier with the same policy rather than silently reverting to mandatory on a CA rotation.
+	// Optional-mTLS flag, stored so reload() keeps the same policy across a CA rotation.
 	allow_unauthenticated: bool,
 }
 
@@ -131,9 +127,8 @@ impl fmt::Debug for ReloadingClientVerifier {
 }
 
 impl ClientCertVerifier for ReloadingClientVerifier {
-	// Empty by design: the borrow is bound to `&self` so it can't reflect hot-swapped roots, and caching
-	// startup subjects would advertise the OLD CA after a rotation. The hint is advisory; every device here
-	// holds one cert and sends it regardless. Equivalent to rustls's clear_root_hint_subjects().
+	// Empty by design: the `&self` borrow can't reflect hot-swapped roots, and the hint is advisory anyway
+	// (every device holds one cert and sends it regardless). Equivalent to clear_root_hint_subjects().
 	fn root_hint_subjects(&self) -> &[DistinguishedName] {
 		return &[];
 	}
@@ -184,8 +179,7 @@ impl ClientCertVerifier for ReloadingClientVerifier {
 
 impl Reloadable for ReloadingClientVerifier {
 	fn reload(&self) -> Result<()> {
-		// Delegate to the inherent method (inherent resolution wins, but be explicit to rule out
-		// any accidental self-recursion through the trait method).
+		// Delegate to the inherent method, explicit to rule out self-recursion through the trait method.
 		return Self::reload(self);
 	}
 }
@@ -206,8 +200,7 @@ mod tests {
 		let crl_file = write_pem(&make_crl_pem(&ca, &[1]));
 
 		let verifier = ReloadingClientVerifier::new(ca_file.path(), Some(crl_file.path())).unwrap();
-		// The functional diff: identical CA + verifier, differing only in whether the leaf's serial is
-		// on the CRL. The revoked serial is refused at verification; the untouched one is accepted.
+		// Functional diff: same CA and verifier, differing only in whether the leaf's serial is on the CRL.
 		assert!(
 			!verifier_accepts(&verifier, &revoked),
 			"a CRL-listed cert must be rejected"
@@ -239,8 +232,6 @@ mod tests {
 			"after reload the newly-revoked leaf must be rejected"
 		);
 	}
-
-	// ── CA trust-anchor (bundle) hot-reload ──
 
 	#[test]
 	fn test_ca_reload_accepts_after_rotation() {
@@ -383,9 +374,6 @@ mod tests {
 			"reloadable verifier must offer no root hint"
 		);
 	}
-
-	// ── Server-cert trust-anchor (backend CA) hot-reload ──
-
 
 	#[test]
 	fn test_load_crls_missing_file_errors() {
