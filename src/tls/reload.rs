@@ -135,25 +135,39 @@ impl CertWatcher {
 	// cognitive_complexity is attributed here to the file-event closure passed to the watcher; its body
 	// (two path-affinity checks, each reloading the matching side) is over-counted by the nested `.any()`
 	// closures and reload-result match arms, not genuine branching.
-	#[allow(clippy::cognitive_complexity)]
 	pub fn new(
 		server_resolver: Arc<ReloadingCertResolver>,
 		client_resolver: Arc<ReloadingCertResolver>,
 	) -> Result<Self> {
+		return Self::with_optional_client(server_resolver, Some(client_resolver));
+	}
+
+	// Server-cert-only watcher: no backend-facing client identity to co-watch (public/plaintext-backend
+	// deployment). Used when the manual server path runs without a [tls.client] identity.
+	pub fn new_server_only(server_resolver: Arc<ReloadingCertResolver>) -> Result<Self> {
+		return Self::with_optional_client(server_resolver, None);
+	}
+
+	// The winning event of a debounce burst decides which side(s) to reload; a reload re-reads the settled
+	// file and keeps the previous key on failure (last-known-good). The client side is watched only when a
+	// client resolver is present.
+	#[allow(clippy::cognitive_complexity)]
+	fn with_optional_client(
+		server_resolver: Arc<ReloadingCertResolver>,
+		client_resolver: Option<Arc<ReloadingCertResolver>>,
+	) -> Result<Self> {
 		let debounce: Duration = Duration::from_millis(CERT_RELOAD_DEBOUNCE_MS);
 		let server_cert_path: PathBuf = server_resolver.cert_path.clone();
 		let server_key_path: PathBuf = server_resolver.key_path.clone();
-		let client_cert_path: PathBuf = client_resolver.cert_path.clone();
-		let client_key_path: PathBuf = client_resolver.key_path.clone();
-		let trigger_paths: Vec<PathBuf> = vec![
-			server_cert_path.clone(),
-			server_key_path.clone(),
-			client_cert_path.clone(),
-			client_key_path.clone(),
-		];
+		let client_paths: Option<(PathBuf, PathBuf)> = client_resolver
+			.as_ref()
+			.map(|r| (r.cert_path.clone(), r.key_path.clone()));
+		let mut trigger_paths: Vec<PathBuf> = vec![server_cert_path.clone(), server_key_path.clone()];
+		if let Some((cert, key)) = &client_paths {
+			trigger_paths.push(cert.clone());
+			trigger_paths.push(key.clone());
+		}
 
-		// The winning event of a debounce burst decides which side(s) to reload; a reload re-reads the
-		// settled file and keeps the previous key on failure (last-known-good).
 		let watcher: RecommendedWatcher = spawn_trailing_edge_watcher(
 			&trigger_paths,
 			debounce,
@@ -164,17 +178,16 @@ impl CertWatcher {
 					.paths
 					.iter()
 					.any(|p| p == &server_cert_path || p == &server_key_path);
-				let affected_client: bool = event
-					.paths
-					.iter()
-					.any(|p| p == &client_cert_path || p == &client_key_path);
+				let affected_client: bool = client_paths
+					.as_ref()
+					.is_some_and(|(cert, key)| event.paths.iter().any(|p| p == cert || p == key));
 				if affected_server {
 					match server_resolver.reload() {
 						Ok(()) => info!("server certificate hot-reloaded"),
 						Err(e) => error!(error = %e, "failed to reload server certificate, keeping previous"),
 					}
 				}
-				if affected_client {
+				if let (true, Some(client_resolver)) = (affected_client, client_resolver.as_ref()) {
 					match client_resolver.reload() {
 						Ok(()) => info!("client certificate hot-reloaded"),
 						Err(e) => error!(error = %e, "failed to reload client certificate, keeping previous"),

@@ -3,13 +3,13 @@ use std::net::SocketAddr;
 
 use arrayvec::ArrayString;
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 use crate::error::{ReductionError, Result};
 use crate::ingress::protocol::MAX_ENVELOPE_FRAME;
 use crate::tls::identity::MAX_COMMON_NAME_LEN;
 
-// Backend/route, TLS, and listener-edge config types live in submodules; re-exported so
-// `crate::config::X` stays stable.
+// Config types live in submodules; re-exported so `crate::config::X` stays stable.
 mod backend;
 mod ingress;
 mod listener;
@@ -20,9 +20,7 @@ pub use listener::{
 	ClientAuthPolicy, DEFAULT_HEALTH_ENDPOINT_LISTEN, DEFAULT_HTTP_REDIRECT_LISTEN, HealthEndpointConfig,
 	HttpRedirectConfig, ListenConfig,
 };
-// The per-section config blocks (balancer/timeouts/rate limit/access/metrics/tracing/proxy/compression/
-// health/circuit breaker/retry/tunnel/cache) and their default consts. Glob re-export keeps every
-// `crate::config::X` and `crate::config::types::X` path stable.
+// Per-section config blocks and their default consts; glob re-export keeps every path stable.
 pub use sections::*;
 
 use ingress::is_private_listen_addr;
@@ -69,43 +67,94 @@ pub struct ReductionConfig {
 	pub tunnel: TunnelConfig,
 	#[serde(default)]
 	pub cache: CacheConfig,
-	// Per-backend allowlist gating which authenticated devices may open a raw QUIC relay. A backend
-	// without an entry is denied, so an empty list disables raw relays safely. See RawRelayAuthzEntry.
+	// Per-backend raw-QUIC-relay allowlist; a backend without an entry is denied (empty = fail-closed).
 	#[serde(default)]
 	pub raw_relay_authz: Vec<RawRelayAuthzEntry>,
-	// Datagram/stream ingress listeners. Presence of any entry enables the ingress mode. Empty by
-	// default so an ordinary reverse-proxy config is unaffected. See PLAN_INGRESS.md.
+	// Datagram/stream ingress listeners; any entry enables ingress mode. See PLAN_INGRESS.md.
 	#[serde(default)]
 	pub ingress: Vec<IngressConfig>,
-	// Optional cleartext port-80 listener that permanently redirects to the canonical HTTPS origin.
-	// Disabled by default so an M2M deployment is unaffected. See HttpRedirectConfig.
+	// Optional cleartext port-80 listener that 308-redirects to the canonical HTTPS origin. Disabled by default.
 	#[serde(default)]
 	pub http_redirect: HttpRedirectConfig,
-	// Optional non-public liveness/readiness endpoint. Disabled by default. See HealthEndpointConfig.
+	// Optional non-public liveness/readiness endpoint. Disabled by default.
 	#[serde(default)]
 	pub health_endpoint: HealthEndpointConfig,
 }
 
 impl ReductionConfig {
-	// Cross-field invariants that per-field serde validation cannot express. Called on initial load
-	// and on every reload, so a contradictory config is rejected instead of shipping a contract the
-	// runtime cannot honor (a reload failure keeps the previous config in force). Each check is a
-	// separate method so a new invariant is one addition, not a branch in a growing function.
+	// Cross-field invariants that per-field serde validation cannot express, run on load and every reload
+	// (a reload failure keeps the previous config in force). One method per invariant.
 	pub fn validate(&self) -> Result<()> {
 		self.validate_no_duplicate_backend_ids()?;
 		self.validate_routes()?;
 		self.validate_retry_backoff()?;
 		self.validate_ingress()?;
 		self.validate_backend_schemes()?;
+		self.validate_client_identity()?;
+		self.validate_acme_inbound_ca()?;
 		self.validate_http_redirect()?;
 		self.validate_health_endpoint()?;
 		self.validate_acme_barrel_state()?;
 		return Ok(());
 	}
 
-	// Barrel ACME custody needs a non-empty persist_command: an empty command could never store renewed
-	// state, so a renewal would succeed in memory yet be lost on restart. Reject it at load rather than
-	// discovering it only when the first renewal tries (and fails) to persist.
+	// True when any backend handshakes upstream (quic or https), so [tls.client] must be present.
+	#[must_use]
+	pub fn needs_client_tls(&self) -> bool {
+		return self.backends.iter().any(BackendConfig::needs_client_tls);
+	}
+
+	// [tls.client] must be present exactly when a backend needs it; a missing identity is rejected at load
+	// (naming the backend), an unused one is warned but allowed.
+	fn validate_client_identity(&self) -> Result<()> {
+		if self.tls.client.is_some() {
+			if !self.needs_client_tls() {
+				warn!(
+					"[tls.client] is present but no backend needs a TLS client identity (every backend is tcp + scheme = \"http\"): the client identity is unused and can be removed",
+				);
+			}
+			return Ok(());
+		}
+		for backend in &self.backends {
+			if backend.needs_client_tls() {
+				let reason: &str = if backend.transport == TransportKind::Quic {
+					"transport = \"quic\" (QUIC always uses mTLS)"
+				} else {
+					"scheme = \"https\" (TLS to the backend)"
+				};
+				return Err(ReductionError::Config(format!(
+					"backend '{}' requires a TLS client identity ({reason}) but [tls.client] is absent: add [tls.client], or set the backend to transport = \"tcp\" with scheme = \"http\"",
+					backend.id,
+				)));
+			}
+		}
+		return Ok(());
+	}
+
+	// Under ACME the inbound client-cert CA is read only when the policy builds a verifier, so it must be
+	// present for `required`/`optional` and may be omitted only under `disabled`.
+	#[cfg(feature = "acme")]
+	fn validate_acme_inbound_ca(&self) -> Result<()> {
+		if let ServerTlsConfig::Acme(acme) = &self.tls.server
+			&& self.listen.client_auth.builds_verifier()
+			&& acme.ca_cert_path.is_none()
+		{
+			return Err(ReductionError::Config(
+				"tls.server.acme.ca_cert_path is required when listen.client_auth is \"required\" or \"optional\": it is the inbound client-cert CA; omit it only under client_auth = \"disabled\"".to_owned(),
+			));
+		}
+		return Ok(());
+	}
+
+	// No ACME feature: the manual server identity always carries its inbound CA, so there is nothing to check.
+	#[cfg(not(feature = "acme"))]
+	#[allow(clippy::unused_self)]
+	const fn validate_acme_inbound_ca(&self) -> Result<()> {
+		return Ok(());
+	}
+
+	// Barrel ACME custody needs a non-empty persist_command; an empty one would lose renewed state on
+	// restart, so reject it at load rather than at the first renewal.
 	#[cfg(feature = "acme")]
 	fn validate_acme_barrel_state(&self) -> Result<()> {
 		if let ServerTlsConfig::Acme(acme) = &self.tls.server
@@ -122,13 +171,12 @@ impl ReductionConfig {
 	// No ACME feature: nothing to validate for the Barrel state store.
 	#[cfg(not(feature = "acme"))]
 	#[allow(clippy::unused_self)]
-	fn validate_acme_barrel_state(&self) -> Result<()> {
+	const fn validate_acme_barrel_state(&self) -> Result<()> {
 		return Ok(());
 	}
 
-	// The non-public health endpoint must not share a port with the public data plane or the redirect
-	// listener — each needs its own socket. A bind collision would otherwise surface only as a runtime
-	// bind error on whichever listener starts second.
+	// The health endpoint needs its own socket; reject a port shared with the data plane or redirect
+	// listener at load rather than as a runtime bind error on whichever starts second.
 	fn validate_health_endpoint(&self) -> Result<()> {
 		if !self.health_endpoint.enabled {
 			return Ok(());
@@ -147,10 +195,8 @@ impl ReductionConfig {
 		return Ok(());
 	}
 
-	// The redirect listener needs a canonical target host to redirect to, and that host must be a bare
-	// authority (no scheme, no path) since it is spliced into `https://{to_host}{path}`. An enabled
-	// redirect with no/invalid `to_host` would emit `https:///path` — a broken Location — so reject it
-	// at load. Also reject a redirect bound to the same address as the main listener (port collision).
+	// The redirect target must be a bare authority (spliced into `https://{to_host}{path}`), so a missing
+	// or URL-shaped `to_host` is rejected at load, as is a port collision with the main listener.
 	fn validate_http_redirect(&self) -> Result<()> {
 		if !self.http_redirect.enabled {
 			return Ok(());
@@ -175,9 +221,8 @@ impl ReductionConfig {
 		return Ok(());
 	}
 
-	// A cleartext-HTTP backend scheme is only meaningful over TCP: QUIC mandates TLS 1.3, so `scheme =
-	// "http"` on a QUIC backend is a contradiction the dial path could not honor. Reject it at load
-	// rather than silently ignoring the field or attempting a nonsensical cleartext QUIC dial.
+	// `scheme = "http"` is meaningful only over TCP; QUIC mandates TLS 1.3, so it is a contradiction
+	// rejected at load rather than silently ignored.
 	fn validate_backend_schemes(&self) -> Result<()> {
 		for backend in &self.backends {
 			if backend.scheme.is_plaintext() && backend.transport != TransportKind::Tcp {
@@ -190,11 +235,8 @@ impl ReductionConfig {
 		return Ok(());
 	}
 
-	// Ingress invariants the runtime cannot honor if violated: a backend_ids entry that is not a
-	// transport = quic backend (ingress dials QUIC+mTLS raw streams), a zero cap (would drop or stall
-	// everything), a batch byte budget that cannot fit one datagram or overruns the frame ceiling, a
-	// duplicate listen address (two listeners fighting for one port), or a routable listen address
-	// with no `[access]` allowlist (ingress relaxes the mTLS-only rule, so the allowlist is the gate).
+	// Ingress invariants: every backend_id must be a quic backend, caps non-zero, batch budget within
+	// bounds, listen addresses unique, and a routable listen address gated by an `[access]` allowlist.
 	fn validate_ingress(&self) -> Result<()> {
 		let quic_backend_ids: HashSet<&str> = self
 			.backends
@@ -236,8 +278,7 @@ impl ReductionConfig {
 		return Ok(());
 	}
 
-	// Non-zero caps and the batch/frame size relationship for one ingress entry, split out so
-	// validate_ingress stays a readable sequence of topology checks.
+	// Non-zero caps and the batch/frame size relationship for one ingress entry.
 	fn validate_ingress_caps(&self, ingress: &IngressConfig) -> Result<()> {
 		let id: &str = ingress.id.as_str();
 		if ingress.max_datagram_bytes == 0
@@ -272,9 +313,8 @@ impl ReductionConfig {
 		return Ok(());
 	}
 
-	// Health, circuit-breaker, and load-balancer state are all keyed by backend id; two backends
-	// sharing an id silently conflate that state (and any per-id limit differences are lost), so a
-	// duplicate is a topology error rather than a merge.
+	// Health, circuit-breaker, and balancer state are keyed by backend id, so a duplicate id would
+	// silently conflate that state — a topology error, not a merge.
 	fn validate_no_duplicate_backend_ids(&self) -> Result<()> {
 		let mut seen: HashSet<&str> = HashSet::with_capacity(self.backends.len());
 		for backend in &self.backends {
@@ -288,9 +328,8 @@ impl ReductionConfig {
 		return Ok(());
 	}
 
-	// Every route must name a routable, unambiguous target. A pool is built for a route only when a
-	// backend's `pool` equals the route's backend_id, so a route naming no pool yields no pool and a
-	// 502 at request time — the exact "starts fine, fails later" trap this rejects at load.
+	// Every route must name a routable, unambiguous pool; a route naming no backend pool would 502 at
+	// request time — the "starts fine, fails later" trap this rejects at load.
 	fn validate_routes(&self) -> Result<()> {
 		let pools: HashSet<&str> = self.backends.iter().map(|b| b.pool.as_str()).collect();
 		let mut seen_prefixes: HashSet<&str> = HashSet::with_capacity(self.routes.len());
@@ -317,8 +356,7 @@ impl ReductionConfig {
 		return Ok(());
 	}
 
-	// Backoff is min(base * 2^attempt, max); a base above the cap collapses the exponential to a flat
-	// `max` on the very first attempt, which is never the intent.
+	// Backoff is min(base * 2^attempt, max); a base above the cap flattens the exponential on attempt one.
 	fn validate_retry_backoff(&self) -> Result<()> {
 		if self.retry.base_delay_ms > self.retry.max_delay_ms {
 			return Err(ReductionError::Config(format!(
@@ -330,10 +368,8 @@ impl ReductionConfig {
 	}
 }
 
-// Per-backend allowlist entry gating which mTLS-authenticated devices may open a raw QUIC relay to a
-// given backend_id (the routing-header value the client sends). A backend with no entry denies every
-// device; a backend with an entry admits only the listed device CNs or key SPKIs. Consumed by
-// proxy::RawRelayAuthz, which validates and indexes it at startup.
+// Per-backend allowlist entry gating which mTLS devices may raw-relay to a backend_id: no entry denies
+// every device, an entry admits only the listed CNs or key SPKIs. Indexed by proxy::RawRelayAuthz.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RawRelayAuthzEntry {
@@ -346,9 +382,7 @@ pub struct RawRelayAuthzEntry {
 	pub allowed_spkis: Vec<String>,
 }
 
-// `ListenConfig`, `TransportKind`'s siblings `ClientAuthPolicy`/`HttpRedirectConfig`/`HealthEndpointConfig`
-// live in the `listener` submodule (re-exported above). `TransportKind` stays here because both `backend`
-// and `listener` reference it via `super::TransportKind`.
+// `TransportKind` stays here because both `backend` and `listener` reference it via `super::TransportKind`.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum TransportKind {
@@ -501,6 +535,151 @@ mod tests {
 	// context of the whole config rather than in isolation.
 	fn minimal_toml_for_raw_authz(extra: &str) -> String {
 		return format!("{}\n{extra}", minimal_toml());
+	}
+
+	// ── client-identity requirement ──
+
+	// A manual-server config with NO [tls.client] and one tcp backend of the given scheme. Used to
+	// exercise the client-identity requirement independent of the ACME feature.
+	fn manual_no_client_toml(transport: &str, scheme_line: &str) -> String {
+		return format!(
+			r#"
+[listen]
+address = "127.0.0.1:8443"
+transport = "tcp"
+client_auth = "disabled"
+
+[tls.server.manual]
+cert_path = "certs/server.crt"
+key_path = "certs/server.key"
+ca_cert_path = "certs/ca.crt"
+
+[[backends]]
+id = "web"
+address = "10.0.0.1:8080"
+weight = 1.0
+transport = "{transport}"
+{scheme_line}
+
+[[routes]]
+path_prefix = "/"
+backend_id = "web"
+"#
+		);
+	}
+
+	#[test]
+	fn validate_rejects_https_backend_without_client_identity() {
+		let config: ReductionConfig = toml::from_str(&manual_no_client_toml("tcp", "scheme = \"https\"")).unwrap();
+		assert!(config.tls.client.is_none());
+		assert!(config.needs_client_tls());
+		let err: String = config.validate().unwrap_err().to_string();
+		assert!(err.contains("web") && err.contains("https"), "must name the backend and reason: {err}");
+	}
+
+	#[test]
+	fn validate_rejects_quic_backend_without_client_identity() {
+		// No scheme line ⇒ default https; quic always needs mTLS regardless.
+		let config: ReductionConfig = toml::from_str(&manual_no_client_toml("quic", "")).unwrap();
+		assert!(config.needs_client_tls());
+		let err: String = config.validate().unwrap_err().to_string();
+		assert!(err.contains("web") && err.contains("quic"), "must name the backend and reason: {err}");
+	}
+
+	#[test]
+	fn validate_accepts_plaintext_backend_without_client_identity() {
+		let config: ReductionConfig = toml::from_str(&manual_no_client_toml("tcp", "scheme = \"http\"")).unwrap();
+		assert!(config.tls.client.is_none());
+		assert!(!config.needs_client_tls(), "a cleartext-http tcp backend needs no client identity");
+		assert!(config.validate().is_ok(), "a plaintext-backend config may omit [tls.client]");
+	}
+
+	// Diff check: the same config differing ONLY in backend scheme flips whether a client identity is
+	// loaded — the http variant drops the load path the https variant requires.
+	#[test]
+	fn needs_client_tls_flips_with_backend_scheme() {
+		let https: ReductionConfig = toml::from_str(&manual_no_client_toml("tcp", "scheme = \"https\"")).unwrap();
+		let http: ReductionConfig = toml::from_str(&manual_no_client_toml("tcp", "scheme = \"http\"")).unwrap();
+		assert!(https.needs_client_tls());
+		assert!(!http.needs_client_tls());
+		assert!(https.validate().is_err(), "https backend requires a client identity");
+		assert!(http.validate().is_ok(), "http backend drops the client-identity requirement");
+	}
+
+	// Existing mTLS config (quic backend + [tls.client] present) is unchanged: still parses, still needs
+	// the client identity, still validates.
+	#[test]
+	fn validate_accepts_existing_mtls_config() {
+		let config: ReductionConfig = toml::from_str(minimal_toml()).unwrap();
+		assert!(config.tls.client.is_some());
+		assert!(config.needs_client_tls());
+		assert!(config.validate().is_ok());
+	}
+
+	// Present-but-unused [tls.client] is allowed (warned, not rejected): a plaintext-backend config that
+	// still carries the client identity must validate.
+	#[test]
+	fn validate_accepts_unused_client_identity() {
+		let toml_str: String = format!(
+			"{}\n[tls.client]\ncert_path = \"certs/client.crt\"\nkey_path = \"certs/client.key\"\nca_cert_path = \"certs/ca.crt\"\n",
+			manual_no_client_toml("tcp", "scheme = \"http\""),
+		);
+		let config: ReductionConfig = toml::from_str(&toml_str).unwrap();
+		assert!(config.tls.client.is_some());
+		assert!(!config.needs_client_tls());
+		assert!(config.validate().is_ok(), "an unused client identity is allowed, not an error");
+	}
+
+	// ── ACME inbound-CA requirement ──
+
+	// The minimal public-blog config: tcp listener, client_auth=disabled, ACME server with NO ca_cert_path,
+	// a single cleartext-http backend, one route, and no [tls.client].
+	#[cfg(feature = "acme")]
+	fn public_blog_toml() -> &'static str {
+		return r#"
+[listen]
+address = "0.0.0.0:443"
+transport = "tcp"
+client_auth = "disabled"
+
+[tls.server.acme]
+domains = ["blog.example.com"]
+acme_email = "ops@example.com"
+
+[[backends]]
+id = "blog"
+address = "127.0.0.1:8080"
+weight = 1.0
+transport = "tcp"
+scheme = "http"
+
+[[routes]]
+path_prefix = "/"
+backend_id = "blog"
+"#;
+	}
+
+	#[cfg(feature = "acme")]
+	#[test]
+	fn validate_accepts_public_blog_without_client_or_acme_ca() {
+		let config: ReductionConfig = toml::from_str(public_blog_toml()).unwrap();
+		assert!(config.tls.client.is_none(), "public blog needs no [tls.client]");
+		assert!(!config.needs_client_tls(), "no backend performs a TLS handshake upstream");
+		match &config.tls.server {
+			ServerTlsConfig::Acme(acme) => assert!(acme.ca_cert_path.is_none(), "no inbound CA under disabled"),
+			ServerTlsConfig::Manual(_) => panic!("expected acme server"),
+		}
+		assert!(config.validate().is_ok(), "the minimal public config must validate");
+	}
+
+	#[cfg(feature = "acme")]
+	#[test]
+	fn validate_rejects_acme_without_ca_under_required() {
+		// Same public config but mandatory mTLS: the inbound client-cert CA is then required.
+		let toml_str: String = public_blog_toml().replace("client_auth = \"disabled\"", "client_auth = \"required\"");
+		let config: ReductionConfig = toml::from_str(&toml_str).unwrap();
+		let err: String = config.validate().unwrap_err().to_string();
+		assert!(err.contains("ca_cert_path"), "must name the missing field: {err}");
 	}
 
 

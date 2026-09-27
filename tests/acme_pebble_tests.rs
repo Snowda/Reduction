@@ -204,8 +204,8 @@ async fn pebble_provisions_certificate_via_tls_alpn() {
 	let config = AcmeTlsConfig {
 		domains: vec![ArrayString::from(env.domain.as_str()).expect("domain fits")],
 		acme_email: ArrayString::from("ops@example.com").expect("email fits"),
-		// Unused by provisioning, but a required field; point it at any real PEM.
-		ca_cert_path: env.ca_cert.clone(),
+		// Unused by provisioning; point it at any real PEM (inbound client-cert CA under mandatory mTLS).
+		ca_cert_path: Some(env.ca_cert.clone()),
 		cache_dir: cache_dir.path().to_path_buf(),
 		staging: false,
 		directory_url: Some(env.directory.clone()),

@@ -8,11 +8,13 @@ use serde::{Deserialize, Serialize};
 #[serde(deny_unknown_fields)]
 pub struct TlsConfig {
 	pub server: ServerTlsConfig,
-	pub client: TlsIdentity,
+	// Backend-facing mTLS identity for dialing https/quic backends; optional, enforced by validate.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub client: Option<TlsIdentity>,
 }
 
-// Externally tagged (variant name is the TOML sub-table key, `[tls.server.manual]` / `[tls.server.acme]`),
-// so `deny_unknown_fields` still fires per variant and a field typo names the field, not "did not match any variant".
+// Externally tagged so the TOML sub-table key is the variant (`[tls.server.manual]` / `[tls.server.acme]`)
+// and `deny_unknown_fields` fires per variant.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ServerTlsConfig {
@@ -23,12 +25,14 @@ pub enum ServerTlsConfig {
 }
 
 impl ServerTlsConfig {
+	// Inbound client-cert CA (trust anchor for verifying peer certs). `None` under ACME with
+	// `client_auth = "disabled"`, where no verifier is built; the manual identity always carries one.
 	#[must_use]
-	pub fn ca_cert_path(&self) -> &Path {
+	pub fn ca_cert_path(&self) -> Option<&Path> {
 		return match self {
-			Self::Manual(identity) => &identity.ca_cert_path,
+			Self::Manual(identity) => Some(&identity.ca_cert_path),
 			#[cfg(feature = "acme")]
-			Self::Acme(acme) => &acme.ca_cert_path,
+			Self::Acme(acme) => acme.ca_cert_path.as_deref(),
 		};
 	}
 
@@ -48,13 +52,10 @@ pub struct TlsIdentity {
 	pub cert_path: PathBuf,
 	pub key_path: PathBuf,
 	pub ca_cert_path: PathBuf,
-	// Optional CA-signed CRL enforced at the mTLS handshake (server side only; ignored on the client
-	// identity). Hot-watched — see docs/configuration.md. None = no handshake-level revocation.
+	// Optional CA-signed CRL enforced at the mTLS handshake (server side only, hot-watched). See docs/configuration.md.
 	#[serde(default)]
 	pub crl_path: Option<PathBuf>,
 }
-
-// ── ACME defaults ──
 
 #[cfg(feature = "acme")]
 pub const DEFAULT_ACME_CACHE_DIR: &str = "./acme_cache";
@@ -64,8 +65,7 @@ fn default_acme_cache_dir() -> PathBuf {
 	return PathBuf::from(DEFAULT_ACME_CACHE_DIR);
 }
 
-// Default environment variable the Barrel agent injects the opaque ACME state into at launch. Mirrors
-// tls::secret_state::DEFAULT_ACME_STATE_ENV (kept in sync; that module is the runtime source of truth).
+// Mirrors tls::secret_state::DEFAULT_ACME_STATE_ENV (that module is the runtime source of truth).
 #[cfg(feature = "acme")]
 pub const DEFAULT_ACME_STATE_ENV: &str = "REDUCTION_ACME_STATE";
 
@@ -74,18 +74,15 @@ fn default_acme_state_env() -> String {
 	return DEFAULT_ACME_STATE_ENV.to_owned();
 }
 
-// Barrel custody for the ACME secret state: the state is injected at launch via `env_var`, and renewed
-// state is persisted by running the hash-pinned `persist_command` with the blob on its stdin. Presence
-// of this table switches the ACME state store from the plaintext `cache_dir` file to Barrel custody
-// (no plaintext ever touches a persistent filesystem, no file fallback). See docs/configuration.md.
+// Barrel custody for the ACME secret state: injected at launch via `env_var`, renewed state persisted by
+// running the hash-pinned `persist_command` with the blob on stdin (no file fallback). See docs/configuration.md.
 #[cfg(feature = "acme")]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BarrelStateConfig {
 	#[serde(default = "default_acme_state_env")]
 	pub env_var: String,
-	// The exact command to run to persist renewed state (e.g. a `barrel-agent run <store-id>`
-	// invocation). Hash-pinned on the Barrel side; must be non-empty.
+	// Command to persist renewed state (hash-pinned on the Barrel side; must be non-empty).
 	pub persist_command: Vec<String>,
 }
 
@@ -95,23 +92,22 @@ pub struct BarrelStateConfig {
 pub struct AcmeTlsConfig {
 	pub domains: Vec<ArrayString<256>>,
 	pub acme_email: ArrayString<256>,
-	pub ca_cert_path: PathBuf,
-	// File-store cache dir. Used only when `barrel_state` is absent; under Barrel custody the state
-	// never touches this path.
+	// Inbound client-cert CA. Optional: omitted under `client_auth = "disabled"` (no verifier built),
+	// required otherwise — enforced by ReductionConfig::validate.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub ca_cert_path: Option<PathBuf>,
+	// File-store cache dir, used only when `barrel_state` is absent.
 	#[serde(default = "default_acme_cache_dir")]
 	pub cache_dir: PathBuf,
 	#[serde(default)]
 	pub staging: bool,
-	// Override the ACME directory URL (private ACME CA, step-ca, or a pebble test server). When
-	// unset, the Let's Encrypt staging/production URL is chosen by `staging`.
+	// Override the ACME directory URL (private CA, step-ca, pebble); unset chooses Let's Encrypt by `staging`.
 	#[serde(default)]
 	pub directory_url: Option<String>,
-	// Trust root (PEM) for the ACME server's own HTTPS endpoint. Required when the directory is
-	// served with a non-public CA (e.g. pebble's minica). When unset, the system roots are used.
+	// Trust root (PEM) for the ACME server's own HTTPS endpoint; unset uses the system roots.
 	#[serde(default)]
 	pub directory_ca_cert: Option<PathBuf>,
-	// Barrel custody for the secret state. When set, the state store is Barrel (env-in, pinned-command-
-	// out) instead of the `cache_dir` file. Validated to carry a non-empty persist_command.
+	// Barrel custody for the secret state; when set, replaces the `cache_dir` file store.
 	#[serde(default)]
 	pub barrel_state: Option<BarrelStateConfig>,
 }
@@ -130,12 +126,10 @@ mod tests {
 		};
 	}
 
-	// ── ServerTlsConfig accessors ──
-
 	#[test]
 	fn server_tls_manual_exposes_identity() {
 		let config: ServerTlsConfig = ServerTlsConfig::Manual(manual_identity());
-		assert_eq!(config.ca_cert_path(), Path::new("certs/ca.crt"));
+		assert_eq!(config.ca_cert_path(), Some(Path::new("certs/ca.crt")));
 		let identity: &TlsIdentity = config.as_manual().unwrap();
 		assert_eq!(identity.cert_path, PathBuf::from("certs/server.crt"));
 		assert_eq!(identity.key_path, PathBuf::from("certs/server.key"));
@@ -152,9 +146,20 @@ mod tests {
 		assert!(!acme.staging);
 		assert!(acme.directory_url.is_none());
 		assert!(acme.directory_ca_cert.is_none());
+		assert_eq!(acme.ca_cert_path, Some(PathBuf::from("certs/ca.crt")));
 		let config: ServerTlsConfig = ServerTlsConfig::Acme(Box::new(acme));
-		assert_eq!(config.ca_cert_path(), Path::new("certs/ca.crt"));
+		assert_eq!(config.ca_cert_path(), Some(Path::new("certs/ca.crt")));
 		assert!(config.as_manual().is_none());
+	}
+
+	#[cfg(feature = "acme")]
+	#[test]
+	fn server_tls_acme_without_ca_cert_path_has_no_inbound_ca() {
+		let acme: AcmeTlsConfig =
+			toml::from_str("domains = [\"example.com\"]\nacme_email = \"ops@example.com\"").unwrap();
+		assert!(acme.ca_cert_path.is_none(), "omitted ca_cert_path must parse to None");
+		let config: ServerTlsConfig = ServerTlsConfig::Acme(Box::new(acme));
+		assert_eq!(config.ca_cert_path(), None);
 	}
 
 	#[cfg(feature = "acme")]
@@ -176,11 +181,7 @@ mod tests {
 		)
 		.unwrap();
 		let barrel = acme.barrel_state.expect("barrel_state must parse");
-		// env_var defaults when omitted.
 		assert_eq!(barrel.env_var, DEFAULT_ACME_STATE_ENV);
 		assert_eq!(barrel.persist_command, vec!["barrel-agent", "run", "reduction-acme-store"]);
 	}
-
-	// ── BackendConfig builders ──
-
 }

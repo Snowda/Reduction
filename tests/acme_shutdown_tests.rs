@@ -38,7 +38,7 @@ fn unreachable_acme_config(cache_dir: &Path) -> AcmeTlsConfig {
 	return AcmeTlsConfig {
 		domains: vec![ArrayString::from("shutdown.example.com").unwrap()],
 		acme_email: ArrayString::from("ops@example.com").unwrap(),
-		ca_cert_path: cache_dir.join("unused-ca.pem"),
+		ca_cert_path: Some(cache_dir.join("unused-ca.pem")),
 		cache_dir: cache_dir.to_path_buf(),
 		staging: false,
 		directory_url: Some("https://127.0.0.1:1/directory".to_owned()),

@@ -183,12 +183,12 @@ address = "127.0.0.1:8443"
 					ca_cert_path: "certs/ca.crt".into(),
 					crl_path: None,
 				}),
-				client: TlsIdentity {
+				client: Some(TlsIdentity {
 					cert_path: "certs/client.crt".into(),
 					key_path: "certs/client.key".into(),
 					ca_cert_path: "certs/ca.crt".into(),
 					crl_path: None,
-				},
+				}),
 			},
 			backends: vec![
 				BackendConfig::new("api", "10.0.0.1:8080".parse().unwrap(), 2.5, TransportKind::Quic).unwrap(),

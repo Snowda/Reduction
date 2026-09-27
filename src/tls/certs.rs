@@ -186,7 +186,7 @@ pub fn build_acme_server_config(
 	ca_cert_path: &Path,
 	resolver: Arc<crate::tls::acme::AcmeCertResolver>,
 ) -> Result<(ServerConfig, Arc<ReloadingClientVerifier>)> {
-	let (config, verifier) = build_acme_server_config_for_policy(ca_cert_path, resolver, ClientAuthPolicy::Required)?;
+	let (config, verifier) = build_acme_server_config_for_policy(Some(ca_cert_path), resolver, ClientAuthPolicy::Required)?;
 	let verifier: Arc<ReloadingClientVerifier> =
 		verifier.ok_or_else(|| ReductionError::Config("required mTLS produced no client verifier".to_owned()))?;
 	return Ok((config, verifier));
@@ -199,7 +199,7 @@ pub fn build_acme_server_config(
 // this policy, so certificate provisioning is unaffected by the client-auth choice.
 #[cfg(feature = "acme")]
 pub fn build_acme_server_config_for_policy(
-	ca_cert_path: &Path,
+	ca_cert_path: Option<&Path>,
 	resolver: Arc<crate::tls::acme::AcmeCertResolver>,
 	policy: ClientAuthPolicy,
 ) -> Result<(ServerConfig, Option<Arc<ReloadingClientVerifier>>)> {
@@ -211,6 +211,12 @@ pub fn build_acme_server_config_for_policy(
 		return Ok((config, None));
 	}
 
+	// A verifier-building policy needs the inbound CA; validation guarantees it is present here.
+	let ca_cert_path: &Path = ca_cert_path.ok_or_else(|| {
+		ReductionError::Config(
+			"ACME client_auth = \"required\"/\"optional\" requires tls.server.acme.ca_cert_path".to_owned(),
+		)
+	})?;
 	let verifier: Arc<ReloadingClientVerifier> = if policy.is_mandatory() {
 		ReloadingClientVerifier::new(ca_cert_path, None)?
 	} else {
