@@ -452,10 +452,11 @@ async fn start_services(dir: &Path, config_path: &Path) -> DemoHandles {
 	.unwrap();
 	let server_tls: Arc<rustls::ServerConfig> = Arc::new(server_tls_config);
 
+	let client_identity = config.tls.client.as_ref().expect("demo config includes [tls.client]");
 	let (client_tls_config, _, _) = tls::build_client_config(
-		&config.tls.client.cert_path,
-		&config.tls.client.key_path,
-		&config.tls.client.ca_cert_path,
+		&client_identity.cert_path,
+		&client_identity.key_path,
+		&client_identity.ca_cert_path,
 	)
 	.unwrap();
 	let client_tls: Arc<rustls::ClientConfig> = Arc::new(client_tls_config);
