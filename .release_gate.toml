@@ -3,15 +3,27 @@ project = "Reduction"
 schema = 1
 
 [[control]]
-id = "reduction.coverage.line-floor"
-title = "Rust source files meet the configured coverage floor"
-assertion = "Bulwark reports every listed Rust source file at or above this repository's configured line-coverage floor."
-theme = "supply_chain"
+id = "Reduction::default.pulumi"
+title = "No Pulumi infrastructure in this repo"
+assertion = "Reduction is a library embedded by other services; it owns no infrastructure, so the Pulumi presence check is opted out."
+theme = "other"
 gate = "advisory"
-severity = "medium"
-evidence = ["bulwark config.toml"]
+severity = "low"
+evidence = ["repo override"]
 
 [control.check]
-kind = "coverage"
-files = []
-floor = 80.0
+kind = "pulumi"
+policy = "off"
+
+[[control]]
+id = "Reduction::default.openapi"
+title = "No OpenAPI spec in this repo"
+assertion = "Reduction is a library embedded by other services and exposes no HTTP API of its own; the OpenAPI presence check is opted out."
+theme = "other"
+gate = "advisory"
+severity = "low"
+evidence = ["repo override"]
+
+[control.check]
+kind = "openapi"
+policy = "off"
