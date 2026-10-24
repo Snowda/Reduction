@@ -1,0 +1,35 @@
+# Fuzz targets for Reduction's ingress envelope decoder (fleet standard: release_gate `default.fuzz`). A workspace
+# member, so it shares target/ and Cargo.lock; libFuzzer links only under `--cfg fuzzing`, on stable, in podman.
+[package]
+name = "reduction-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+rust-version = "1.99.1"
+
+[dependencies]
+# Lean core only: the decoder is fuzzed exactly as a `default-features = false` backend links it.
+reduction = { path = "..", default-features = false }
+
+[target.'cfg(fuzzing)'.dependencies]
+libfuzzer-sys = "0.4.13"
+
+[lints.clippy]
+ref_option = "deny"
+fn_params_excessive_bools = "deny"
+missing_assert_message = "deny"
+string_add = "deny"
+# House style mandates explicit `return` on tail expressions, the inverse of clippy's default.
+needless_return = "allow"
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+
+[[bin]]
+name = "envelope_decode"
+path = "fuzz_targets/envelope_decode.rs"
+test = false
+doc = false
+bench = false
