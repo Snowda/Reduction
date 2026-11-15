@@ -1,0 +1,4 @@
+CONNECT LocalHost.:$PORT HTTP/1.1
+Host: LocalHost.:$PORT
+
+ping

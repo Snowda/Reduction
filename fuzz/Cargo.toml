@@ -1,18 +1,35 @@
-# Fuzz targets for Reduction's ingress envelope decoder (fleet standard: release_gate `default.fuzz`). A workspace
+# Fuzz targets for Reduction's untrusted boundaries (fleet standard: release_gate `default.fuzz`). A workspace
 # member, so it shares target/ and Cargo.lock; libFuzzer links only under `--cfg fuzzing`, on stable, in podman.
 [package]
 name = "reduction-fuzz"
 version = "0.0.0"
 publish = false
 edition = "2024"
-rust-version = "1.99.1"
+rust-version = "1.100.0"
 
 [dependencies]
-# Lean core only: the decoder is fuzzed exactly as a `default-features = false` backend links it.
-reduction = { path = "..", default-features = false }
+# Default features: the proxy, the pool and the redirect listener are the remote boundaries under test.
+reduction = { path = ".." }
+arrayvec = "0.7.8"
+bytes = "1.12.1"
+http = "1.5.0"
+http-body-util = "0.1.5"
+httparse = "1.10.1"
+hyper = { version = "1.12.0", features = ["client", "server", "http1", "http2"] }
+hyper-util = { version = "0.1.21", features = ["tokio"] }
+rcgen = { version = "0.14.10", default-features = false, features = ["aws_lc_rs"] }
+rustls = "0.23.46"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "net", "io-util", "time"] }
+tokio-rustls = "0.26.6"
+tokio-util = "0.7.20"
+toml = "1.2.0"
 
 [target.'cfg(fuzzing)'.dependencies]
 libfuzzer-sys = "0.4.13"
+
+# Only the libFuzzer container build sets `fuzzing`; declaring it here keeps a plain build quiet.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
 
 [lints.clippy]
 ref_option = "deny"
@@ -30,6 +47,62 @@ print_stderr = "deny"
 [[bin]]
 name = "envelope_decode"
 path = "fuzz_targets/envelope_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "proxy_request"
+path = "fuzz_targets/proxy_request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "upstream_send"
+path = "fuzz_targets/upstream_send.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "redirect"
+path = "fuzz_targets/redirect.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fastlane_chunked"
+path = "fuzz_targets/fastlane_chunked.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fastlane_response"
+path = "fuzz_targets/fastlane_response.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "egress_connect"
+path = "fuzz_targets/egress_connect.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fastlane_classify"
+path = "fuzz_targets/fastlane_classify.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "health_route"
+path = "fuzz_targets/health_route.rs"
 test = false
 doc = false
 bench = false

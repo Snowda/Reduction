@@ -1,0 +1,3 @@
+PUT /readyz HTTP/1.1
+Host: probe
+
