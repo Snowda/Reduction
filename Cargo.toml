@@ -2,11 +2,13 @@
 name = "reduction"
 version = "0.3.0"
 edition = "2024"
-rust-version = "1.96.0"
+rust-version = "1.100.0"
 description = "Low Bandwidth Reverse Proxy"
 license = "MIT"
 # Internal application binary — not published to a registry.
 publish = false
+# The fuzz/ member's target bins are default members too; a bare `cargo run` still means the proxy.
+default-run = "reduction"
 
 [features]
 default = ["proxy"]
@@ -15,28 +17,33 @@ default = ["proxy"]
 # with a device cert) build with default-features = false and get QuicStream, tunnel::protocol,
 # the mTLS client config, and PeerIdentity without the proxy dependency tree.
 proxy = [
-    "dep:axum",
+    "dep:async-trait",
     "dep:bytes",
     "dep:dashmap",
-    "dep:governor",
+    "dep:impediment",
+    "dep:h2",
+    "dep:http",
     "dep:http-body",
     "dep:http-body-util",
+    "dep:httparse",
+    "dep:httpdate",
     "dep:hyper",
     "dep:hyper-util",
     "dep:lru",
     "dep:notify",
     "dep:opentelemetry",
+    "dep:opentelemetry-http",
     "dep:opentelemetry-otlp",
     "dep:opentelemetry_sdk",
     "dep:parking_lot",
     "dep:pin-project-lite",
     "dep:rand",
+    "dep:rapidhash",
     "dep:serde_json",
     "dep:socket2",
     "dep:tokio-util",
     "dep:tracing-opentelemetry",
     "dep:tracing-subscriber",
-    "dep:zstd",
 ]
 acme = ["proxy", "dep:instant-acme"]
 # Gates integration tests under tests/ that need external infrastructure (e.g. a pebble ACME server).
@@ -46,54 +53,71 @@ integration_tests = ["proxy"]
 dhat-heap = ["dep:dhat"]
 
 [dependencies]
-arrayvec = { version = "0.7.8", features = ["serde"] }
-axum = { version = "0.8.9", features = ["http2"], optional = true }
+# Lock-free hot-swap of TLS certs/verifiers: read on every handshake, written only on reload.
+solo = { path = "../Solo" }
+# Reads a Barrel-injected TLS key (`key_env`), so a private key never needs a file.
+barrel-client = { path = "../Barrel/crates/barrel-client" }
+arrayvec ={ version = "0.7.8", features = ["serde"] }
+# Keyed hasher for every map, core config checks included; std's SipHash showed in the request-path profile.
+ahash = "0.8.12"
 bitcode = { version = "0.6.9", features = ["arrayvec"] }
 dashmap = { version = "6.2.1", optional = true }
-governor = { version = "0.10.4", optional = true }
+# Keyed GCRA rate limiter shared across the fleet (also behind server_utils::gcra).
+impediment = { path = "../Impediment", optional = true }
 bytes = { version = "1.12.1", optional = true }
+# The HTTP/2 upstream speaks h2 directly (already in the tree through hyper), so a request needs no extra tasks.
+h2 = { version = "0.4.20", optional = true }
 instant-acme = { version = "0.8.5", optional = true }
-serde_json = { version = "1.0.151", optional = true }
-ipnet = { version = "2.12.1", features = ["serde"] }
+serde_json = { version = "1.0.154", optional = true }
+ipnet = { version = "2.12.2", features = ["serde"] }
+http = { version = "1.5.0", optional = true }
 http-body = { version = "1.1.0", optional = true }
 http-body-util = { version = "0.1.5", optional = true }
-lru = { version = "0.18.2", optional = true }
+# The raw HTTP/1.1 data plane parses and edits message heads itself, with hyper's parser and date format.
+httparse = { version = "1.10.1", optional = true }
+httpdate = { version = "1.0.3", optional = true }
+lru ={ version = "0.18.5", optional = true }
 pin-project-lite = { version = "0.2.17", optional = true }
 # Retry backoff jitter — decorrelates concurrent retriers to avoid a thundering herd.
-rand = { version = "0.9", optional = true }
-hyper = { version = "1.11.0", features = ["client", "http1", "http2"], optional = true }
-hyper-util = { version = "0.1.20", features = ["tokio", "http2"], optional = true }
-notify = { version = "8.2.0", optional = true }
+rand = { version = "0.10.3", optional = true }
+# Per-IP balancer jitter: rapidhash v3's output is fixed across versions and platforms, so every node agrees.
+rapidhash = { version = "4.5.1", default-features = false, optional = true }
+hyper = { version = "1.12.0", features = ["client", "server", "http1", "http2"], optional = true }
+hyper-util = { version = "0.1.21", features = ["tokio", "http1", "http2", "server", "server-auto"], optional = true }
+notify = { version = "8.2.2", optional = true }
 parking_lot = { version = "0.12.5", optional = true }
-opentelemetry = { version = "0.32.0", features = ["trace"], optional = true }
-opentelemetry-otlp = { version = "0.32.0", features = ["trace"], optional = true }
-opentelemetry_sdk = { version = "0.32.1", features = ["trace", "rt-tokio"], optional = true }
-quinn = { version = "0.11.11", default-features = false, features = ["platform-verifier", "runtime-tokio", "rustls-aws-lc-rs", "bloom"] }
+opentelemetry = { version = "0.33.1", features = ["trace"], optional = true }
+# OTLP/HTTP protobuf on the hyper client (otlp.rs). The defaults pull reqwest into every dependent's tree.
+opentelemetry-otlp = { version = "0.33.1", default-features = false, features = ["http-proto", "trace", "metrics", "internal-logs"], optional = true }
+opentelemetry-http = { version = "0.33.1", default-features = false, features = ["hyper"], optional = true }
+# opentelemetry-http's HttpClient trait is an async_trait; already in the tree through it.
+async-trait = { version = "0.1.92", optional = true }
+opentelemetry_sdk = { version = "0.33.1", features = ["trace", "rt-tokio"], optional = true }
+quinn = { version = "0.11.12", default-features = false, features = ["platform-verifier", "runtime-tokio", "rustls-aws-lc-rs", "bloom"] }
 # x509-parser feature enables rcgen::Issuer::from_ca_cert_der, used by test/example PKI helpers
 # to sign leaf certs from an in-memory CA. Reuses the x509-parser 0.18 already in the tree.
-rcgen = { version = "0.14.9", default-features = false, features = ["aws_lc_rs", "pem", "x509-parser"] }
+rcgen = { version = "0.14.10", default-features = false, features = ["aws_lc_rs", "pem", "x509-parser"] }
 # SHA-256 over leaf SPKI DER and SystemRandom for PeerIdentity — reuses aws-lc-rs (ring is
 # unmaintained), the provider now linked transitively by rustls/quinn, avoiding a second hash dep.
-aws-lc-rs = "1"
+aws-lc-rs = "1.19.0"
 # Optional heap profiler for profile_loadtest, gated by the dhat-heap feature (see [features]).
-dhat = { version = "0.3", optional = true }
-rustls = "0.23.43"
+dhat = { version = "0.3.3", optional = true }
+rustls = "0.23.46"
 serde = { version = "1.0.229", features = ["derive"] }
 # UDP socket options for the ingress listener: SO_RCVBUF sizing and per-worker SO_REUSEPORT
 # (Linux/BSD) so multiple recv workers can flow-hash-share one port. Already in the tree via quinn.
 socket2 = { version = "0.6.5", features = ["all"], optional = true }
 tempfile = "3.27.0"
-thiserror = "2.0.20"
-tokio = { version = "1.53.1", features = ["rt-multi-thread", "net", "io-util", "macros", "signal", "fs", "sync", "process"] }
-tokio-util = { version = "0.7.19", optional = true }
-tokio-rustls = "0.26.4"
-toml = "1.1.4"
+thiserror = "2.0.21"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "net", "io-util", "macros", "signal", "fs", "sync", "process"] }
+tokio-util = { version = "0.7.20", optional = true }
+tokio-rustls = "0.26.6"
+toml = "1.2.0+spec-1.1.0"
 tracing = "0.1.44"
-tracing-opentelemetry = { version = "0.33.0", optional = true }
+tracing-opentelemetry = { version = "0.34.0", optional = true }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"], optional = true }
 # PeerIdentity leaf-cert parsing (subject CN + SPKI). Core to mTLS identity propagation, always linked.
 x509-parser = "0.18.1"
-zstd = { version = "0.13.3", optional = true }
 
 # The binary is the proxy — a lean-client (no-default-features) build produces the library only.
 [[bin]]
@@ -125,24 +149,43 @@ required-features = ["proxy"]
 name = "tunnel_demo"
 required-features = ["proxy"]
 
+# The ACME tests drive acme-only code, so they build only with that feature; each test is integration_tests-gated.
+[[test]]
+name = "acme_pebble_tests"
+required-features = ["acme"]
+
+[[test]]
+name = "acme_shutdown_tests"
+required-features = ["acme"]
+
 [dev-dependencies]
 criterion = { version = "0.8.2", features = ["html_reports"] }
 # test-util enables tokio::test(start_paused): the relay idle-timeout tests drive virtual time so
 # "active transfer outlives the timeout" is deterministic instead of wall-clock flaky.
-tokio = { version = "1.53.1", features = ["test-util"] }
+tokio = { version = "1.54.1", features = ["test-util"] }
 tracing-chrome = "0.7.2"
-# Integration tests drive the real TcpListener via its axum::serve::Listener impl.
-axum = { version = "0.8.9", features = ["http2"] }
 # The acme integration test brings up a local pebble ACME server + mock DNS in Docker.
 testcontainers = "0.28.0"
 # Retry integration tests stand up real TLS h2 backend servers; the proxy's own hyper is
 # client-only, so enable the server feature (unified) plus the h2 body/runtime helpers for tests.
-hyper = { version = "1.11.0", features = ["server", "http2"] }
-hyper-util = { version = "0.1.20", features = ["tokio", "http2"] }
+hyper = { version = "1.12.0", features = ["server", "http2"] }
+hyper-util = { version = "0.1.21", features = ["tokio", "http2"] }
 http-body-util = "0.1.5"
 bytes = "1.12.1"
+# `testing` exposes the in-memory metric exporter, so unit tests read back what an instrument recorded.
+opentelemetry_sdk = { version = "0.33.1", features = ["testing"] }
+# Tests label errors with `.ctx("what")?`; the defaults pull in services the tests do not need.
+ServerUtils = { path = "../ServerUtils", default-features = false }
 
+# Fleet release profile: whole-program optimisation, and overflow panics instead of silent wrapping.
 [profile.release]
+lto = "thin"
+codegen-units = 1
+overflow-checks = true
+
+# Profiling (examples/README.md flamegraph): release codegen plus full debuginfo, so shipped release builds stay stripped.
+[profile.profiling]
+inherits = "release"
 debug = true
 
 [profile.dev]
@@ -161,11 +204,6 @@ harness = false
 required-features = ["proxy"]
 
 [[bench]]
-name = "compression_bench"
-harness = false
-required-features = ["proxy"]
-
-[[bench]]
 name = "ratelimit_bench"
 harness = false
 required-features = ["proxy"]
@@ -175,12 +213,33 @@ name = "health_bench"
 harness = false
 required-features = ["proxy"]
 
+[[bench]]
+name = "shared_map_bench"
+harness = false
+required-features = ["proxy"]
+
+[[bench]]
+name = "ingress_bench"
+harness = false
+required-features = ["proxy"]
+
+# fuzz/ (fleet fuzz standard) shares this target/ and Cargo.lock, and a plain `ntc` replays its seeds. The root
+# package is a member implicitly; comparison/ stays a standalone package.
+[workspace]
+members = ["fuzz"]
+default-members = [".", "fuzz"]
+exclude = ["comparison"]
+
 [lints.rust]
 # deny (not forbid) so a dependency's macro-generated #[allow(unsafe_code)] can compile;
 # first-party unsafe is still rejected unless explicitly allowed.
 unsafe_code = "deny"
 
 [lints.clippy]
+ref_option = "deny"
+fn_params_excessive_bools = "deny"
+missing_assert_message = "deny"
+string_add = "deny"
 # float_arithmetic is intentionally relaxed: this is a load balancer / reverse proxy whose core
 # domain math is inherently floating-point — weighted rendezvous balancing, health load &
 # latency factors, connection-pressure ratios, OTLP sample ratios, and metric durations. This
@@ -207,6 +266,8 @@ as_conversions = "warn"
 # Ownership / borrowing
 clone_on_copy = "warn"
 redundant_clone = "deny"
+# An Arc bump reads as `Arc::clone(&x)`, so a remaining `.clone()` is a real copy (release_gate clone-count).
+clone_on_ref_ptr = "deny"
 needless_pass_by_value = "warn"
 ptr_arg = "warn"
 
