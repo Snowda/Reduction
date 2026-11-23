@@ -210,11 +210,12 @@ The `--trace` flag writes a `trace.json` to the working directory. Open it in [P
 
 ### Sampling flamegraph
 
-For CPU-level profiling, install `cargo-flamegraph` and run with ETW (requires admin):
+For CPU-level profiling, install `cargo-flamegraph` and run with ETW (requires admin). The `profiling` profile is
+release codegen with debug info; plain `--release` is stripped, so its frames would show no function names:
 
 ```sh
 cargo install flamegraph
-cargo flamegraph --release --example profile_loadtest -- 20 5000
+cargo flamegraph --profile profiling --example profile_loadtest -- 20 5000
 ```
 
 This produces an interactive SVG flamegraph showing where CPU time is spent.
@@ -222,5 +223,5 @@ This produces an interactive SVG flamegraph showing where CPU time is spent.
 ### Notes
 
 - **Client affinity:** All demo requests originate from `127.0.0.1`, so rendezvous hashing deterministically routes them to one backend. In production with diverse client IPs, requests distribute across backends proportional to their weights.
-- **No compression negotiation:** The MCP client does not send `Accept-Encoding: zstd`, so responses pass through the proxy uncompressed. This also means SSE streaming (used by MCP's Streamable HTTP transport) would work without buffering, since the proxy only collects the full body when compressing.
+- **Streaming:** The proxy applies no body encoding, so SSE streaming (used by MCP's Streamable HTTP transport) passes through without buffering.
 - **Ports:** The demo uses ports 18443, 19443, and 19444. If these conflict with existing services, the constants at the top of `mcp_demo.rs` can be changed.

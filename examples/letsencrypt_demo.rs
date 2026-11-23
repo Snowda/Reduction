@@ -8,47 +8,99 @@
 //! This example writes a config TOML to a temporary file, then boots the proxy
 //! using ACME for the server certificate and a local CA for client mTLS.
 
-// Demo/example code: printing to stdout/stderr is the point of a runnable demo.
-#![allow(clippy::print_stdout)]
-#![allow(clippy::print_stderr)]
-#![allow(clippy::dbg_macro)]
+mod support;
 
 #[cfg(feature = "acme")]
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-	use std::io::Write;
-	use std::path::PathBuf;
+use std::io::Write;
+#[cfg(feature = "acme")]
+use std::path::PathBuf;
 
-	use tempfile::NamedTempFile;
+#[cfg(feature = "acme")]
+use tempfile::NamedTempFile;
+#[cfg(feature = "acme")]
+use tracing::info;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 
+use crate::support::Context;
+
+// Show only the demo text and any warnings from the library.
+const LIBRARY_LOG_LEVEL: &str = "warn";
+
+#[cfg(feature = "acme")]
+const INSTRUCTIONS: [&str; 17] = [
+	"",
+	"To run the proxy with this config:",
+	"  cargo run --features acme -- {config}",
+	"",
+	"Requirements:",
+	"  1. Port 443 must be accessible from the internet",
+	"  2. DNS for 'proxy.example.com' must point to this server",
+	"  3. Set directory = \"production\" for production certificates",
+	"",
+	"The ACME flow:",
+	"  1. On first start, provisions a certificate via tls-alpn-01",
+	"  2. Caches cert + key in ./acme_cache/",
+	"  3. Auto-renews 30 days before expiry",
+	"  4. Client mTLS is still enforced (clients need certs from the private CA)",
+	"",
+	"=== Config TOML ===",
+	"{toml}",
+];
+
+// Write `contents` to a fresh temp file that lives as long as the returned handle.
+#[cfg(feature = "acme")]
+fn temp_file_with(contents: &str, what: &str) -> Result<NamedTempFile, String> {
+	let mut file = NamedTempFile::new().context(&format!("create {what} temp file"))?;
+	file.write_all(contents.as_bytes()).context(&format!("write {what}"))?;
+	file.flush().context(&format!("flush {what}"))?;
+	return Ok(file);
+}
+
+// The client-mTLS files the config points at. The temp files stay on disk while this value lives.
+#[cfg(feature = "acme")]
+struct ClientPki {
+	ca: NamedTempFile,
+	client_cert: NamedTempFile,
+	client_key: NamedTempFile,
+}
+
+#[cfg(feature = "acme")]
+fn client_pki() -> Result<ClientPki, String> {
 	// In a real deployment, the client CA cert would be pre-distributed to all
 	// authorized clients. Here we generate one for illustration purposes.
-	let ca_key = rcgen::KeyPair::generate()?;
-	let mut ca_params = rcgen::CertificateParams::new(vec![])?;
+	let ca_key = rcgen::KeyPair::generate().context("CA key")?;
+	let mut ca_params = rcgen::CertificateParams::new(vec![]).context("CA params")?;
 	ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
 	ca_params.distinguished_name.push(
 		rcgen::DnType::CommonName,
 		rcgen::DnValue::Utf8String("Reduction Client CA".to_owned()),
 	);
-	let ca_cert = ca_params.self_signed(&ca_key)?;
-
-	let mut ca_file = NamedTempFile::new()?;
-	ca_file.write_all(ca_cert.pem().as_bytes())?;
-	ca_file.flush()?;
-	let ca_path: PathBuf = ca_file.path().to_path_buf();
+	let ca_cert = ca_params.self_signed(&ca_key).context("self-sign CA")?;
 
 	// Generate a client cert signed by the CA (for mTLS)
-	let client_key = rcgen::KeyPair::generate()?;
-	let client_params = rcgen::CertificateParams::new(vec!["client-1".to_owned()])?;
-	let issuer = rcgen::Issuer::from_ca_cert_der(ca_cert.der(), &ca_key)?;
-	let client_cert = client_params.signed_by(&client_key, &issuer)?;
+	let client_key = rcgen::KeyPair::generate().context("client key")?;
+	let client_params = rcgen::CertificateParams::new(vec!["client-1".to_owned()]).context("client params")?;
+	let issuer = rcgen::Issuer::from_ca_cert_der(ca_cert.der(), &ca_key).context("CA issuer")?;
+	let client_cert = client_params
+		.signed_by(&client_key, &issuer)
+		.context("sign client cert")?;
 
-	let mut client_cert_file = NamedTempFile::new()?;
-	client_cert_file.write_all(client_cert.pem().as_bytes())?;
-	client_cert_file.flush()?;
+	return Ok(ClientPki {
+		ca: temp_file_with(&ca_cert.pem(), "CA cert")?,
+		client_cert: temp_file_with(&client_cert.pem(), "client cert")?,
+		client_key: temp_file_with(&client_key.serialize_pem(), "client key")?,
+	});
+}
 
-	let mut client_key_file = NamedTempFile::new()?;
-	client_key_file.write_all(client_key.serialize_pem().as_bytes())?;
-	client_key_file.flush()?;
+#[cfg(feature = "acme")]
+fn main() -> Result<(), String> {
+	tracing_subscriber::registry()
+		.with(support::output_layer(LIBRARY_LOG_LEVEL))
+		.init();
+
+	let pki: ClientPki = client_pki()?;
+	let ca_path: PathBuf = pki.ca.path().to_path_buf();
 
 	// Write a config TOML using ACME for the server cert
 	let config_toml: String = format!(
@@ -63,7 +115,7 @@ domains = ["proxy.example.com"]
 acme_email = "ops@example.com"
 ca_cert_path = "{ca_path}"
 cache_dir = "./acme_cache"
-staging = true  # Use Let's Encrypt staging for testing
+directory = "staging"  # Use Let's Encrypt staging for testing
 
 [tls.client]
 cert_path = "{client_cert}"
@@ -81,40 +133,30 @@ path_prefix = "/"
 backend_id = "api"
 "#,
 		ca_path = ca_path.display(),
-		client_cert = client_cert_file.path().display(),
-		client_key = client_key_file.path().display(),
+		client_cert = pki.client_cert.path().display(),
+		client_key = pki.client_key.path().display(),
 	);
 
-	let mut config_file = NamedTempFile::new()?;
-	config_file.write_all(config_toml.as_bytes())?;
-	config_file.flush()?;
+	let config_file = temp_file_with(&config_toml, "config")?;
+	let config_shown: String = config_file.path().display().to_string();
 
-	println!("=== Let's Encrypt Demo Configuration ===");
-	println!();
-	println!("Config written to: {}", config_file.path().display());
-	println!();
-	println!("To run the proxy with this config:");
-	println!("  cargo run --features acme -- {}", config_file.path().display());
-	println!();
-	println!("Requirements:");
-	println!("  1. Port 443 must be accessible from the internet");
-	println!("  2. DNS for 'proxy.example.com' must point to this server");
-	println!("  3. Set staging = false for production certificates");
-	println!();
-	println!("The ACME flow:");
-	println!("  1. On first start, provisions a certificate via tls-alpn-01");
-	println!("  2. Caches cert + key in ./acme_cache/");
-	println!("  3. Auto-renews 30 days before expiry");
-	println!("  4. Client mTLS is still enforced (clients need certs from the private CA)");
-	println!();
-	println!("=== Config TOML ===");
-	println!("{config_toml}");
+	info!("=== Let's Encrypt Demo Configuration ===");
+	info!("");
+	info!("Config written to: {config_shown}");
+	INSTRUCTIONS
+		.iter()
+		.map(|line| line.replace("{config}", &config_shown).replace("{toml}", &config_toml))
+		.for_each(|line| info!("{line}"));
 	return Ok(());
 }
 
 #[cfg(not(feature = "acme"))]
-fn main() {
-	eprintln!("This example requires the 'acme' feature.");
-	eprintln!("Run with: cargo run --features acme --example letsencrypt_demo");
-	std::process::exit(1);
+fn main() -> Result<(), String> {
+	tracing_subscriber::registry()
+		.with(support::output_layer(LIBRARY_LOG_LEVEL))
+		.init();
+	return Err::<(), &str>(
+		"this example requires the 'acme' feature; run with: cargo run --features acme --example letsencrypt_demo",
+	)
+	.context("letsencrypt_demo");
 }
