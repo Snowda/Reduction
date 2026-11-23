@@ -7,8 +7,8 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use http::header::HOST;
 use http::{HeaderMap, HeaderName, HeaderValue, Version};
 use reduction::proxy::ProxyState;
-use reduction::proxy::handler::fastlane::fields::{peer_fields, peer_headers};
-use reduction::proxy::handler::fastlane::request::{ClassifyInput, Classified, Plane, RequestFacts, Template, classify};
+use reduction::proxy::handler::fastlane::fields::PeerFields;
+use reduction::proxy::handler::fastlane::request::{ClassifyInput, Plane, RequestFacts, Template, classify};
 use reduction::proxy::handler::headers::{apply_forwarded_headers, apply_identity_headers, strip_hop_by_hop_headers};
 use reduction::transport::ConnectAddr;
 
@@ -88,17 +88,15 @@ fn agrees(facts: &RequestFacts, served: Option<&ServerRead>) -> Result<(), Strin
 /// Partial and Handoff leave every byte to hyper, so only a Ready head can diverge.
 pub fn check(state: &ProxyState, client: &[u8]) -> Result<(), String> {
 	let peer: ConnectAddr = ConnectAddr(SocketAddr::new(CLIENT_IP, CLIENT_PORT), None);
-	let fields: Vec<u8> = peer_fields(peer).ok_or("loopback peer fields")?;
-	let headers: HeaderMap = peer_headers(&fields).ok_or("loopback peer headers")?;
+	let headers: HeaderMap = PeerFields::new(peer).and_then(|fields: PeerFields| fields.headers()).ok_or("loopback peer headers")?;
 	let input: ClassifyInput<'_> = ClassifyInput {
 		state,
 		listener: None,
 		peer,
-		peer_fields: &fields,
 		peer_headers: &headers,
 	};
 	let mut template: Template = Template::default();
-	let Classified::Ready(facts) = classify(client, &input, &mut template) else {
+	let Ok(facts) = classify(client, &input, &mut template) else {
 		return Ok(());
 	};
 	if facts.head_len == 0 || facts.head_len > client.len() {
@@ -131,13 +129,12 @@ mod tests {
 	fn plain_heads_are_ready_on_both_planes_and_agree_with_hyper() -> Result<(), String> {
 		let fixture: &Fixture = fixture::get()?;
 		let peer: ConnectAddr = ConnectAddr(SocketAddr::new(CLIENT_IP, CLIENT_PORT), None);
-		let fields: Vec<u8> = peer_fields(peer).ok_or("peer fields")?;
-		let headers: HeaderMap = peer_headers(&fields).ok_or("peer headers")?;
+		let headers: HeaderMap = PeerFields::new(peer).and_then(|fields: PeerFields| fields.headers()).ok_or("peer headers")?;
 		return [fixture.raw.h1, fixture.raw.h2].iter().try_for_each(|state: &&'static ProxyState| {
-			let input: ClassifyInput<'_> = ClassifyInput { state, listener: None, peer, peer_fields: &fields, peer_headers: &headers };
+			let input: ClassifyInput<'_> = ClassifyInput { state, listener: None, peer, peer_headers: &headers };
 			return READY.iter().try_for_each(|client: &&[u8]| {
 				let mut template: Template = Template::default();
-				let is_ready: bool = matches!(classify(client, &input, &mut template), Classified::Ready(_));
+				let is_ready: bool = classify(client, &input, &mut template).is_ok();
 				assert!(is_ready, "{:?} must take the raw plane", String::from_utf8_lossy(client));
 				return check(state, client);
 			});
@@ -158,10 +155,9 @@ mod tests {
 		assert!(check_template(&retargeted, &served).is_err(), "a changed target");
 		let fixture: &Fixture = fixture::get()?;
 		let peer: ConnectAddr = ConnectAddr(SocketAddr::new(CLIENT_IP, CLIENT_PORT), None);
-		let fields: Vec<u8> = peer_fields(peer).ok_or("peer fields")?;
-		let headers: HeaderMap = peer_headers(&fields).ok_or("peer headers")?;
-		let input: ClassifyInput<'_> = ClassifyInput { state: fixture.raw.h1, listener: None, peer, peer_fields: &fields, peer_headers: &headers };
-		let Classified::Ready(facts) = classify(READY[1], &input, &mut Template::default()) else {
+		let headers: HeaderMap = PeerFields::new(peer).and_then(|fields: PeerFields| fields.headers()).ok_or("peer headers")?;
+		let input: ClassifyInput<'_> = ClassifyInput { state: fixture.raw.h1, listener: None, peer, peer_headers: &headers };
+		let Ok(facts) = classify(READY[1], &input, &mut Template::default()) else {
 			return Err(String::from("the POST must be Ready"));
 		};
 		assert!(agrees(&facts, None).is_err(), "a head hyper refuses");

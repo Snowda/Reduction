@@ -23,37 +23,89 @@ const CONNECT: &str = "CONNECT";
 const ALLOW: &str = "allow";
 const CONTENT_LENGTH: &str = "content-length";
 const TRANSFER_ENCODING: &str = "transfer-encoding";
-const MALFORMED: &str = "malformed";
-const METHOD_NOT_ALLOWED: &str = "method_not_allowed";
-const PRIVATE_ADDRESS: &str = "private_address";
 
-// docs/egress.md, "Order of checks": each refusal label and the status it answers with.
-const REFUSALS: [(&str, StatusCode); 11] = [
-	("client_not_allowed", StatusCode::FORBIDDEN),
-	("rate_limited", StatusCode::TOO_MANY_REQUESTS),
-	(METHOD_NOT_ALLOWED, StatusCode::METHOD_NOT_ALLOWED),
-	(MALFORMED, StatusCode::BAD_REQUEST),
-	("host_not_allowed", StatusCode::FORBIDDEN),
-	("port_not_allowed", StatusCode::FORBIDDEN),
-	("at_capacity", StatusCode::SERVICE_UNAVAILABLE),
-	("resolve_failed", StatusCode::BAD_GATEWAY),
-	(PRIVATE_ADDRESS, StatusCode::FORBIDDEN),
-	("connect_failed", StatusCode::BAD_GATEWAY),
-	("connect_timeout", StatusCode::GATEWAY_TIMEOUT),
-];
-// The refusals that a target the policy allows can still get: capacity and network faults only.
-const ALLOWED_TARGET_REFUSALS: [&str; 4] = ["at_capacity", "resolve_failed", "connect_failed", "connect_timeout"];
-// An allowlisted internal literal resolves without DNS, so only the slot check comes before the internal check.
-const INTERNAL_TARGET_REFUSALS: [&str; 2] = ["at_capacity", PRIVATE_ADDRESS];
-// The checks before the slot, resolve and dial: a target the policy refuses never gets past them.
-const POLICY_REFUSALS: [&str; 6] = [
-	"client_not_allowed",
-	"rate_limited",
-	METHOD_NOT_ALLOWED,
-	MALFORMED,
-	"host_not_allowed",
-	"port_not_allowed",
-];
+// docs/egress.md, "Order of checks": each refusal the gateway can answer with, in check order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Refusal {
+	ClientNotAllowed,
+	RateLimited,
+	MethodNotAllowed,
+	Malformed,
+	HostNotAllowed,
+	PortNotAllowed,
+	AtCapacity,
+	ResolveFailed,
+	PrivateAddress,
+	ConnectFailed,
+	ConnectTimeout,
+}
+
+impl Refusal {
+	const ALL: [Self; 11] = [
+		Self::ClientNotAllowed,
+		Self::RateLimited,
+		Self::MethodNotAllowed,
+		Self::Malformed,
+		Self::HostNotAllowed,
+		Self::PortNotAllowed,
+		Self::AtCapacity,
+		Self::ResolveFailed,
+		Self::PrivateAddress,
+		Self::ConnectFailed,
+		Self::ConnectTimeout,
+	];
+
+	// The body a refusal carries.
+	const fn label(self) -> &'static str {
+		return match self {
+			Self::ClientNotAllowed => "client_not_allowed",
+			Self::RateLimited => "rate_limited",
+			Self::MethodNotAllowed => "method_not_allowed",
+			Self::Malformed => "malformed",
+			Self::HostNotAllowed => "host_not_allowed",
+			Self::PortNotAllowed => "port_not_allowed",
+			Self::AtCapacity => "at_capacity",
+			Self::ResolveFailed => "resolve_failed",
+			Self::PrivateAddress => "private_address",
+			Self::ConnectFailed => "connect_failed",
+			Self::ConnectTimeout => "connect_timeout",
+		};
+	}
+
+	const fn status(self) -> StatusCode {
+		return match self {
+			Self::ClientNotAllowed | Self::HostNotAllowed | Self::PortNotAllowed | Self::PrivateAddress => StatusCode::FORBIDDEN,
+			Self::RateLimited => StatusCode::TOO_MANY_REQUESTS,
+			Self::MethodNotAllowed => StatusCode::METHOD_NOT_ALLOWED,
+			Self::Malformed => StatusCode::BAD_REQUEST,
+			Self::AtCapacity => StatusCode::SERVICE_UNAVAILABLE,
+			Self::ResolveFailed | Self::ConnectFailed => StatusCode::BAD_GATEWAY,
+			Self::ConnectTimeout => StatusCode::GATEWAY_TIMEOUT,
+		};
+	}
+
+	// Whether a target the policy classes as `expected` can get this refusal.
+	const fn can_reach(self, expected: Expected) -> bool {
+		return match expected {
+			// An allowed target fails only on capacity and network faults.
+			Expected::Tunnel => matches!(self, Self::AtCapacity | Self::ResolveFailed | Self::ConnectFailed | Self::ConnectTimeout),
+			// An allowlisted internal literal resolves without DNS, so only the slot check comes before the internal check.
+			Expected::Internal => matches!(self, Self::AtCapacity | Self::PrivateAddress),
+			// A refused target never gets past the checks before the slot, resolve and dial.
+			Expected::Refused => matches!(
+				self,
+				Self::ClientNotAllowed
+					| Self::RateLimited | Self::MethodNotAllowed
+					| Self::Malformed | Self::HostNotAllowed
+					| Self::PortNotAllowed
+			),
+		};
+	}
+
+	fn from_body(body: &[u8]) -> Option<Self> {
+		return Self::ALL.into_iter().find(|refusal: &Self| return refusal.label().as_bytes() == body);
+	}
+}
 
 /// What the policy says about a request, from its bytes alone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -132,10 +184,10 @@ pub fn check(data: &[u8], echo_port: u16, response: &Result<Vec<u8>, String>) ->
 	if !status.is_client_error() && !status.is_server_error() {
 		return Err(format!("the gateway answered {status}"));
 	}
-	let Some(label) = refusal_label(head.headers, after_head) else {
+	let Some(refusal) = refusal_of(head.headers, after_head) else {
 		return Ok(());
 	};
-	return check_refusal(label, status, head.headers, expected);
+	return check_refusal(refusal, status, head.headers, expected);
 }
 
 // A 200 is a tunnel: only an allowed target gets one, and the echo returns the bytes sent after the head.
@@ -159,32 +211,26 @@ fn check_tunnel(data: &[u8], asked: Option<&Asked>, echoed: &[u8], response_len:
 	return Ok(());
 }
 
-fn check_refusal(label: &str, status: StatusCode, headers: &[Header<'_>], expected: Expected) -> Result<(), String> {
-	let documented: Option<StatusCode> = REFUSALS.iter().find(|(name, _)| return *name == label).map(|(_, code)| return *code);
-	if documented != Some(status) {
-		return Err(format!("refusal {label} answered {status}, documented as {documented:?}"));
+fn check_refusal(refusal: Refusal, status: StatusCode, headers: &[Header<'_>], expected: Expected) -> Result<(), String> {
+	let label: &str = refusal.label();
+	if refusal.status() != status {
+		return Err(format!("refusal {label} answered {status}, documented as {}", refusal.status()));
 	}
-	if label == METHOD_NOT_ALLOWED && header(headers, ALLOW) != Some(CONNECT.as_bytes()) {
+	if refusal == Refusal::MethodNotAllowed && header(headers, ALLOW) != Some(CONNECT.as_bytes()) {
 		return Err(String::from("a 405 without Allow: CONNECT"));
 	}
-	let is_consistent: bool = match expected {
-		Expected::Tunnel => ALLOWED_TARGET_REFUSALS.contains(&label),
-		Expected::Internal => INTERNAL_TARGET_REFUSALS.contains(&label),
-		Expected::Refused => POLICY_REFUSALS.contains(&label),
-	};
-	if !is_consistent {
+	if !refusal.can_reach(expected) {
 		return Err(format!("a {expected:?} target got the refusal {label}"));
 	}
 	return Ok(());
 }
 
-// The label a refusal body carries: the body, cut at its Content-Length, must be one documented label.
-fn refusal_label(headers: &[Header<'_>], after_head: &[u8]) -> Option<&'static str> {
+// The refusal a body names: the body, cut at its Content-Length, must be one documented label.
+fn refusal_of(headers: &[Header<'_>], after_head: &[u8]) -> Option<Refusal> {
 	let length: usize = header(headers, CONTENT_LENGTH)
 		.and_then(|value| return str::from_utf8(value).ok())
 		.and_then(|value| return value.parse::<usize>().ok())?;
-	let body: &[u8] = after_head.get(..length)?;
-	return REFUSALS.iter().map(|(name, _)| return *name).find(|name| return name.as_bytes() == body);
+	return Refusal::from_body(after_head.get(..length)?);
 }
 
 // Parse the first request head with httparse and classify its target against the fixture's policy.
@@ -245,6 +291,34 @@ mod tests {
 		return format!("HTTP/1.1 {status}\r\ncontent-length: {}\r\n\r\n{label}", label.len());
 	}
 
+	// docs/egress.md, "Order of checks": the labels, their statuses, and which targets can get each one.
+	#[test]
+	fn each_refusal_has_its_documented_label_status_and_targets() {
+		let documented: [(&str, u16, &[Expected]); 11] = [
+			("client_not_allowed", 403, &[Expected::Refused]),
+			("rate_limited", 429, &[Expected::Refused]),
+			("method_not_allowed", 405, &[Expected::Refused]),
+			("malformed", 400, &[Expected::Refused]),
+			("host_not_allowed", 403, &[Expected::Refused]),
+			("port_not_allowed", 403, &[Expected::Refused]),
+			("at_capacity", 503, &[Expected::Tunnel, Expected::Internal]),
+			("resolve_failed", 502, &[Expected::Tunnel]),
+			("private_address", 403, &[Expected::Internal]),
+			("connect_failed", 502, &[Expected::Tunnel]),
+			("connect_timeout", 504, &[Expected::Tunnel]),
+		];
+		let targets: [Expected; 3] = [Expected::Tunnel, Expected::Internal, Expected::Refused];
+		Refusal::ALL.iter().zip(documented).for_each(|(refusal, (label, status, reachable))| {
+			assert_eq!(refusal.label(), label);
+			assert_eq!(refusal.status().as_u16(), status, "{label}");
+			assert_eq!(Refusal::from_body(label.as_bytes()), Some(*refusal));
+			targets.iter().for_each(|target| {
+				assert_eq!(refusal.can_reach(*target), reachable.contains(target), "{label} for {target:?}");
+			});
+		});
+		assert_eq!(Refusal::from_body(b"not_a_label"), None);
+	}
+
 	#[test]
 	fn the_port_token_becomes_the_echo_port() {
 		assert_eq!(with_port(b"CONNECT localhost:$PORT x$PORT$", PORT), b"CONNECT localhost:4321 x4321$".to_vec());
@@ -274,7 +348,7 @@ mod tests {
 		let off_list: &[u8] = b"CONNECT example.com:4321 HTTP/1.1\r\n\r\n";
 		assert!(check(off_list, PORT, &replied(&refusal("403 Forbidden", "host_not_allowed"))).is_ok(), "403");
 		let internal: &[u8] = b"CONNECT 127.0.0.2:4321 HTTP/1.1\r\n\r\n";
-		assert!(check(internal, PORT, &replied(&refusal("403 Forbidden", PRIVATE_ADDRESS))).is_ok(), "private");
+		assert!(check(internal, PORT, &replied(&refusal("403 Forbidden", "private_address"))).is_ok(), "private");
 		let get: &[u8] = b"GET / HTTP/1.1\r\n\r\n";
 		let refused_get: String = "HTTP/1.1 405 Method Not Allowed\r\nallow: CONNECT\r\ncontent-length: 18\r\n\r\nmethod_not_allowed".to_owned();
 		assert!(check(get, PORT, &replied(&refused_get)).is_ok(), "405");
@@ -294,7 +368,7 @@ mod tests {
 		assert!(check(off_list, PORT, &replied(&refusal("400 Bad Request", "host_not_allowed"))).is_err(), "wrong status");
 		assert!(check(off_list, PORT, &replied(&refusal("504 Gateway Timeout", "connect_timeout"))).is_err(), "dialed off list");
 		let get: &[u8] = b"GET / HTTP/1.1\r\n\r\n";
-		assert!(check(get, PORT, &replied(&refusal("405 Method Not Allowed", METHOD_NOT_ALLOWED))).is_err(), "no Allow");
+		assert!(check(get, PORT, &replied(&refusal("405 Method Not Allowed", "method_not_allowed"))).is_err(), "no Allow");
 		assert!(check(get, PORT, &replied("HTTP/1.1 302 Found\r\n\r\n")).is_err(), "a redirect");
 		assert!(check(get, PORT, &replied("garbage")).is_err(), "not a response head");
 		assert!(check(get, PORT, &Err(String::from("hung"))).is_err(), "no close in the bound");

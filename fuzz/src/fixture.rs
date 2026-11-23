@@ -24,7 +24,7 @@ use reduction::config::{
 use reduction::egress::spawn_egress;
 use reduction::fast_hash::FastMap;
 use reduction::health::HealthState;
-use reduction::health_endpoint::{Readiness, spawn_health_endpoint};
+use reduction::health_endpoint::{Readiness, leaked_readiness, spawn_health_endpoint};
 use reduction::metrics::ProxyMetrics;
 use reduction::proxy::server::serve_with;
 use reduction::proxy::{ConnPool, HttpAuthz, ProxyState, ReloadableState, Router};
@@ -268,7 +268,7 @@ fn routing(backend: &BackendConfig) -> Result<ReloadableState, String> {
 		timeout_secs: None,
 		is_wakeable: false,
 		stickiness: Stickiness::Identity,
-		spills_on_exhaustion: false,
+		allows_spill_on_exhaustion: false,
 		split: Vec::new(),
 	};
 	let pool: BackendPool = BackendPool::new(vec![backend.clone()]).map_err(|e| format!("backend pool: {e}"))?;
@@ -300,7 +300,7 @@ fn proxy_state(reloadable: ReloadableState, client_tls: Arc<ClientConfig>) -> &'
 		default_queue_depth: QUEUE_DEPTH,
 		metrics: ProxyMetrics::new(),
 		circuit_breakers: CircuitBreakers::new(&CircuitBreakerConfig::default()),
-		shutdown: Box::leak(Box::new(CancellationToken::new())),
+		shutdown: CancellationToken::new(),
 		timeouts,
 		proxy_config: ProxyConfig::default(),
 		retry_config: RetryConfig::default(),
@@ -319,9 +319,9 @@ async fn spawn_redirect() -> Result<SocketAddr, String> {
 	let config: HttpRedirectConfig = HttpRedirectConfig {
 		is_enabled: true,
 		listen,
-		to_host: REDIRECT_HOST.to_owned(),
+		to_host: ArrayString::from(REDIRECT_HOST).map_err(|e| format!("redirect host: {e}"))?,
 	};
-	spawn_http_redirect(&config, Box::leak(Box::new(CancellationToken::new())))
+	spawn_http_redirect(&config, CancellationToken::new())
 		.await
 		.map_err(|e| format!("redirect listener: {e}"))?;
 	return Ok(listen);
@@ -332,9 +332,9 @@ async fn spawn_redirect() -> Result<SocketAddr, String> {
 async fn spawn_health() -> Result<SocketAddr, String> {
 	let listen: SocketAddr = bind().await?.local_addr().map_err(|e| format!("health addr: {e}"))?;
 	let config: HealthEndpointConfig = HealthEndpointConfig { is_enabled: true, listen };
-	let readiness: &'static Readiness = Readiness::leaked();
+	let readiness: &'static Readiness = leaked_readiness();
 	readiness.set_ready();
-	spawn_health_endpoint(&config, readiness, Box::leak(Box::new(CancellationToken::new())))
+	spawn_health_endpoint(&config, readiness, CancellationToken::new())
 		.await
 		.map_err(|e| format!("health endpoint: {e}"))?
 		.ok_or("the endpoint is enabled, so it must start")?;
@@ -378,7 +378,7 @@ async fn spawn_gateway() -> Result<Egress, String> {
 		toml::from_str(&egress_toml(gateway, echo_port)).map_err(|e| format!("egress config: {e}"))?;
 	config.validate().map_err(|e| format!("egress config is invalid: {e}"))?;
 	let (_config_tx, config_rx): (watch::Sender<ReductionConfig>, watch::Receiver<ReductionConfig>) = watch::channel(config);
-	spawn_egress(config_rx, Box::leak(Box::new(CancellationToken::new())))
+	spawn_egress(config_rx, CancellationToken::new())
 		.await
 		.map_err(|e| format!("egress gateway: {e}"))?
 		.ok_or("the config has [egress], so the gateway must start")?;

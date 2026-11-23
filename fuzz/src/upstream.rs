@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use http::header::{CONNECTION, HOST, TE, TRAILER, UPGRADE};
-use http::{HeaderValue, Method, Request, Response, StatusCode};
+use http::{HeaderValue, Method, Request, Response, StatusCode, Uri};
 use http_body_util::BodyExt;
 use reduction::body::Body;
 use reduction::config::BackendConfig;
@@ -14,7 +14,7 @@ use reduction::proxy::{ConnPool, HttpSender, ProxyState};
 use tokio::time::timeout;
 
 use crate::fixture::echo_of;
-use crate::request::path_and_query;
+use crate::request::DEFAULT_PATH;
 
 // Each pool step has a 2 s timeout of its own; past this bound a step hung.
 const EXCHANGE_BOUND: Duration = Duration::from_secs(30);
@@ -34,7 +34,13 @@ pub fn expected_echo(req: &Request<Bytes>) -> Vec<u8> {
 	if req.method() == Method::HEAD || req.method() == Method::CONNECT {
 		return Vec::new();
 	}
-	return echo_of(req.method(), path_and_query(req.uri()), req.body());
+	return echo_of(req.method(), &origin_target(req.uri()), req.body());
+}
+
+// The origin-form target the backend reads: never an empty path, and the root path in front of a bare `?q`.
+fn origin_target(uri: &Uri) -> String {
+	let path: &str = if uri.path().is_empty() { DEFAULT_PATH } else { uri.path() };
+	return uri.query().map_or_else(|| return path.to_owned(), |query: &str| return format!("{path}?{query}"));
 }
 
 /// Acquire a sender for `backend`, send `req` as a forward does, and read the body to its end.
@@ -127,6 +133,33 @@ mod tests {
 		let head: Request<Bytes> = request::parse(b"HEAD /x HTTP/1.1\r\n\r\n").ok_or("HEAD did not parse")?;
 		assert!(expected_echo(&head).is_empty(), "a HEAD answer has no body");
 		return Ok(());
+	}
+
+	#[test]
+	fn the_expected_target_is_origin_form() -> Result<(), String> {
+		let targets: Vec<String> = ["SPOT ://hx?1", "GET /a?b", "GET /a?", "GET /a", "GET http://h", "POST h:80"]
+			.iter()
+			.map(|line: &&str| {
+				let req: Request<Bytes> = request::parse(format!("{line} HTTP/1.1\r\n\r\n").as_bytes()).ok_or(*line)?;
+				return Ok(origin_target(req.uri()));
+			})
+			.collect::<Result<_, &str>>()?;
+		assert_eq!(targets, ["/?1", "/a?b", "/a?", "/a", "/", "/"]);
+		return Ok(());
+	}
+
+	// regressions/upstream_send/crash-74a6…: an absolute target with no path. Each backend reads it as `/?1`.
+	#[test]
+	fn every_backend_reads_an_empty_path_as_the_root() -> Result<(), String> {
+		let fixture: &Fixture = fixture::get()?;
+		return (0..3).try_for_each(|selector: u8| {
+			let req: Request<Bytes> = request::parse(b"SPOT ://hx?1 HTTP/1.1\r\n\nhello").ok_or("SPOT did not parse")?;
+			let expected: Vec<u8> = expected_echo(&req);
+			let backend: &BackendConfig = fixture.backend(selector);
+			let exchange: Result<Exchange, String> = fixture.block_on(exchange(fixture.state, backend, req.map(Body::from)));
+			assert!(exchange.is_ok(), "backend {} refused: {exchange:?}", backend.id);
+			return check(&expected, &exchange).map_err(|e| return format!("backend {}: {e}", backend.id));
+		});
 	}
 
 	// Positive control: each of the three backends completes a POST with an exact echo, so no path is vacuous.
