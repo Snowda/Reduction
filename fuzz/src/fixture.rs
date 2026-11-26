@@ -8,6 +8,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::num::NonZeroU64;
 use std::sync::{Arc, OnceLock};
 
+use ahash::AHashMap;
 use arrayvec::ArrayString;
 use http::{Method, Request, Response, StatusCode};
 use http_body_util::BodyExt;
@@ -19,10 +20,9 @@ use reduction::body::Body;
 use reduction::circuit::CircuitBreakers;
 use reduction::config::{
 	BackendConfig, BackendProtocol, BackendScheme, CircuitBreakerConfig, ClientAuthPolicy, DeviceIdSource, HealthEndpointConfig, HttpRedirectConfig, MAX_BACKEND_ID_LEN, ProxyConfig, ReductionConfig,
-	RetryConfig, RouteConfig, Stickiness, TimeoutConfig, TransportKind,
+	NonZeroDuration, RetryConfig, RouteConfig, Stickiness, TimeoutConfig, TransportKind,
 };
 use reduction::egress::spawn_egress;
-use reduction::fast_hash::FastMap;
 use reduction::health::HealthState;
 use reduction::health_endpoint::{Readiness, leaked_readiness, spawn_health_endpoint};
 use reduction::metrics::ProxyMetrics;
@@ -177,7 +177,7 @@ fn plain_backend(addr: SocketAddr) -> Result<BackendConfig, String> {
 
 fn tls_backend(id: &str, addr: SocketAddr) -> Result<BackendConfig, String> {
 	return BackendConfig::new(id, addr, 1.0, TransportKind::Tcp)
-		.map(|backend| return backend.with_host(TLS_HOST.to_owned()))
+		.and_then(|backend| return backend.with_host(TLS_HOST))
 		.map_err(|e| format!("{id} backend: {e}"));
 }
 
@@ -265,7 +265,7 @@ fn routing(backend: &BackendConfig) -> Result<ReloadableState, String> {
 	let route: RouteConfig = RouteConfig {
 		path_prefix: ArrayString::from(ROUTE_PREFIX).map_err(|e| format!("route prefix: {e}"))?,
 		backend_id: Some(pool_id),
-		timeout_secs: None,
+		timeout: None,
 		is_wakeable: false,
 		stickiness: Stickiness::Identity,
 		allows_spill_on_exhaustion: false,
@@ -274,7 +274,7 @@ fn routing(backend: &BackendConfig) -> Result<ReloadableState, String> {
 	let pool: BackendPool = BackendPool::new(vec![backend.clone()]).map_err(|e| format!("backend pool: {e}"))?;
 	return Ok(ReloadableState {
 		router: Router::new(&[route]),
-		backend_pools: FastMap::from_iter([(pool_id, pool)]),
+		backend_pools: AHashMap::from_iter([(pool_id, pool)]),
 		acl: AccessControl::new(vec![], vec![]),
 	});
 }
@@ -282,10 +282,10 @@ fn routing(backend: &BackendConfig) -> Result<ReloadableState, String> {
 // The production ProxyState shape, with short timeouts and peers admitted without a name.
 fn proxy_state(reloadable: ReloadableState, client_tls: Arc<ClientConfig>) -> &'static ProxyState {
 	let timeouts: TimeoutConfig = TimeoutConfig {
-		connect_secs: FUZZ_TIMEOUT_SECS,
-		handshake_secs: FUZZ_TIMEOUT_SECS,
-		request_secs: FUZZ_REQUEST_SECS,
-		response_idle_secs: FUZZ_TIMEOUT_SECS,
+		connect: NonZeroDuration::from_secs(FUZZ_TIMEOUT_SECS),
+		handshake: NonZeroDuration::from_secs(FUZZ_TIMEOUT_SECS),
+		request: NonZeroDuration::from_secs(FUZZ_REQUEST_SECS),
+		response_idle: NonZeroDuration::from_secs(FUZZ_TIMEOUT_SECS),
 	};
 	return Box::leak(Box::new(ProxyState {
 		reloadable: watch::channel(reloadable).1,
@@ -361,7 +361,7 @@ fn egress_toml(listen: SocketAddr, echo_port: u16) -> String {
 	return format!(
 		"[egress]\nlisten = \"{listen}\"\nallow_hosts = [\"{EGRESS_HOST}\", \"{EGRESS_INTERNAL_HOST}\"]\n\
 		 allow_ports = [{echo_port}]\nallow_private_cidrs = [\"127.0.0.1/32\", \"::1/128\"]\n\
-		 connect_timeout_secs = {EGRESS_CONNECT_TIMEOUT_SECS}\nidle_timeout_secs = 2\nmax_tunnels = 1024\n\
+		 connect_timeout = \"{EGRESS_CONNECT_TIMEOUT_SECS}s\"\nidle_timeout = \"2s\"\nmax_tunnels = 1024\n\
 		 [access]\nallow = [\"127.0.0.0/8\", \"::1/128\"]\n"
 	);
 }

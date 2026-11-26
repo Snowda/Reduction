@@ -10,6 +10,7 @@ rust-version = "1.100.0"
 [dependencies]
 # Default features: the proxy, the pool and the redirect listener are the remote boundaries under test.
 reduction = { path = ".." }
+ahash = "0.8.12"
 arrayvec = "0.7.8"
 bytes = "1.12.1"
 http = "1.5.0"

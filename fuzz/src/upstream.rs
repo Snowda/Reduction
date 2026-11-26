@@ -45,8 +45,8 @@ fn origin_target(uri: &Uri) -> String {
 
 /// Acquire a sender for `backend`, send `req` as a forward does, and read the body to its end.
 pub async fn exchange(state: &ProxyState, backend: &BackendConfig, req: Request<Body>) -> Result<Exchange, String> {
-	let connect: Duration = Duration::from_secs(state.timeouts.connect_secs.get());
-	let handshake: Duration = Duration::from_secs(state.timeouts.handshake_secs.get());
+	let connect: Duration = state.timeouts.connect.get();
+	let handshake: Duration = state.timeouts.handshake.get();
 	let pool: &ConnPool = &state.conn_pool;
 	let acquired = ConnPool::acquire(pool, backend, &state.tls_connector, &state.client_tls_config, connect, handshake);
 	let mut sender: HttpSender = bounded(acquired).await?.map_err(|e| format!("acquire: {e}"))?;
